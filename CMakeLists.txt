@@ -1,0 +1,19 @@
+# Register the component
+idf_component_register(
+    NAME
+      RaftROS
+    SRCS
+      "components/RaftROS/RaftROS.cpp"
+      "components/RaftROS/RTPS/RTPSParticipant.cpp"
+      "components/RaftROS/RTPS/SPDPHandler.cpp"
+      "components/RaftROS/RTPS/SEDPHandler.cpp"
+      "components/RaftROS/RTPS/RTPSMessage.cpp"
+      "components/RaftROS/CDR/CDREncoder.cpp"
+      "components/RaftROS/CDR/CDRDecoder.cpp"
+    INCLUDE_DIRS
+      "components/RaftROS"
+      "components/RaftROS/RTPS"
+      "components/RaftROS/CDR"
+    REQUIRES
+      RaftCore
+    )
