@@ -27,7 +27,12 @@ static const uint8_t ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER[4] = {0x00, 0x00
 static const uint8_t ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER[4] = {0x00, 0x00, 0x04, 0xC7};
 
 // User-defined writer for ros_discovery_info topic
-static const uint8_t ENTITYID_ROS_DISC_INFO_WRITER[4] = {0x00, 0x00, 0x01, 0x02};
+static const uint8_t ENTITYID_ROS_DISC_INFO_WRITER[4] = {0x00, 0x00, 0x01, 0x03};
+static const uint8_t ENTITYID_ROS_DISC_INFO_READER[4] = {0x00, 0x00, 0x02, 0x04};
+
+// Participant Message Data (liveliness)
+static const uint8_t ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER[4] = {0x00, 0x02, 0x00, 0xC2};
+static const uint8_t ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER[4] = {0x00, 0x02, 0x00, 0xC7};
 
 // === Parameter IDs (DDSI-RTPS §9.6.2) ===
 enum RTPSParameterId : uint16_t
@@ -41,6 +46,7 @@ enum RTPSParameterId : uint16_t
     PID_VENDORID                      = 0x0016,
     PID_RELIABILITY                   = 0x001A,
     PID_DURABILITY                    = 0x001D,
+    PID_UNICAST_LOCATOR               = 0x002F,
     PID_USER_DATA                     = 0x002C,
     PID_DEFAULT_UNICAST_LOCATOR       = 0x0031,
     PID_METATRAFFIC_UNICAST_LOCATOR   = 0x0032,
@@ -81,6 +87,8 @@ static const uint32_t DISC_BUILTIN_ENDPOINT_PUBLICATIONS_ANNOUNCER      = (1u <<
 static const uint32_t DISC_BUILTIN_ENDPOINT_PUBLICATIONS_DETECTOR       = (1u << 3);
 static const uint32_t DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER     = (1u << 4);
 static const uint32_t DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR      = (1u << 5);
+static const uint32_t BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_READER   = (1u << 10);
+static const uint32_t BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER   = (1u << 11);
 
 // Standard set for a minimal participant (all SEDP endpoints)
 static const uint32_t BUILTIN_ENDPOINT_SET_DEFAULT =

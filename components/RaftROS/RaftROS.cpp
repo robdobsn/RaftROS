@@ -449,6 +449,10 @@ void RaftROS::recvMetatraffic()
                       writerEID[0], writerEID[1], writerEID[2], writerEID[3], (int)contentLen);
             }
         }
+        else if (submsgId == SUBMSG_ACKNACK && contentLen >= 24)
+        {
+            handleAcknack(srcGuidPrefix, pContent, contentLen, fromAddr);
+        }
         else
         {
             const char* name = "?";
@@ -542,6 +546,10 @@ void RaftROS::recvUserData()
                       lastSNLow, sent);
             }
         }
+        else if (submsgId == SUBMSG_ACKNACK && contentLen >= 24)
+        {
+            handleAcknack(srcGuidPrefix, pContent, contentLen, fromAddr);
+        }
         else
         {
             const char* name = "?";
@@ -558,6 +566,112 @@ void RaftROS::recvUserData()
         }
 
         offset += submsgSize;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Handle incoming ACKNACK — retransmit requested data
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
+                            const struct sockaddr_in& fromAddr)
+{
+    if (contentLen < 24)
+        return;
+
+    // ACKNACK layout: readerEID(4) + writerEID(4) + bitmapBase(8) + numBits(4) + [bitmap] + count(4)
+    const uint8_t* readerEID = pContent;
+    const uint8_t* writerEID = pContent + 4;
+    uint32_t bitmapBaseLow = RTPSMessage::readLE32(pContent + 12);
+    // uint32_t bitmapBaseHigh = RTPSMessage::readLE32(pContent + 8); // unused for now
+    uint32_t numBits = RTPSMessage::readLE32(pContent + 16);
+
+    LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X base=%u numBits=%u",
+          readerEID[0], readerEID[1], readerEID[2], readerEID[3],
+          writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+          bitmapBaseLow, numBits);
+
+    // Find the remote participant
+    const DiscoveredParticipant* remote = nullptr;
+    for (const auto& dp : _discovered)
+    {
+        if (memcmp(dp.guidPrefix, srcGuidPrefix, 12) == 0)
+        {
+            remote = &dp;
+            break;
+        }
+    }
+    if (!remote)
+    {
+        LOG_W(MODULE_PREFIX, "  ACKNACK from unknown participant");
+        return;
+    }
+
+    // Check which writer they're requesting data from
+    if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0)
+    {
+        // They want our SEDP publication data (SN=1)
+        // bitmapBase=1 means they haven't received SN=1 yet; retransmit
+        if (bitmapBaseLow <= 1)
+        {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publication");
+            uint32_t sedpLen = _sedpHandler.buildPublicationMessage(
+                _sendBuf, sizeof(_sendBuf),
+                _participant, srcGuidPrefix,
+                ENTITYID_ROS_DISC_INFO_WRITER,
+                "ros_discovery_info",
+                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                RELIABILITY_RELIABLE,
+                DURABILITY_TRANSIENT_LOCAL,
+                _sedpSeqNum);
+
+            if (sedpLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote->metatrafficPort);
+                dest.sin_addr.s_addr = remote->ipAddr;
+                int sent = sendto(_metatrafficSock, _sendBuf, sedpLen, 0,
+                                  (struct sockaddr*)&dest, sizeof(dest));
+                LOG_I(MODULE_PREFIX, "  SEDP retransmit %d/%d bytes", sent, (int)sedpLen);
+            }
+        }
+    }
+    else if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
+    {
+        // They want our ros_discovery_info data (SN=1)
+        if (bitmapBaseLow <= 1)
+        {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
+            uint8_t rosDiscPayload[256];
+            uint32_t rosDiscLen = SPDPHandler::buildRosDiscoveryInfoPayload(
+                rosDiscPayload, sizeof(rosDiscPayload),
+                _participant.getParticipantGuid(),
+                _nodeName.c_str(),
+                _nodeNamespace.c_str());
+
+            if (rosDiscLen > 0)
+            {
+                _heartbeatCount++;
+                uint32_t msgLen = _sedpHandler.buildUserDataMessage(
+                    _sendBuf, sizeof(_sendBuf),
+                    _participant, srcGuidPrefix,
+                    ENTITYID_ROS_DISC_INFO_WRITER,
+                    rosDiscPayload, rosDiscLen,
+                    _rosDiscSeqNum, _heartbeatCount);
+
+                if (msgLen > 0)
+                {
+                    struct sockaddr_in dest = {};
+                    dest.sin_family = AF_INET;
+                    dest.sin_port = htons(remote->userDataPort);
+                    dest.sin_addr.s_addr = remote->ipAddr;
+                    int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
+                                      (struct sockaddr*)&dest, sizeof(dest));
+                    LOG_I(MODULE_PREFIX, "  rosDisc retransmit %d/%d bytes", sent, (int)msgLen);
+                }
+            }
+        }
     }
 }
 

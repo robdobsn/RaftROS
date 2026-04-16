@@ -22,15 +22,32 @@ OBJECTS = $(SOURCES:.cpp=.o)
 # Output binary
 OUTPUT = linux_unit_tests
 
+# Standalone binary
+STANDALONE_SRC = raftros_standalone.cpp
+STANDALONE_OBJ = raftros_standalone.o
+STANDALONE_OUT = raftros_linux
+
+# Shared protocol sources (no main)
+PROTO_SOURCES = utils.cpp \
+	../components/RaftROS/CDR/CDREncoder.cpp \
+	../components/RaftROS/CDR/CDRDecoder.cpp \
+	../components/RaftROS/RTPS/RTPSMessage.cpp \
+	../components/RaftROS/RTPS/RTPSParticipant.cpp \
+	../components/RaftROS/RTPS/SPDPHandler.cpp \
+	../components/RaftROS/RTPS/SEDPHandler.cpp
+PROTO_OBJECTS = $(PROTO_SOURCES:.cpp=.o)
+
 # RaftCore
 REPO_URL=https://github.com/robdobsn/RaftCore
 DEST_DIR=./RaftCore
 # GIT_TAG=v1.0  # Optional: Specify a tag if needed
 
 # Ensure raft_core is executed every time by making it .PHONY
-.PHONY: raft_core clean all
+.PHONY: raft_core clean all standalone
 
 all: $(OUTPUT)
+
+standalone: $(STANDALONE_OUT)
 
 raft_core:
 	@echo "Fetching RaftCore repository..."
@@ -46,6 +63,11 @@ $(OUTPUT): $(OBJECTS) raft_core
 	@echo "Building $(OUTPUT)..."
 	$(CC) $(CFLAGS) $(INCLUDES) -o $(OUTPUT) $(OBJECTS)
 
+# Standalone ROS 2 participant
+$(STANDALONE_OUT): $(STANDALONE_OBJ) $(PROTO_OBJECTS) raft_core
+	@echo "Building $(STANDALONE_OUT)..."
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(STANDALONE_OUT) $(STANDALONE_OBJ) $(PROTO_OBJECTS)
+
 clean:
 	@echo "Cleaning up..."
-	rm -f $(OUTPUT) $(OBJECTS)
+	rm -f $(OUTPUT) $(STANDALONE_OUT) $(OBJECTS) $(STANDALONE_OBJ)

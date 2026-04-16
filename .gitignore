@@ -10,3 +10,4 @@ logs/
 node_modules
 *.o
 ros-humble-*/
+docker/captures/

@@ -90,6 +90,8 @@ private:
     void handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr);
     void purgeStaleParticipants();
     void processDiscoveredParticipant(DiscoveredParticipant& remote, const struct sockaddr_in& fromAddr);
+    void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
+                       const struct sockaddr_in& fromAddr);
 
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);

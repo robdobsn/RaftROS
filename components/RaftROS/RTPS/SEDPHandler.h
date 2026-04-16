@@ -32,7 +32,8 @@ public:
         const char* typeName,
         uint32_t reliabilityKind,
         uint32_t durabilityKind,
-        uint64_t sequenceNumber);
+        uint64_t sequenceNumber,
+        uint32_t ipAddrNetOrder = 0);
 
     /// Build a user DATA message wrapping a payload from a specific writer
     /// Used for publishing on topics like ros_discovery_info
@@ -43,6 +44,28 @@ public:
         const uint8_t* destGuidPrefix,
         const uint8_t* writerEntityId,
         const uint8_t* pPayload, uint32_t payloadLen,
+        uint64_t sequenceNumber,
+        uint32_t heartbeatCount);
+
+    /// Build a complete SEDP subscription announcement RTPS message
+    /// This announces a DataReader endpoint to a remote participant
+    uint32_t buildSubscriptionMessage(
+        uint8_t* pBuf, uint32_t bufLen,
+        const RTPSParticipant& participant,
+        const uint8_t* destGuidPrefix,
+        const uint8_t* readerEntityId,
+        const char* topicName,
+        const char* typeName,
+        uint32_t reliabilityKind,
+        uint32_t durabilityKind,
+        uint64_t sequenceNumber,
+        uint32_t ipAddrNetOrder = 0);
+
+    /// Build a Participant Message Data (liveliness assertion) RTPS message
+    uint32_t buildParticipantMessageData(
+        uint8_t* pBuf, uint32_t bufLen,
+        const RTPSParticipant& participant,
+        const uint8_t* destGuidPrefix,
         uint64_t sequenceNumber,
         uint32_t heartbeatCount);
 
