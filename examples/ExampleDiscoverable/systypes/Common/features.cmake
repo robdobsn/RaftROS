@@ -9,6 +9,9 @@ set(RAFT_COMPONENTS
     
 )
 
+# RaftROS component (local path - parent directory contains RaftROS CMakeLists.txt)
+list(APPEND EXTRA_COMPONENT_DIRS "${CMAKE_CURRENT_LIST_DIR}/../../../..")
+
 # File system
 set(FS_TYPE "littlefs")
 set(FS_IMAGE_PATH "../Common/FSImage")

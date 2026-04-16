@@ -16,4 +16,7 @@ idf_component_register(
       "components/RaftROS/CDR"
     REQUIRES
       RaftCore
+      esp_hw_support
+      esp_netif
+      lwip
     )
