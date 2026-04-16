@@ -1,6 +1,6 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// SPDP Handler - Simple Participant Discovery Protocol
+// SPDP Handler - Simple Participant Discovery Protocol message building
 //
 // Rob Dobson 2026
 //
@@ -9,8 +9,23 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
+#include <vector>
+#include "RTPSTypes.h"
 
 class RTPSParticipant;
+
+/// Discovered remote participant
+struct DiscoveredParticipant
+{
+    uint8_t guidPrefix[12] = {};
+    uint32_t ipAddr = 0;           // Network byte order
+    uint16_t metatrafficPort = 0;
+    uint16_t userDataPort = 0;
+    uint32_t leaseDurationSec = 0;
+    uint64_t discoveredTimeMs = 0;
+    bool valid = false;
+};
 
 class SPDPHandler
 {
@@ -18,20 +33,33 @@ public:
     SPDPHandler();
     ~SPDPHandler();
 
-    // Initialize with participant reference
-    void init(RTPSParticipant& participant);
+    /// Build a complete SPDP announcement RTPS message
+    /// Returns bytes written, or 0 on error
+    uint32_t buildAnnouncementMessage(
+        uint8_t* pBuf, uint32_t bufLen,
+        const RTPSParticipant& participant,
+        uint32_t ipAddrNetOrder,
+        uint32_t leaseDurationSec,
+        uint64_t sequenceNumber);
 
-    // Service SPDP (call from loop)
-    void service();
+    /// Parse a received SPDP message and extract participant info
+    /// Returns true if valid
+    bool parseAnnouncementMessage(const uint8_t* pBuf, uint32_t bufLen,
+                                   DiscoveredParticipant& outParticipant);
 
-    // Send participant announcement
-    bool sendAnnouncement();
-
-    // Process received SPDP message
-    void processReceived(const uint8_t* pData, uint32_t dataLen);
+    /// Build the ros_discovery_info CDR payload (ParticipantEntitiesInfo)
+    /// Returns bytes written
+    static uint32_t buildRosDiscoveryInfoPayload(
+        uint8_t* pBuf, uint32_t bufLen,
+        const uint8_t* participantGuid,
+        const char* nodeName,
+        const char* nodeNamespace);
 
 private:
-    RTPSParticipant* _pParticipant = nullptr;
-    uint32_t _lastAnnouncementMs = 0;
-    uint32_t _announcementIntervalMs = 30000; // Default 30s lease/3
+    /// Write a ParameterList entry header (PID + length)
+    static uint32_t writeParamHeader(uint8_t* pBuf, uint16_t pid, uint16_t length);
+
+    /// Write a Locator parameter (PID + 24-byte locator)
+    static uint32_t writeLocatorParam(uint8_t* pBuf, uint16_t pid,
+                                       uint32_t ipAddrNetOrder, uint16_t port);
 };

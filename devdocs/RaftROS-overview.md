@@ -578,18 +578,327 @@ RaftROS could expose an enhanced self-description capability beyond standard ROS
 
 ## 5. Implementation Phases
 
-### Phase 1: RTPS Foundation
+### Phase 1: RTPS Foundation — DDS Participant Discovery
 
 **Goal:** ESP32 appears as a DDS participant visible to `ros2 node list`
 
-- Implement RTPS message structure (header, submessages)
-- Implement SPDP (participant announcement and discovery)
-- Implement basic SEDP (endpoint announcement)
-- Implement CDR serialization for a few fixed message types
-- Create RaftROS SysMod skeleton
-- Test with Fast DDS and Cyclone DDS on a host
+**Deliverable:** Running `ros2 node list` on a host PC (same WiFi network, domain 0) shows `/raft_esp32` (or a configurable node name). Running `ros2 topic list` shows a `/raft_esp32/heartbeat` topic.
 
-**Deliverable:** `ros2 node list` shows `/raft_esp32_<mac>`, `ros2 topic list` shows a heartbeat topic
+**Example project:** `examples/ExampleDiscoverable` — a minimal Raft application that includes the RaftROS SysMod and demonstrates DDS participant discovery (see [§5.2](#52-examplediscoverable--the-phase-1-test-application) for full details).
+
+#### 5.1.1 What `ros2 node list` Requires (Protocol-Level)
+
+When a user runs `ros2 node list`, the ROS 2 CLI tool (or the ROS 2 daemon) acts as a DDS participant and discovers other participants via the SPDP multicast protocol. For the ESP32 to be visible, it must:
+
+1. **Join the SPDP multicast group** on the correct port
+2. **Send a valid `SPDPdiscoveredParticipantData` message** periodically
+3. **Include ROS 2 node name metadata** in the participant's `userData` QoS parameter
+4. **Respond to SEDP** built-in endpoint exchange (so the host can query topics)
+
+The discovery flow looks like this:
+
+```
+ESP32 (RaftROS)                                     ROS 2 Host (ros2 node list)
+     │                                                      │
+     │──── SPDP multicast ─────────────────────────────────▶│
+     │     (SPDPdiscoveredParticipantData)                   │
+     │     Contains: GUID, locators, lease,                  │
+     │     userData="name=/raft_esp32;ns=/;"                  │
+     │                                                      │
+     │◀──── SPDP multicast ────────────────────────────────│
+     │      (Host's own SPDP announcement)                  │
+     │                                                      │
+     │◀──── SEDP unicast (to our metatraffic locator) ─────│
+     │      "What endpoints do you have?"                   │
+     │                                                      │
+     │──── SEDP unicast ──────────────────────────────────▶│
+     │     "I have DataWriter for /raft_esp32/heartbeat"    │
+     │                                                      │
+     │                ros2 node list shows:                  │
+     │                   /raft_esp32                         │
+```
+
+#### 5.1.2 SPDP Multicast Details
+
+**Multicast group:** `239.255.0.1`
+
+**Port calculation** (DDSI-RTPS §9.6.1): The port numbers depend on the domain ID and participant index:
+
+| Port | Formula | Domain 0 Value |
+|------|---------|----------------|
+| SPDP multicast (discovery) | PB + DG × domainId + d0 | 7400 |
+| SPDP unicast (discovery) | PB + DG × domainId + d1 + PG × participantId | 7410+ |
+| User multicast (data) | PB + DG × domainId + d2 | 7401 |
+| User unicast (data) | PB + DG × domainId + d3 + PG × participantId | 7411+ |
+
+Where: PB=7400, DG=250, PG=2, d0=0, d1=10, d2=1, d3=11
+
+**SPDP announcement interval:** Typically every 30 seconds (configurable). Lease duration is typically 3× the announcement interval.
+
+#### 5.1.3 SPDPdiscoveredParticipantData Message Format
+
+The SPDP announcement is an RTPS message containing a DATA submessage. The payload is a CDR-serialized `ParameterList` — a sequence of (parameterId, length, value) tuples terminated by a sentinel:
+
+```
+RTPS Header (20 bytes)
+  ├── "RTPS" magic (4 bytes)
+  ├── Version 2.2 (2 bytes)
+  ├── Vendor ID (2 bytes)
+  └── GUID Prefix (12 bytes)
+
+INFO_TS Submessage (optional, timestamp)
+
+DATA Submessage
+  └── Serialized Payload (CDR-encoded ParameterList):
+        ├── PID_PROTOCOL_VERSION    (0x0015) → {2, 2}
+        ├── PID_VENDORID            (0x0016) → {0x01, 0x03} (or custom)
+        ├── PID_PARTICIPANT_GUID    (0x0050) → 16-byte GUID
+        ├── PID_BUILTIN_ENDPOINT_SET(0x0058) → bitmap of built-in endpoints
+        ├── PID_DEFAULT_UNICAST_LOCATOR    (0x0031) → {kind, port, address}
+        ├── PID_METATRAFFIC_UNICAST_LOCATOR(0x0032) → {kind, port, address}
+        ├── PID_METATRAFFIC_MULTICAST_LOCATOR(0x0049) → {kind, port, address}
+        ├── PID_PARTICIPANT_LEASE_DURATION (0x0002) → {seconds, fraction}
+        ├── PID_USER_DATA           (0x002c) → ROS 2 node name encoding
+        └── PID_SENTINEL            (0x0001) → end marker
+```
+
+**ROS 2 node name encoding in `PID_USER_DATA`:**
+
+ROS 2 middleware implementations (rmw_fastrtps, rmw_cyclonedds) encode the node name and namespace in the participant's `userData` field. The format is:
+
+```
+enclave=<enclave>;name=<node_name>;namespace=<namespace>;
+```
+
+For example, a node named `raft_esp32` in the default namespace:
+```
+enclave=/;name=raft_esp32;namespace=/;
+```
+
+#### 5.1.4 Built-in Endpoint Set (SEDP)
+
+The `PID_BUILTIN_ENDPOINT_SET` bitmap declares which built-in SEDP endpoints this participant supports. For Phase 1, the minimum viable set is:
+
+| Bit | Endpoint | Required? |
+|-----|----------|-----------|
+| 0 | DISC_BUILTIN_ENDPOINT_PARTICIPANT_DETECTOR | Yes |
+| 1 | DISC_BUILTIN_ENDPOINT_PARTICIPANT_ANNOUNCER | Yes |
+| 2 | DISC_BUILTIN_ENDPOINT_PUBLICATIONS_DETECTOR | Yes |
+| 3 | DISC_BUILTIN_ENDPOINT_PUBLICATIONS_ANNOUNCER | Yes |
+| 4 | DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR | Yes |
+| 5 | DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER | Yes |
+
+Minimum bitmap value: `0x3F` (all 6 basic built-in endpoints)
+
+#### 5.1.5 RTPS Locator Format
+
+Locators (used in `PID_DEFAULT_UNICAST_LOCATOR`, etc.) are 24-byte structures:
+
+```
+struct Locator_t {
+    int32_t kind;       // LOCATOR_KIND_UDPv4 = 1
+    uint32_t port;      // UDP port number
+    uint8_t address[16]; // IPv4 mapped: [0..11]=0, [12..15]=IPv4 octets
+};
+```
+
+For IPv4, the address field is 12 bytes of zero followed by the 4 IPv4 octets.
+
+#### 5.1.6 GUID Generation
+
+The participant GUID is 16 bytes: 12-byte GUID prefix + 4-byte entity ID.
+
+For the participant itself, the entity ID is `{0x00, 0x00, 0x01, 0xC1}` (`ENTITYID_PARTICIPANT`).
+
+The GUID prefix should be unique. Strategy for ESP32:
+- Bytes 0–1: Vendor ID (e.g., `{0x01, 0x03}` for eProsima or `{0x00, 0x00}` for unregistered)
+- Bytes 2–7: ESP32 MAC address (6 bytes, guaranteed unique per chip)
+- Bytes 8–11: Process/instance discriminator (e.g., monotonic counter or timestamp-based)
+
+#### 5.1.7 Implementation Tasks — Phase 1 Checklist
+
+The following tasks build on the existing scaffolding (CDREncoder, CDRDecoder, RTPSMessage, RaftROS SysMod skeleton):
+
+| # | Task | Component | Status |
+|---|------|-----------|--------|
+| 1 | RTPS message header write/parse | `RTPS/RTPSMessage` | Done |
+| 2 | CDR encoder (all primitives, strings) | `CDR/CDREncoder` | Done |
+| 3 | CDR decoder (all primitives, strings) | `CDR/CDRDecoder` | Done |
+| 4 | RaftROS SysMod skeleton | `RaftROS.h/.cpp` | Done (stub) |
+| 5 | RTPS participant GUID generation (MAC-based) | `RTPS/RTPSParticipant` | Stub exists |
+| 6 | CDR ParameterList encoder (PID + length + value tuples with sentinel) | `CDR/` or `RTPS/` | Not started |
+| 7 | SPDPdiscoveredParticipantData builder (compose full SPDP announce message) | `RTPS/SPDPHandler` | Not started |
+| 8 | SPDP multicast socket — join `239.255.0.1` on computed port, periodic send | `RTPS/SPDPHandler` | Not started |
+| 9 | SPDP receive + parse — extract remote participant GUID and locators | `RTPS/SPDPHandler` | Not started |
+| 10 | Participant table — store discovered remote participants with lease tracking | `RTPS/SPDPHandler` | Not started |
+| 11 | SEDP built-in endpoint announcement (publications/subscriptions) | `RTPS/SEDPHandler` | Not started |
+| 12 | DATA submessage write (framing for SPDP/SEDP payloads) | `RTPS/RTPSMessage` | Stub exists |
+| 13 | INFO_TS submessage (optional but improves interop) | `RTPS/RTPSMessage` | Not started |
+| 14 | Heartbeat topic — DataWriter for a simple `std_msgs/msg/String` topic | `RaftROS` | Not started |
+| 15 | Connection state machine in `loop()` — DISCONNECTED → MULTICAST_JOIN → SPDP_ANNOUNCING → ACTIVE | `RaftROS` | Stub exists |
+| 16 | WiFi-ready gating — only attempt multicast join after NetworkManager reports connected | `RaftROS` | Not started |
+| 17 | Integration test with `ros2 node list` on host PC | `examples/ExampleDiscoverable` | Not started |
+| 18 | Wireshark RTPS packet validation | Testing | Not started |
+
+**Recommended implementation order:**
+
+```
+[6] ParameterList encoder
+  └──▶ [7] SPDP message builder (uses ParameterList + CDR)
+         └──▶ [12] DATA submessage write (wraps SPDP payload)
+                └──▶ [8] Multicast socket + periodic send
+                       └──▶ [9] SPDP receive + parse
+                              └──▶ [10] Participant table
+                                     └──▶ [11] SEDP endpoint exchange
+                                            └──▶ [14] Heartbeat topic
+                                                   └──▶ [15,16] State machine + WiFi gating
+                                                          └──▶ [17,18] Test + validate
+```
+
+#### 5.1.8 Phase 1 Testing Strategy
+
+**Linux unit tests** (no hardware required):
+- ParameterList encoder round-trip (encode → decode, verify PIDs and values)
+- SPDP message builder — verify byte-level output against Wireshark captures from a known ROS 2 node
+- GUID generation determinism
+
+**On-device testing with ExampleDiscoverable:**
+1. Flash ExampleDiscoverable to ESP32, connect to same WiFi as ROS 2 host
+2. Run `ros2 node list` — verify `/raft_esp32` appears
+3. Run `ros2 topic list` — verify `/raft_esp32/heartbeat` appears
+4. Use Wireshark with RTPS dissector to capture and validate SPDP/SEDP packets
+5. Test lease duration — verify the node disappears after the ESP32 is powered off and the lease expires
+6. Test reconnection — power-cycle the ESP32, verify it re-appears
+
+**Interoperability matrix:**
+
+| ROS 2 Host DDS | Test Priority |
+|----------------|---------------|
+| Fast DDS (default in Humble/Iron/Jazzy) | Primary |
+| Cyclone DDS | Secondary |
+| Zenoh (Kilted Kaiju) | Future |
+
+### 5.2 ExampleDiscoverable — The Phase 1 Test Application
+
+The `examples/ExampleDiscoverable/` directory contains a complete Raft application that serves as the primary test vehicle for Phase 1. It is a standard Raft project (created via `raft new`) with the RaftROS SysMod integrated.
+
+#### 5.2.1 Project Structure
+
+```
+examples/ExampleDiscoverable/
+├── CMakeLists.txt              ← Raft bootstrap (fetches RaftCore, RaftSysMods, etc.)
+├── Dockerfile                  ← ESP-IDF v5.5.2 build container
+├── compose.yaml                ← Docker compose for CI builds
+├── main/
+│   ├── CMakeLists.txt          ← Links app to RaftCore, RaftSysMods, RaftWebServer, MainSysMod
+│   └── main.cpp                ← App entry point (registers SysMods, runs main loop)
+├── components/
+│   └── MainSysMod/             ← Minimal application SysMod
+│       ├── CMakeLists.txt
+│       ├── MainSysMod.cpp
+│       └── MainSysMod.h
+└── systypes/
+    ├── Common/
+    │   └── features.cmake      ← Target chip (esp32s3), Raft component versions
+    └── SysTypeMain/
+        ├── SysTypes.json       ← Full system configuration (NetMan, DevMan, Publish, etc.)
+        ├── features.cmake      ← Includes Common/features.cmake
+        ├── partitions.csv      ← Flash partition layout
+        └── sdkconfig.defaults  ← ESP-IDF SDK configuration
+```
+
+#### 5.2.2 Phase 1 Integration Plan
+
+To make ExampleDiscoverable function as a Phase 1 demonstrator, the following changes are needed:
+
+**1. Add RaftROS as a dependency:**
+
+In `systypes/Common/features.cmake`, add RaftROS to the component list:
+```cmake
+set(RAFT_COMPONENTS
+    RaftCore@main
+    RaftSysMods@main
+    RaftWebServer@main
+    RaftROS@main                  # ← NEW
+)
+```
+
+Or, for local development, use a path dependency by adding to `CMakeLists.txt`:
+```cmake
+list(APPEND EXTRA_COMPONENT_DIRS "../../components")
+```
+
+**2. Register the RaftROS SysMod in `main.cpp`:**
+
+```cpp
+#include "RaftROS.h"
+
+// In app_main(), before the main loop:
+raftCoreApp.registerSysMod("RaftROS", RaftROS::create, true);
+```
+
+**3. Configure RaftROS in `SysTypes.json`:**
+
+Add a RaftROS configuration block alongside the existing SysMod configs:
+```json
+{
+  "RaftROS": {
+    "enable": true,
+    "domainId": 0,
+    "nodeName": "raft_esp32",
+    "spdpAnnounceIntervalMs": 30000,
+    "leaseDurationS": 100,
+    "topics": [
+      {
+        "name": "heartbeat",
+        "path": "/raft_esp32/heartbeat",
+        "msgType": "std_msgs/msg/String",
+        "qos": "best_effort",
+        "inbound": false
+      }
+    ]
+  }
+}
+```
+
+**4. Ensure WiFi is configured** — the existing `NetMan` config in SysTypes.json already enables WiFi STA mode. The user must configure WiFi credentials (SSID/password) via the serial console or web interface before RaftROS can send multicast.
+
+#### 5.2.3 Expected Phase 1 Test Workflow
+
+```
+1. Build and flash:
+   $ cd examples/ExampleDiscoverable
+   $ raft run
+
+2. Configure WiFi (serial console):
+   > w/<SSID>/<password>
+
+3. On the ROS 2 host (same network):
+   $ source /opt/ros/jazzy/setup.bash
+   $ ros2 node list
+   /raft_esp32                          ← SUCCESS: ESP32 is discoverable
+
+   $ ros2 topic list
+   /raft_esp32/heartbeat                ← Phase 1 heartbeat topic
+
+4. Validate with Wireshark (optional):
+   - Filter: rtps
+   - Verify SPDP announcements from ESP32 IP on port 7400
+   - Verify GUID prefix contains ESP32 MAC
+   - Verify userData contains "name=raft_esp32;namespace=/;"
+```
+
+#### 5.2.4 Debugging DDS Discovery Issues
+
+Common issues when testing Phase 1 and how to diagnose them:
+
+| Symptom | Likely Cause | Diagnostic |
+|---------|-------------|------------|
+| Node not visible at all | Multicast blocked by WiFi AP or firewall | Wireshark: check if SPDP packets reach the host; try a different router |
+| Node appears then disappears | Lease duration too short or SPDP keepalive not sent | Check `spdpAnnounceIntervalMs` vs `leaseDurationS`; increase lease |
+| Node visible but no topics | SEDP not working | Wireshark: check for SEDP exchange after SPDP; verify built-in endpoint bitmap |
+| `ros2 node list` hangs | Domain ID mismatch | Verify both ESP32 and host use `ROS_DOMAIN_ID=0` |
+| Intermittent discovery | WiFi power saving dropping multicast | Disable WiFi power save in sdkconfig: `CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME=0` |
 
 ### Phase 2: Static Publishing
 

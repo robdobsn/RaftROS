@@ -8,5 +8,6 @@ idf_component_register(
         RaftCore
         RaftSysMods
         RaftWebServer
+        RaftROS
         MainSysMod
 )

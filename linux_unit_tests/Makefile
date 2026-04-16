@@ -8,7 +8,13 @@ CFLAGS = -Wall -std=c++20 -lc -g -DRAFT_CORE
 INCLUDES = -I../components/RaftROS -I../components/RaftROS/RTPS -I../components/RaftROS/CDR -I./RaftCore/components/core/Utils -I./RaftCore/components/core/ArduinoUtils -I.
 
 # Source files
-SOURCES = main.cpp utils.cpp ../components/RaftROS/CDR/CDREncoder.cpp ../components/RaftROS/CDR/CDRDecoder.cpp ../components/RaftROS/RTPS/RTPSMessage.cpp
+SOURCES = main.cpp utils.cpp \
+	../components/RaftROS/CDR/CDREncoder.cpp \
+	../components/RaftROS/CDR/CDRDecoder.cpp \
+	../components/RaftROS/RTPS/RTPSMessage.cpp \
+	../components/RaftROS/RTPS/RTPSParticipant.cpp \
+	../components/RaftROS/RTPS/SPDPHandler.cpp \
+	../components/RaftROS/RTPS/SEDPHandler.cpp
 
 # Object files
 OBJECTS = $(SOURCES:.cpp=.o)

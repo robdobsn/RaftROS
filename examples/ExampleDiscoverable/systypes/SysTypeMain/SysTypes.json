@@ -57,6 +57,14 @@
   "Publish": {
     "enable": 1
   },
+  "RaftROS": {
+    "enable": 1,
+    "domainId": 0,
+    "nodeName": "raft_esp32",
+    "nodeNamespace": "/",
+    "leaseDurationSec": 120,
+    "spdpIntervalMs": 5000
+  },
   "SerialConsole": {
     "enable": 1
   },
@@ -69,7 +77,7 @@
     ],
     "slowSysModMs": 50
   },
-  "SysTypeName": "SysTypeMain",
+  "SysTypeName": "RaftROS",
   "WebServer": {
     "enable": 1,
     "websockets": [

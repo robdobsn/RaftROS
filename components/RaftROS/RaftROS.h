@@ -1,6 +1,6 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// RaftROS - Native ROS 2 Node for Raft Framework
+// RaftROS - Native ROS 2 Node for Raft Framework (Phase 1: Discoverable Node)
 //
 // Rob Dobson 2026
 //
@@ -12,10 +12,9 @@
 #include "RTPSParticipant.h"
 #include "SPDPHandler.h"
 #include "SEDPHandler.h"
-#include "CDREncoder.h"
-#include <map>
+#include <vector>
 
-class CommsCoreIF;
+class APISourceInfo;
 
 class RaftROS : public RaftSysMod
 {
@@ -26,38 +25,72 @@ public:
     // SysMod lifecycle
     void setup() override;
     void loop() override;
-    void addCommsChannels(CommsCoreIF& commsCoreIF) override;
-    void postSetup() override;
-
-    // REST API and status
     void addRestAPIEndpoints(RestAPIEndpointManager& endpointManager) override;
     String getStatusJSON() const override;
+
+    // Factory for SysMod registration
+    static RaftSysMod* create(const char* pModuleName, RaftJsonIF& sysConfig)
+    {
+        return new RaftROS(pModuleName, sysConfig);
+    }
 
 private:
     // Configuration
     bool _isEnabled = false;
     uint32_t _domainId = 0;
     String _nodeName;
+    String _nodeNamespace;
+    uint32_t _leaseDurationSec = 120;
+    uint32_t _spdpIntervalMs = 30000;
 
-    // RTPS participant and discovery
+    // Protocol handlers (platform-independent)
     RTPSParticipant _participant;
-    SPDPHandler _spdp;
-    SEDPHandler _sedp;
+    SPDPHandler _spdpHandler;
+    SEDPHandler _sedpHandler;
 
-    // CDR serialization
-    CDREncoder _cdrEncoder;
+    // UDP sockets (-1 = not created)
+    int _spdpSock = -1;          // Multicast for SPDP (port 7400)
+    int _metatrafficSock = -1;   // Unicast for SEDP  (port 7410)
+    int _userDataSock = -1;      // Unicast for data   (port 7411)
 
-    // Channel integration
-    std::map<String, uint32_t> _topicChannelIDs;
+    // Our IP (network byte order)
+    uint32_t _myIpAddr = 0;
 
     // Connection state
-    enum class ConnState { DISCONNECTED, MULTICAST_JOIN, SPDP_ANNOUNCING, ACTIVE };
+    enum class ConnState { DISCONNECTED, ANNOUNCING, ACTIVE };
     ConnState _connState = ConnState::DISCONNECTED;
 
-    // Helpers
-    bool sendRTPSMsg(const String& topicName, CommsChannelMsg& msg);
-    bool readyToSend(uint32_t channelID, CommsMsgTypeCode msgType, bool& noConn);
+    // Sequence numbers and counters
+    uint32_t _lastSpdpSendMs = 0;
+    uint32_t _lastWriterHbMs = 0;
+    static const uint32_t WRITER_HB_INTERVAL_MS = 1000;
+    uint64_t _spdpSeqNum = 0;
+    uint64_t _sedpSeqNum = 1;     // always 1 (single SEDP pub, never changes)
+    uint64_t _rosDiscSeqNum = 1;  // always 1 (single ros_discovery_info sample)
+    uint32_t _heartbeatCount = 0;
+    uint32_t _acknackCount = 0;
 
-    // API handler
+    // Discovered remote participants
+    std::vector<DiscoveredParticipant> _discovered;
+    static const uint32_t MAX_DISCOVERED = 8;
+
+    // Buffers for UDP I/O
+    uint8_t _sendBuf[512] = {};
+    uint8_t _recvBuf[512] = {};
+
+    // Networking helpers
+    uint32_t getLocalIP();
+    bool createSockets();
+    void closeSockets();
+    void sendSPDP();
+    void recvSPDP();
+    void recvMetatraffic();
+    void recvUserData();
+    void sendWriterHeartbeats();
+    void handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr);
+    void purgeStaleParticipants();
+    void processDiscoveredParticipant(DiscoveredParticipant& remote, const struct sockaddr_in& fromAddr);
+
+    // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
 };
