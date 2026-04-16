@@ -1,0 +1,20 @@
+services:
+  # Reference capture: two real ROS 2 nodes talking to each other
+  # Use bridge network so we only see DDS traffic (no host noise)
+  ros-node:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    container_name: raftros-test
+    network_mode: host
+    privileged: true
+    volumes:
+      - ../docker/captures:/workspace/captures
+      - ../docker/scripts:/workspace/scripts
+    environment:
+      - ROS_DOMAIN_ID=0
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - FASTRTPS_DEFAULT_PROFILES_FILE=/workspace/scripts/fastdds_profile.xml
+    command: ["bash"]
+    stdin_open: true
+    tty: true

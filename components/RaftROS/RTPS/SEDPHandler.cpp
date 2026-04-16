@@ -64,9 +64,10 @@ uint32_t SEDPHandler::buildPublicationMessage(
     const char* typeName,
     uint32_t reliabilityKind,
     uint32_t durabilityKind,
-    uint64_t sequenceNumber)
+    uint64_t sequenceNumber,
+    uint32_t ipAddrNetOrder)
 {
-    if (!pBuf || bufLen < 300)
+    if (!pBuf || bufLen < 400)
         return 0;
 
     uint32_t pos = 0;
@@ -81,7 +82,7 @@ uint32_t SEDPHandler::buildPublicationMessage(
     pos += RTPSMessage::writeInfoTS(pBuf + pos, bufLen - pos, 0, 0);
 
     // Build SEDP publication ParameterList payload
-    uint8_t payload[512];
+    uint8_t payload[600];
     uint32_t pp = 0;
 
     // CDR Encapsulation: PL_CDR_LE
@@ -124,6 +125,22 @@ uint32_t SEDPHandler::buildPublicationMessage(
     putLE16(payload + pp, PID_DURABILITY); pp += 2;
     putLE16(payload + pp, 4); pp += 2;   // length = 4
     putLE32(payload + pp, durabilityKind); pp += 4;
+
+    // PID_UNICAST_LOCATOR — tells remote where to send user data
+    if (ipAddrNetOrder != 0)
+    {
+        putLE16(payload + pp, PID_UNICAST_LOCATOR); pp += 2;
+        putLE16(payload + pp, 24); pp += 2;  // length = 24 (locator struct)
+        RTPSParticipant::buildLocatorUDPv4(payload + pp, ipAddrNetOrder,
+                                           participant.getUserUnicastPort());
+        pp += 24;
+    }
+
+    // PID_PARTICIPANT_GUID
+    putLE16(payload + pp, PID_PARTICIPANT_GUID); pp += 2;
+    putLE16(payload + pp, 16); pp += 2;
+    memcpy(payload + pp, participant.getGuidPrefix(), 12); pp += 12;
+    memcpy(payload + pp, ENTITYID_PARTICIPANT, 4); pp += 4;
 
     // PID_SENTINEL
     putLE16(payload + pp, PID_SENTINEL); pp += 2;
@@ -187,6 +204,178 @@ uint32_t SEDPHandler::buildUserDataMessage(
         ENTITYID_UNKNOWN,
         writerEntityId,
         0, 1,  // firstSN = 1
+        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        heartbeatCount);
+
+    return pos;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Build SEDP subscription announcement RTPS message
+// Announces a DataReader endpoint to a remote participant
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t SEDPHandler::buildSubscriptionMessage(
+    uint8_t* pBuf, uint32_t bufLen,
+    const RTPSParticipant& participant,
+    const uint8_t* destGuidPrefix,
+    const uint8_t* readerEntityId,
+    const char* topicName,
+    const char* typeName,
+    uint32_t reliabilityKind,
+    uint32_t durabilityKind,
+    uint64_t sequenceNumber,
+    uint32_t ipAddrNetOrder)
+{
+    if (!pBuf || bufLen < 300)
+        return 0;
+
+    uint32_t pos = 0;
+
+    // RTPS Header
+    pos += RTPSMessage::writeHeader(pBuf + pos, bufLen - pos, participant.getGuidPrefix());
+
+    // INFO_DST
+    pos += RTPSMessage::writeInfoDST(pBuf + pos, bufLen - pos, destGuidPrefix);
+
+    // INFO_TS
+    pos += RTPSMessage::writeInfoTS(pBuf + pos, bufLen - pos, 0, 0);
+
+    // Build SEDP subscription ParameterList payload
+    uint8_t payload[600];
+    uint32_t pp = 0;
+
+    // CDR Encapsulation: PL_CDR_LE
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x03;
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x00;
+
+    // PID_ENDPOINT_GUID
+    putLE16(payload + pp, PID_ENDPOINT_GUID); pp += 2;
+    putLE16(payload + pp, 16);                pp += 2;
+    memcpy(payload + pp, participant.getGuidPrefix(), 12);
+    pp += 12;
+    memcpy(payload + pp, readerEntityId, 4);
+    pp += 4;
+
+    // PID_TOPIC_NAME
+    uint32_t topicPadded = ((uint32_t)strlen(topicName) + 1 + 3) & ~3u;
+    putLE16(payload + pp, PID_TOPIC_NAME); pp += 2;
+    putLE16(payload + pp, (uint16_t)(4 + topicPadded)); pp += 2;
+    pp += writePLString(payload + pp, topicName);
+
+    // PID_TYPE_NAME
+    uint32_t typePadded = ((uint32_t)strlen(typeName) + 1 + 3) & ~3u;
+    putLE16(payload + pp, PID_TYPE_NAME); pp += 2;
+    putLE16(payload + pp, (uint16_t)(4 + typePadded)); pp += 2;
+    pp += writePLString(payload + pp, typeName);
+
+    // PID_RELIABILITY
+    putLE16(payload + pp, PID_RELIABILITY); pp += 2;
+    putLE16(payload + pp, 12); pp += 2;
+    putLE32(payload + pp, reliabilityKind); pp += 4;
+    putLE32(payload + pp, 0); pp += 4;
+    putLE32(payload + pp, 100000000); pp += 4;
+
+    // PID_DURABILITY
+    putLE16(payload + pp, PID_DURABILITY); pp += 2;
+    putLE16(payload + pp, 4); pp += 2;
+    putLE32(payload + pp, durabilityKind); pp += 4;
+
+    // PID_UNICAST_LOCATOR — tells remote where to send user data
+    if (ipAddrNetOrder != 0)
+    {
+        putLE16(payload + pp, PID_UNICAST_LOCATOR); pp += 2;
+        putLE16(payload + pp, 24); pp += 2;
+        RTPSParticipant::buildLocatorUDPv4(payload + pp, ipAddrNetOrder,
+                                           participant.getUserUnicastPort());
+        pp += 24;
+    }
+
+    // PID_PARTICIPANT_GUID
+    putLE16(payload + pp, PID_PARTICIPANT_GUID); pp += 2;
+    putLE16(payload + pp, 16); pp += 2;
+    memcpy(payload + pp, participant.getGuidPrefix(), 12); pp += 12;
+    memcpy(payload + pp, ENTITYID_PARTICIPANT, 4); pp += 4;
+
+    // PID_SENTINEL
+    putLE16(payload + pp, PID_SENTINEL); pp += 2;
+    putLE16(payload + pp, 0); pp += 2;
+
+    // Write DATA submessage via SEDP subscriptions writer
+    pos += RTPSMessage::writeDataSubmessage(pBuf + pos, bufLen - pos,
+        ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER,
+        ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
+        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        payload, pp);
+
+    // HEARTBEAT
+    pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
+        ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER,
+        ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
+        0, 1,
+        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        (uint32_t)sequenceNumber);
+
+    return pos;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Build Participant Message Data (liveliness assertion)
+// GuidPrefix + PARTICIPANT_MESSAGE_DATA_WRITER -> DATA + HB
+// Payload: participantGuidPrefix(12) + kind(4) + data(4+0)
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t SEDPHandler::buildParticipantMessageData(
+    uint8_t* pBuf, uint32_t bufLen,
+    const RTPSParticipant& participant,
+    const uint8_t* destGuidPrefix,
+    uint64_t sequenceNumber,
+    uint32_t heartbeatCount)
+{
+    if (!pBuf || bufLen < 120)
+        return 0;
+
+    uint32_t pos = 0;
+
+    // RTPS Header
+    pos += RTPSMessage::writeHeader(pBuf + pos, bufLen - pos, participant.getGuidPrefix());
+
+    // INFO_DST
+    pos += RTPSMessage::writeInfoDST(pBuf + pos, bufLen - pos, destGuidPrefix);
+
+    // INFO_TS
+    pos += RTPSMessage::writeInfoTS(pBuf + pos, bufLen - pos, 0, 0);
+
+    // ParticipantMessageData payload:
+    // CDR encapsulation (4 bytes) + participantGuidPrefix (12 bytes)
+    // + kind (4 bytes: AUTOMATIC_LIVELINESS_UPDATE = {0,0,0,1})
+    // + sequence of octets length (4 bytes: 0 = empty)
+    uint8_t payload[24];
+    uint32_t pp = 0;
+    payload[pp++] = 0x00; payload[pp++] = 0x01;  // CDR_LE (plain CDR)
+    payload[pp++] = 0x00; payload[pp++] = 0x00;
+    memcpy(payload + pp, participant.getGuidPrefix(), 12); pp += 12;
+    // kind = AUTOMATIC_LIVELINESS_UPDATE
+    payload[pp++] = 0x00; payload[pp++] = 0x00;
+    payload[pp++] = 0x00; payload[pp++] = 0x01;
+    // data length = 0
+    payload[pp++] = 0x00; payload[pp++] = 0x00;
+    payload[pp++] = 0x00; payload[pp++] = 0x00;
+
+    // DATA submessage
+    pos += RTPSMessage::writeDataSubmessage(pBuf + pos, bufLen - pos,
+        ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
+        ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
+        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        payload, pp);
+
+    // HEARTBEAT
+    pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
+        ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
+        ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
+        0, 1,
         0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
         heartbeatCount);
 
