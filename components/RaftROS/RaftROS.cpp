@@ -623,7 +623,7 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
                 "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
                 RELIABILITY_RELIABLE,
                 DURABILITY_TRANSIENT_LOCAL,
-                _sedpSeqNum);
+                _sedpSeqNum, _myIpAddr);
 
             if (sedpLen > 0)
             {
@@ -673,6 +673,34 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
             }
         }
     }
+    else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
+    {
+        // They want our SEDP subscription data (SN=1)
+        if (bitmapBaseLow <= 1)
+        {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP subscription");
+            uint32_t sedpSubLen = _sedpHandler.buildSubscriptionMessage(
+                _sendBuf, sizeof(_sendBuf),
+                _participant, srcGuidPrefix,
+                ENTITYID_ROS_DISC_INFO_READER,
+                "ros_discovery_info",
+                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                RELIABILITY_RELIABLE,
+                DURABILITY_TRANSIENT_LOCAL,
+                _sedpSubSeqNum, _myIpAddr);
+
+            if (sedpSubLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote->metatrafficPort);
+                dest.sin_addr.s_addr = remote->ipAddr;
+                int sent = sendto(_metatrafficSock, _sendBuf, sedpSubLen, 0,
+                                  (struct sockaddr*)&dest, sizeof(dest));
+                LOG_I(MODULE_PREFIX, "  SEDP sub retransmit %d/%d bytes", sent, (int)sedpSubLen);
+            }
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -719,7 +747,7 @@ void RaftROS::sendWriterHeartbeats()
                 "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
                 RELIABILITY_RELIABLE,
                 DURABILITY_TRANSIENT_LOCAL,
-                _sedpSeqNum);  // resend same seqNum (not incrementing)
+                _sedpSeqNum, _myIpAddr);
 
             if (sedpLen > 0)
             {
@@ -732,7 +760,50 @@ void RaftROS::sendWriterHeartbeats()
             }
         }
 
-        // 2) Resend ros_discovery_info DATA + HB → remote user data port
+        // 2) SEDP subscription DATA + HB → remote metatraffic port
+        {
+            uint32_t sedpSubLen = _sedpHandler.buildSubscriptionMessage(
+                _sendBuf, sizeof(_sendBuf),
+                _participant, remote.guidPrefix,
+                ENTITYID_ROS_DISC_INFO_READER,
+                "ros_discovery_info",
+                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                RELIABILITY_RELIABLE,
+                DURABILITY_TRANSIENT_LOCAL,
+                _sedpSubSeqNum, _myIpAddr);
+
+            if (sedpSubLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote.metatrafficPort);
+                dest.sin_addr.s_addr = remote.ipAddr;
+                sendto(_metatrafficSock, _sendBuf, sedpSubLen, 0,
+                       (struct sockaddr*)&dest, sizeof(dest));
+            }
+        }
+
+        // 3) Participant message data (liveliness) → remote metatraffic port
+        {
+            _heartbeatCount++;
+            _livelinessSeqNum++;
+            uint32_t pmdLen = _sedpHandler.buildParticipantMessageData(
+                _sendBuf, sizeof(_sendBuf),
+                _participant, remote.guidPrefix,
+                _livelinessSeqNum, _heartbeatCount);
+
+            if (pmdLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote.metatrafficPort);
+                dest.sin_addr.s_addr = remote.ipAddr;
+                sendto(_metatrafficSock, _sendBuf, pmdLen, 0,
+                       (struct sockaddr*)&dest, sizeof(dest));
+            }
+        }
+
+        // 4) Resend ros_discovery_info DATA + HB → remote user data port
         {
             uint8_t rosDiscPayload[256];
             uint32_t rosDiscLen = SPDPHandler::buildRosDiscoveryInfoPayload(
@@ -808,7 +879,7 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
         "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
         RELIABILITY_RELIABLE,
         DURABILITY_TRANSIENT_LOCAL,
-        _sedpSeqNum);
+        _sedpSeqNum, _myIpAddr);
 
     if (sedpLen > 0)
     {
@@ -822,7 +893,53 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
               sent, (int)sedpLen, (int)remote.metatrafficPort);
     }
 
-    // 2) ros_discovery_info will be sent by periodic sendWriterHeartbeats()
+    // 2) SEDP subscription announcement (we subscribe to ros_discovery_info)
+    {
+        uint32_t sedpSubLen = _sedpHandler.buildSubscriptionMessage(
+            _sendBuf, sizeof(_sendBuf),
+            _participant, remote.guidPrefix,
+            ENTITYID_ROS_DISC_INFO_READER,
+            "ros_discovery_info",
+            "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+            RELIABILITY_RELIABLE,
+            DURABILITY_TRANSIENT_LOCAL,
+            _sedpSubSeqNum, _myIpAddr);
+
+        if (sedpSubLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote.metatrafficPort);
+            dest.sin_addr.s_addr = remote.ipAddr;
+            int sent = sendto(_metatrafficSock, _sendBuf, sedpSubLen, 0,
+                   (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP sub sent %d/%d bytes to port %d",
+                  sent, (int)sedpSubLen, (int)remote.metatrafficPort);
+        }
+    }
+
+    // 3) Participant message data (liveliness assertion)
+    {
+        _heartbeatCount++;
+        uint32_t pmdLen = _sedpHandler.buildParticipantMessageData(
+            _sendBuf, sizeof(_sendBuf),
+            _participant, remote.guidPrefix,
+            _livelinessSeqNum, _heartbeatCount);
+
+        if (pmdLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote.metatrafficPort);
+            dest.sin_addr.s_addr = remote.ipAddr;
+            int sent = sendto(_metatrafficSock, _sendBuf, pmdLen, 0,
+                   (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "handleNewParticipant liveliness sent %d/%d bytes to port %d",
+                  sent, (int)pmdLen, (int)remote.metatrafficPort);
+        }
+    }
+
+    // 4) ros_discovery_info will be sent by periodic sendWriterHeartbeats()
     //    (initial burst causes errno 12 = lwIP buffer exhaustion)
 
     _connState = ConnState::ACTIVE;

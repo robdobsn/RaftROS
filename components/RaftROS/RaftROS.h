@@ -66,7 +66,9 @@ private:
     static const uint32_t WRITER_HB_INTERVAL_MS = 1000;
     uint64_t _spdpSeqNum = 0;
     uint64_t _sedpSeqNum = 1;     // always 1 (single SEDP pub, never changes)
+    uint64_t _sedpSubSeqNum = 1;  // always 1 (single SEDP sub, never changes)
     uint64_t _rosDiscSeqNum = 1;  // always 1 (single ros_discovery_info sample)
+    uint64_t _livelinessSeqNum = 0; // incremented each liveliness send
     uint32_t _heartbeatCount = 0;
     uint32_t _acknackCount = 0;
 
@@ -75,8 +77,8 @@ private:
     static const uint32_t MAX_DISCOVERED = 8;
 
     // Buffers for UDP I/O
-    uint8_t _sendBuf[512] = {};
-    uint8_t _recvBuf[512] = {};
+    uint8_t _sendBuf[1024] = {};
+    uint8_t _recvBuf[2048] = {};
 
     // Networking helpers
     uint32_t getLocalIP();
