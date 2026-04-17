@@ -263,7 +263,7 @@ Implement the minimum subset of the DDSI-RTPS specification needed to:
 **Cons:** Most complex to implement; RTPS is a substantial protocol
 
 **Scope can be limited by:**
-- Supporting only Best-Effort reliability (no ACK/NACK/heartbeat state machines)
+- Supporting only Best-Effort reliability for user topics (reliable delivery is already implemented for discovery)
 - Supporting only a fixed, small set of ROS message types
 - Using compile-time topic configuration with runtime device-driven additions
 - Targeting a specific ROS 2 DDS implementation for initial interop testing (e.g., Fast DDS or Cyclone DDS)
@@ -314,16 +314,19 @@ The full RTPS specification (OMG DDSI-RTPS v2.5) is large, but a workable subset
 - Maintain a participant table with lease duration tracking
 
 **Required SEDP functionality:**
-- Announce DataWriter endpoints (for publishers) and DataReader endpoints (for subscribers)
+- Announce DataWriter endpoints (publication messages) with topic name, type name, QoS, unicast locator, and participant GUID
+- Announce DataReader endpoints (subscription messages) with matching parameters
+- Send Participant Message Data (liveliness assertions) periodically
 - Parse remote endpoint announcements to match publishers to subscribers
 - Maintain matched endpoint state
+- Handle reliable delivery for all SEDP exchanges (HEARTBEAT + ACKNACK + retransmit)
 
 #### 3.2.2 Data Exchange
 
 - Serialize outgoing messages in CDR (Common Data Representation) format
 - Send data over UDP unicast to matched subscribers
 - Receive data over UDP from matched publishers
-- Handle the RTPS message header and submessage structure (DATA, HEARTBEAT, ACKNACK for reliable, or just DATA for best-effort)
+- Handle the RTPS message header and submessage structure (DATA, HEARTBEAT, ACKNACK, INFO_DST, INFO_TS) — reliable delivery is already implemented
 
 #### 3.2.3 CDR Serialization
 
@@ -420,7 +423,6 @@ loop():            Service RTPS connection state machine:
     ]
   }
 }
-```
 ```
 
 ### 3.4 Device-to-ROS Mapping Engine
@@ -580,9 +582,9 @@ RaftROS could expose an enhanced self-description capability beyond standard ROS
 
 ### Phase 1: RTPS Foundation — DDS Participant Discovery
 
-**Goal:** ESP32 appears as a DDS participant visible to `ros2 node list`
+**Goal:** ESP32 appears as a DDS participant visible to `ros2 node list` ✅ COMPLETE
 
-**Deliverable:** Running `ros2 node list` on a host PC (same WiFi network, domain 0) shows `/raft_esp32` (or a configurable node name). Running `ros2 topic list` shows a `/raft_esp32/heartbeat` topic.
+**Deliverable:** Running `ros2 node list` on a host PC (same WiFi network, domain 0) shows `/raft_esp32`.
 
 **Example project:** `examples/ExampleDiscoverable` — a minimal Raft application that includes the RaftROS SysMod and demonstrates DDS participant discovery (see [§5.2](#52-examplediscoverable--the-phase-1-test-application) for full details).
 
@@ -603,16 +605,23 @@ ESP32 (RaftROS)                                     ROS 2 Host (ros2 node list)
      │──── SPDP multicast ─────────────────────────────────▶│
      │     (SPDPdiscoveredParticipantData)                   │
      │     Contains: GUID, locators, lease,                  │
-     │     userData="name=/raft_esp32;ns=/;"                  │
+     │     userData="enclave=/;"                              │
      │                                                      │
      │◀──── SPDP multicast ────────────────────────────────│
      │      (Host's own SPDP announcement)                  │
      │                                                      │
-     │◀──── SEDP unicast (to our metatraffic locator) ─────│
-     │      "What endpoints do you have?"                   │
+     │──── SEDP pub unicast (metatraffic) ─────────────────▶│
+     │     "I have DataWriter for ros_discovery_info"        │
+     │──── SEDP sub unicast (metatraffic) ─────────────────▶│
+     │     "I have DataReader for ros_discovery_info"        │
+     │──── Liveliness (metatraffic) ───────────────────────▶│
+     │     (Participant message data)                        │
      │                                                      │
-     │──── SEDP unicast ──────────────────────────────────▶│
-     │     "I have DataWriter for /raft_esp32/heartbeat"    │
+     │◀──── SEDP + ACKNACK exchange ───────────────────────│
+     │      (Endpoint matching handshake)                   │
+     │                                                      │
+     │──── ros_discovery_info DATA (user data port) ───────▶│
+     │     (CDR: participant GID, node name, namespace)      │
      │                                                      │
      │                ros2 node list shows:                  │
      │                   /raft_esp32                         │
@@ -662,22 +671,18 @@ DATA Submessage
         └── PID_SENTINEL            (0x0001) → end marker
 ```
 
-**ROS 2 node name encoding in `PID_USER_DATA`:**
+**ROS 2 enclave encoding in `PID_USER_DATA`:**
 
-ROS 2 middleware implementations (rmw_fastrtps, rmw_cyclonedds) encode the node name and namespace in the participant's `userData` field. The format is:
+FastRTPS requires `PID_USER_DATA` to contain the DDS security enclave path. For the default enclave:
+```
+enclave=/;
+```
 
-```
-enclave=<enclave>;name=<node_name>;namespace=<namespace>;
-```
-
-For example, a node named `raft_esp32` in the default namespace:
-```
-enclave=/;name=raft_esp32;namespace=/;
-```
+Without this field, FastRTPS **silently ignores** the participant entirely — it will not appear in `ros2 node list`. The actual node name and namespace are **not** in the SPDP `userData` — they are communicated via the `ros_discovery_info` topic (a CDR-encoded `ParticipantEntitiesInfo` message containing participant GID, node namespace, node name, and reader/writer GID lists).
 
 #### 5.1.4 Built-in Endpoint Set (SEDP)
 
-The `PID_BUILTIN_ENDPOINT_SET` bitmap declares which built-in SEDP endpoints this participant supports. For Phase 1, the minimum viable set is:
+The `PID_BUILTIN_ENDPOINT_SET` bitmap declares which built-in SEDP endpoints this participant supports. The required set (validated by implementation) is:
 
 | Bit | Endpoint | Required? |
 |-----|----------|-----------|
@@ -687,8 +692,10 @@ The `PID_BUILTIN_ENDPOINT_SET` bitmap declares which built-in SEDP endpoints thi
 | 3 | DISC_BUILTIN_ENDPOINT_PUBLICATIONS_ANNOUNCER | Yes |
 | 4 | DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_DETECTOR | Yes |
 | 5 | DISC_BUILTIN_ENDPOINT_SUBSCRIPTIONS_ANNOUNCER | Yes |
+| 10 | BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_WRITER | Yes |
+| 11 | BUILTIN_ENDPOINT_PARTICIPANT_MESSAGE_DATA_READER | Yes |
 
-Minimum bitmap value: `0x3F` (all 6 basic built-in endpoints)
+**Required bitmap value: `0x0C3F`** (bits 0-5 + bits 10-11). The PARTICIPANT_MESSAGE_DATA endpoints (bits 10-11) are required for liveliness assertion — without them, FastRTPS does not complete endpoint matching.
 
 #### 5.1.5 RTPS Locator Format
 
@@ -717,43 +724,66 @@ The GUID prefix should be unique. Strategy for ESP32:
 
 #### 5.1.7 Implementation Tasks — Phase 1 Checklist
 
-The following tasks build on the existing scaffolding (CDREncoder, CDRDecoder, RTPSMessage, RaftROS SysMod skeleton):
-
 | # | Task | Component | Status |
 |---|------|-----------|--------|
-| 1 | RTPS message header write/parse | `RTPS/RTPSMessage` | Done |
-| 2 | CDR encoder (all primitives, strings) | `CDR/CDREncoder` | Done |
-| 3 | CDR decoder (all primitives, strings) | `CDR/CDRDecoder` | Done |
-| 4 | RaftROS SysMod skeleton | `RaftROS.h/.cpp` | Done (stub) |
-| 5 | RTPS participant GUID generation (MAC-based) | `RTPS/RTPSParticipant` | Stub exists |
-| 6 | CDR ParameterList encoder (PID + length + value tuples with sentinel) | `CDR/` or `RTPS/` | Not started |
-| 7 | SPDPdiscoveredParticipantData builder (compose full SPDP announce message) | `RTPS/SPDPHandler` | Not started |
-| 8 | SPDP multicast socket — join `239.255.0.1` on computed port, periodic send | `RTPS/SPDPHandler` | Not started |
-| 9 | SPDP receive + parse — extract remote participant GUID and locators | `RTPS/SPDPHandler` | Not started |
-| 10 | Participant table — store discovered remote participants with lease tracking | `RTPS/SPDPHandler` | Not started |
-| 11 | SEDP built-in endpoint announcement (publications/subscriptions) | `RTPS/SEDPHandler` | Not started |
-| 12 | DATA submessage write (framing for SPDP/SEDP payloads) | `RTPS/RTPSMessage` | Stub exists |
-| 13 | INFO_TS submessage (optional but improves interop) | `RTPS/RTPSMessage` | Not started |
-| 14 | Heartbeat topic — DataWriter for a simple `std_msgs/msg/String` topic | `RaftROS` | Not started |
-| 15 | Connection state machine in `loop()` — DISCONNECTED → MULTICAST_JOIN → SPDP_ANNOUNCING → ACTIVE | `RaftROS` | Stub exists |
-| 16 | WiFi-ready gating — only attempt multicast join after NetworkManager reports connected | `RaftROS` | Not started |
-| 17 | Integration test with `ros2 node list` on host PC | `examples/ExampleDiscoverable` | Not started |
-| 18 | Wireshark RTPS packet validation | Testing | Not started |
+| 1 | RTPS message header write/parse | `RTPS/RTPSMessage` | ✅ Done |
+| 2 | CDR encoder (all primitives, strings) | `CDR/CDREncoder` | ✅ Done |
+| 3 | CDR decoder (all primitives, strings) | `CDR/CDRDecoder` | ✅ Done |
+| 4 | RaftROS SysMod with connection state machine | `RaftROS.h/.cpp` | ✅ Done |
+| 5 | RTPS participant GUID generation (MAC-based) | `RTPS/RTPSParticipant` | ✅ Done |
+| 6 | CDR ParameterList encoder (PID tuples + sentinel) | `RTPS/SPDPHandler` | ✅ Done |
+| 7 | SPDPdiscoveredParticipantData builder | `RTPS/SPDPHandler` | ✅ Done |
+| 8 | SPDP multicast socket — join + periodic send | `RaftROS` | ✅ Done |
+| 9 | SPDP receive + parse (multicast and metatraffic port) | `RaftROS` | ✅ Done |
+| 10 | Participant table with lease tracking + purging | `RaftROS` | ✅ Done |
+| 11 | SEDP publication endpoint announcement | `RTPS/SEDPHandler` | ✅ Done |
+| 12 | SEDP subscription endpoint announcement | `RTPS/SEDPHandler` | ✅ Done |
+| 13 | Participant message data (liveliness) | `RTPS/SEDPHandler` | ✅ Done |
+| 14 | ros_discovery_info CDR payload builder | `RTPS/SPDPHandler` | ✅ Done |
+| 15 | ros_discovery_info DataWriter (user data port) | `RTPS/SEDPHandler` | ✅ Done |
+| 16 | DATA submessage write (for SPDP/SEDP/user data) | `RTPS/RTPSMessage` | ✅ Done |
+| 17 | INFO_DST + INFO_TS submessages | `RTPS/RTPSMessage` | ✅ Done |
+| 18 | HEARTBEAT submessage (sent with each DATA) | `RTPS/RTPSMessage` | ✅ Done |
+| 19 | ACKNACK handling — respond to remote HBs | `RaftROS` | ✅ Done |
+| 20 | ACKNACK handling — retransmit on remote NACKs | `RaftROS` | ✅ Done |
+| 21 | Periodic writer heartbeats (all 4 writers) | `RaftROS` | ✅ Done |
+| 22 | WiFi-ready gating (only join multicast after connected) | `RaftROS` | ✅ Done |
+| 23 | Integration test: `ros2 node list` shows `/raft_esp32` | ESP32 + ROS 2 host | ✅ Done |
+| 24 | Linux standalone test node (`raftros_standalone.cpp`) | `linux_unit_tests/` | ✅ Done |
 
-**Recommended implementation order:**
+#### 5.1.8 Phase 1 Key Learnings
 
-```
-[6] ParameterList encoder
-  └──▶ [7] SPDP message builder (uses ParameterList + CDR)
-         └──▶ [12] DATA submessage write (wraps SPDP payload)
-                └──▶ [8] Multicast socket + periodic send
-                       └──▶ [9] SPDP receive + parse
-                              └──▶ [10] Participant table
-                                     └──▶ [11] SEDP endpoint exchange
-                                            └──▶ [14] Heartbeat topic
-                                                   └──▶ [15,16] State machine + WiFi gating
-                                                          └──▶ [17,18] Test + validate
-```
+The following lessons were learned during Phase 1 implementation. These are critical for anyone working on or extending the RTPS code:
+
+**Entity ID encoding (NO_KEY vs WITH_KEY):**
+The `ros_discovery_info` topic uses `WRITER_NO_KEY` (entity kind byte `0x03`) and `READER_NO_KEY` (`0x04`). Using `WITH_KEY` variants (`0x02` / `0x07`) causes FastDDS XTypes type matching to fail silently — the endpoint is discovered but never matched. This was the single most important fix.
+
+**SEDP requires both publication AND subscription announcements:**
+It is not sufficient to only announce our DataWriter (SEDP publication). We must also announce our DataReader (SEDP subscription) for `ros_discovery_info`, plus send Participant Message Data (liveliness assertions). Without all three, FastDDS does not complete the endpoint matching handshake.
+
+**PID_UNICAST_LOCATOR and PID_PARTICIPANT_GUID in SEDP:**
+SEDP publication and subscription messages must include `PID_UNICAST_LOCATOR` (our IP address) and `PID_PARTICIPANT_GUID` (linking the endpoint back to the participant). Without `PID_UNICAST_LOCATOR`, the remote peer doesn't know where to send user data.
+
+**ros_discovery_info sequence number must not increment:**
+The `ros_discovery_info` payload is static (same content every time). Its sequence number must stay at 1. Incrementing it causes the remote to ACKNACK requesting all the "missing" intermediate sequence numbers, creating an ever-growing gap.
+
+**PID_USER_DATA must contain `"enclave=/;"`:**
+FastRTPS silently ignores any SPDP participant that lacks `PID_USER_DATA` with the enclave string. There is no error, no log — the participant simply doesn't appear.
+
+**Reliable writer protocol is required from the start:**
+Even for discovery-only (Phase 1), reliable delivery (HEARTBEAT + ACKNACK handling + retransmit) is required for SEDP and `ros_discovery_info`. Best-effort is not sufficient because the remote may not have created its reader proxy when our first DATA arrives.
+
+**lwIP buffer exhaustion on ESP32:**
+Sending too many UDP packets in a burst causes `errno 12` (ENOMEM) on ESP32 due to lwIP buffer limits. The workaround is to defer some messages to the periodic heartbeat cycle rather than sending everything in `handleNewParticipant()`.
+
+**Buffer sizes:**
+Send buffer needs ≥1024 bytes and receive buffer ≥2048 bytes. SPDP announcements from FastDDS can be ~400 bytes due to multiple locators (including SHM locators that we ignore).
+
+**Stale participant purging is essential:**
+Without purging, the discovered participant list fills up with dead entries (e.g., from daemon restarts). New participants can't be added once the list is full. Purge entries older than 2× lease duration.
+
+**SPDP arrives on metatraffic port too:**
+The daemon sends unicast SPDP replies to our metatraffic port (7410), not just to the multicast port (7400). The metatraffic receive handler must detect and parse these as SPDP announcements.
 
 #### 5.1.8 Phase 1 Testing Strategy
 
@@ -874,18 +904,19 @@ Add a RaftROS configuration block alongside the existing SysMod configs:
    > w/<SSID>/<password>
 
 3. On the ROS 2 host (same network):
-   $ source /opt/ros/jazzy/setup.bash
-   $ ros2 node list
+   $ source /opt/ros/humble/setup.bash
+   $ ros2 node list --no-daemon
    /raft_esp32                          ← SUCCESS: ESP32 is discoverable
 
-   $ ros2 topic list
-   /raft_esp32/heartbeat                ← Phase 1 heartbeat topic
+   Note: If using FastDDS on the same host as the ESP32 (e.g., WSL2),
+   a UDPv4-only profile XML may be needed to disable SHM transport:
+   $ FASTRTPS_DEFAULT_PROFILES_FILE=fastdds_profile.xml ros2 node list --no-daemon
 
 4. Validate with Wireshark (optional):
    - Filter: rtps
    - Verify SPDP announcements from ESP32 IP on port 7400
    - Verify GUID prefix contains ESP32 MAC
-   - Verify userData contains "name=raft_esp32;namespace=/;"
+   - Verify userData contains "enclave=/;"
 ```
 
 #### 5.2.4 Debugging DDS Discovery Issues
@@ -904,10 +935,12 @@ Common issues when testing Phase 1 and how to diagnose them:
 
 **Goal:** Publish sensor data on pre-configured topics
 
-- Implement DataWriter with best-effort QoS
-- CDR encoding for `sensor_msgs/Imu`, `sensor_msgs/Temperature`, `sensor_msgs/Range`
+- Announce new DataWriter endpoints via SEDP (in addition to the existing `ros_discovery_info` writer)
+- CDR encoding for standard ROS 2 message types (`sensor_msgs/Imu`, `sensor_msgs/Temperature`, `sensor_msgs/Range`, `std_msgs/String`)
+- Reliable QoS delivery is already implemented (HEARTBEAT/ACKNACK) from Phase 1
 - Manual configuration of device-to-topic mapping in SysType JSON
 - Integration with DeviceManager data callbacks
+- Update `ros_discovery_info` payload to include the new writer GIDs
 
 **Deliverable:** `ros2 topic echo /raft_esp32/imu` shows live IMU data from an I2C sensor
 
@@ -935,12 +968,12 @@ Common issues when testing Phase 1 and how to diagnose them:
 
 ### Phase 5: Advanced Features
 
-- Reliable QoS (HEARTBEAT/ACKNACK) for critical topics
 - Zenoh transport as an alternative to RTPS
 - Multi-domain support
 - ROS 2 lifecycle node support
 - Integration with `tf2` (transform broadcasting for spatial sensors)
 - DDS Security (if needed for specific deployments)
+- Best-effort QoS option for high-rate sensor topics where dropped samples are acceptable
 
 ---
 
@@ -1033,7 +1066,7 @@ diagnostic_msgs/msg/DiagnosticArray  → Device/bus health
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| RTPS implementation complexity exceeds ESP32 resources | High | Start with absolute minimum subset; measure early; consider Zenoh fallback |
+| RTPS implementation complexity exceeds ESP32 resources | ~~High~~ Low (Phase 1 validated) | Phase 1 complete — RTPS fits comfortably on ESP32 with ~30KB RAM overhead |
 | WiFi multicast unreliability | Medium | Support static peer configuration as fallback; consider unicast-only discovery mode |
 | Interop issues between DDS implementations | Medium | Test against Fast DDS and Cyclone DDS from day one; use Wireshark RTPS dissector |
 | CDR encoding bugs causing data corruption | Medium | Develop extensive unit tests; compare output with micro-CDR library |

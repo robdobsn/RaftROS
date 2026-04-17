@@ -1,14 +1,16 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-16
+**Last Updated:** 2026-04-17
 
 ## Goal
 
-Make an ESP32-S3 (running Raft firmware) appear as a native ROS 2 node — discoverable via `ros2 node list` as `/raft_esp32` — without micro-ROS or any agent process. This is Phase 1: discovery only, no topic data exchange yet.
+Make an ESP32-S3 (running Raft firmware) appear as a native ROS 2 node — without micro-ROS or any agent process — using a clean-room RTPS 2.2 implementation as a Raft SysMod.
+
+**Phase 1 (Discovery) is COMPLETE.** The ESP32 appears as `/raft_esp32` in `ros2 node list`.
 
 ## Architecture
 
-Clean-room RTPS 2.2 implementation as a Raft SysMod. No third-party DDS libraries.
+Clean-room RTPS 2.2 implementation. No third-party DDS libraries.
 
 ### Source Files
 
@@ -21,8 +23,8 @@ Clean-room RTPS 2.2 implementation as a Raft SysMod. No third-party DDS librarie
 | `components/RaftROS/RTPS/RTPSMessage.cpp/.h` | RTPS header/submessage read/write (DATA, HEARTBEAT, ACKNACK, INFO_DST, INFO_TS) |
 | `components/RaftROS/RTPS/RTPSParticipant.cpp/.h` | GUID management, port calculation, locator building |
 | `components/RaftROS/RTPS/SPDPHandler.cpp/.h` | SPDP announcement build/parse, ros_discovery_info CDR payload |
-| `components/RaftROS/RTPS/SEDPHandler.cpp/.h` | SEDP publication message build, user data (rosDisc) message build |
-| `linux_unit_tests/` | Linux-hosted unit tests (84/85 passing) |
+| `components/RaftROS/RTPS/SEDPHandler.cpp/.h` | SEDP publication/subscription/liveliness message build, user data message build |
+| `linux_unit_tests/` | Linux-hosted unit tests + standalone linux RTPS node (`raftros_standalone.cpp`) |
 | `unit_tests/` | ESP-IDF Unity tests |
 | `examples/ExampleDiscoverable/` | ESP32 app that runs RaftROS as a SysMod |
 
@@ -32,102 +34,67 @@ Clean-room RTPS 2.2 implementation as a Raft SysMod. No third-party DDS librarie
 - **ROS 2 Humble** with FastRTPS 2.6.11, running on WSL2 (mirrored networking), IP `192.168.1.92`
 - Domain ID 0 → SPDP multicast `239.255.0.1:7400`, metatraffic unicast `:7410`, user data unicast `:7411`
 
-## What Works
+## Phase 1: Discovery — COMPLETE ✅
 
-### SPDP (Participant Discovery) — Working
-- ESP32 sends periodic 196-byte SPDP announcements to multicast `239.255.0.1:7400`
-- Contains correct GUID prefix (derived from WiFi MAC), lease duration, builtin endpoint set (`0x2F`), `PID_USER_DATA` with `"enclave=/;"` (required by FastRTPS), default unicast/multicast locators
-- Daemon receives these and discovers the ESP32 as a participant
-- ESP32 receives daemon's 392-byte SPDP (with multiple locators including SHM) and correctly extracts the UDPv4 locator IP
-- **Stale participant purging** now implemented — expired entries are removed after 2× lease duration, preventing the `_discovered` list from filling up with dead daemon instances
+`ros2 node list` shows `/raft_esp32` on both ESP32 and the linux standalone test node.
 
-### SPDP on Metatraffic Port — Working
-- Daemon sends unicast SPDP replies to ESP32's metatraffic port (7410)
-- ESP32 now parses these as SPDP announcements (previously ignored)
-- Lease timers are refreshed on re-reception of known participants
+### What Works
 
-### SEDP (Endpoint Discovery) — Partially Working
-- ESP32 sends 244-byte SEDP publication DATA to daemon's metatraffic port (7410)
-- Announces the `ros_discovery_info` DataWriter with topic name, type name, reliability (RELIABLE), and durability (TRANSIENT_LOCAL)
-- Message includes HEARTBEAT submessage (SN=1, count incrementing)
-- **Issue:** Only 5 PIDs are serialized (ENDPOINT_GUID, TOPIC_NAME, TYPE_NAME, RELIABILITY, DURABILITY). FastRTPS WriterProxyData normally includes more (locators, PARTICIPANT_GUID, KEY_HASH, etc.) but missing PIDs should use defaults.
+- **SPDP (Participant Discovery):** ESP32 sends periodic SPDP announcements to multicast `239.255.0.1:7400`. Contains GUID prefix (from WiFi MAC), lease duration, builtin endpoint set (`0x0C3F`), `PID_USER_DATA` with `"enclave=/;"`. Stale participant purging removes expired entries after 2× lease duration.
+- **SPDP on Metatraffic Port:** Daemon unicast SPDP replies to ESP32:7410 are correctly parsed. Lease timers refreshed on re-reception.
+- **SEDP Publication:** Announces `ros_discovery_info` DataWriter with topic name, type name, reliability (RELIABLE), durability (TRANSIENT_LOCAL), `PID_UNICAST_LOCATOR`, and `PID_PARTICIPANT_GUID`. Includes HEARTBEAT submessage.
+- **SEDP Subscription:** Announces `ros_discovery_info` DataReader with matching QoS, locator, and participant GUID.
+- **Participant Message Data (Liveliness):** Sent on discovery and periodically via heartbeats. Sequence number increments each send.
+- **ros_discovery_info:** CDR-encoded `ParticipantEntitiesInfo` (participant GID, node namespace `/`, node name `raft_esp32`) sent to user data port.
+- **HEARTBEAT/ACKNACK:** ESP32 responds to daemon HEARTBEATs with ACKNACKs. Handles incoming ACKNACKs and retransmits SEDP publication, SEDP subscription, and ros_discovery_info data as requested.
+- **Periodic Writer Heartbeats:** Sends all four DATA+HB messages (SEDP pub, SEDP sub, liveliness, rosDisc) to each discovered remote participant.
 
-### ros_discovery_info — Partially Working
-- ESP32 sends 168-byte CDR-encoded `ParticipantEntitiesInfo` to daemon's user data port (7411)
-- Contains participant GID, node namespace `/`, node name `raft_esp32`, empty reader/writer GID sequences
-- CDR field order is correct (namespace before name — this was a bug fix)
-- Message wrapped in RTPS header + INFO_DST + INFO_TS + DATA + HEARTBEAT
+### Fixes Applied (chronological)
 
-### HEARTBEAT/ACKNACK — Partially Working
-- ESP32 correctly responds to daemon's HEARTBEATs with ACKNACKs (on both metatraffic and user data ports)
-- Daemon's HEARTBEAT sequence numbers are tracked and acknowledged
-- **Issue:** ESP32 does NOT handle incoming ACKNACKs from the daemon (see below)
+| # | Fix | Details |
+|---|-----|---------|
+| 1 | CDR field order | `node_namespace` before `node_name` in `buildRosDiscoveryInfoPayload` |
+| 2 | `PID_USER_DATA` in SPDP | FastRTPS requires `"enclave=/;"` — without it, participant is silently ignored |
+| 3 | Stale participant purging | `purgeStaleParticipants()` prevents `_discovered` vector from filling with dead entries |
+| 4 | SPDP on metatraffic port | `recvMetatraffic()` now detects SPDP writer entity ID and parses as announcement |
+| 5 | Lease refresh on re-reception | `discoveredTimeMs` updated when existing participant re-announces |
+| 6 | Entity IDs must be NO_KEY | `ros_discovery_info` uses WRITER_NO_KEY (0x03) / READER_NO_KEY (0x04) — **key breakthrough** that made endpoint matching work |
+| 7 | Don't increment `rosDiscSeqNum` | Static content always SN=1; incrementing causes ever-growing NACK gap |
+| 8 | `participant.init()` before GUID | Must set nodeName, domainId, participantId before `setGuidPrefixFromMAC` |
+| 9 | `BUILTIN_ENDPOINT_SET = 0x0C3F` | Includes SUBSCRIPTIONS_ANNOUNCER and PARTICIPANT_MESSAGE_DATA bits |
+| 10 | SEDP subscription announcement | `buildSubscriptionMessage()` in `handleNewParticipant` and `sendWriterHeartbeats` |
+| 11 | Participant message data (liveliness) | `buildParticipantMessageData()` in `handleNewParticipant` and `sendWriterHeartbeats` |
+| 12 | `PID_UNICAST_LOCATOR` in SEDP | Pass `_myIpAddr` to all `buildPublicationMessage()` and `buildSubscriptionMessage()` calls |
+| 13 | `PID_PARTICIPANT_GUID` in SEDP | Added to `buildPublicationMessage()` and `buildSubscriptionMessage()` in SEDPHandler |
+| 14 | ACKNACK retransmit handling | ESP32 retransmits SEDP pub, SEDP sub, and rosDisc on incoming ACKNACKs |
 
-## What Doesn't Work
+### RTPS Protocol Key Facts
 
-### `ros2 node list` returns empty
+- `ros2` sends SPDP from loopback (127.0.0.1) on WSL2 with UDPv4-only profile
+- ACKNACK `base=2 numBits=0` → "received SN=1 OK"; `base=1 numBits=X growing` → "never received SN=1"
+- Entity kind byte: 0x02=WRITER_WITH_KEY, 0x03=WRITER_NO_KEY, 0x04=READER_NO_KEY, 0x07=READER_WITH_KEY
+- FastDDS needs UDPv4-only profile XML to disable SHM for same-host testing
+- Port formulas: `meta = 7400 + 250*domainId + 10 + 2*participantId`, `user = meta + 1`
 
-Despite correct SPDP mutual discovery, SEDP publication, and ros_discovery_info being sent, the node `/raft_esp32` does not appear.
+## Phase 2: Topic Publishing — TODO
 
-## Debugging History
+Next step: publish real ROS 2 topic data from the ESP32.
 
-### Bug #1 — CDR Field Order (Fixed)
-`buildRosDiscoveryInfoPayload` was serializing `node_name` before `node_namespace`. The IDL requires `node_namespace` first. Fixed.
+- Announce a new DataWriter endpoint (e.g. `std_msgs/msg/String` on `/chatter`) via SEDP
+- Serialize ROS 2 messages using CDR encoder
+- Send DATA messages to remote subscribers' user data ports
+- Handle HEARTBEAT/ACKNACK reliable delivery for the new writer
+- Update `ros_discovery_info` payload to include the new writer's GID
 
-### Bug #2 — Missing PID_USER_DATA in SPDP (Fixed)
-FastRTPS silently ignores participants that don't include `PID_USER_DATA` containing `"enclave=/;"` in their SPDP announcement. Added.
+## Phase 3: Topic Subscribing — TODO
 
-### Bug #3 — Stale Participant Accumulation (Fixed)
-`_discovered` vector (MAX_DISCOVERED=8) never purged expired entries. After 8 daemon restarts, the list was full of stale entries and the current daemon could never be added. ESP32's SEDP publications were being sent to 8 dead guidPrefixes. **Root cause confirmed via `tcpdump -XX` packet capture.**
+- Announce a new DataReader endpoint via SEDP subscription
+- Receive and deserialize incoming ROS 2 messages
+- Handle ACKNACK (reader side) for reliable subscriptions
 
-Fix: `purgeStaleParticipants()` removes entries older than 2× lease duration. Called every loop iteration.
+## Phase 4: Integration with Raft — TODO
 
-### Bug #4 — SPDP Ignored on Metatraffic Port (Fixed)
-Daemon sends unicast SPDP DATA replies to ESP32:7410 (metatraffic). `recvMetatraffic()` only handled HEARTBEATs, discarding SPDP DATA. Now detects `writerEntityId == SPDP_PARTICIPANT_WRITER` and parses as announcement.
-
-### Bug #5 — No Lease Refresh on Re-reception (Fixed)
-When `recvSPDP()` found an existing participant by guidPrefix, it returned immediately without updating `discoveredTimeMs`. This meant participants could be purged even though they were still actively announcing. Now refreshes the timer.
-
-### Investigation: FastDDS Source Code
-Read `EDP.cpp`, `WriterProxyData.cpp`, `EDPSimpleListeners.cpp`, `PDP.cpp` to understand matching logic. The `valid_matching()` check compares topic name, type name, topicKind, reliability, durability, ownership, deadline, liveliness, and partitions. All should pass for our data.
-
-### Investigation: Python Fake Node
-Created standalone Python RTPS participants that mimic the ESP32's exact byte sequence. Also failed, ruling out ESP32-specific issues.
-
-### Investigation: strace
-`strace -e sendto,sendmsg` on `ros2 node list --no-daemon` showed the daemon sends 64-byte ACKNACKs to ESP32:7410 requesting SEDP data, and 68-byte HEARTBEATs, but never sends anything to port 7411 (user data). This confirms the daemon reaches the SEDP exchange phase but ESP32 doesn't respond to the daemon's data requests.
-
-## Current Root Cause Hypothesis
-
-**ESP32 ignores incoming ACKNACKs from the daemon.**
-
-The RTPS reliable writer protocol requires:
-1. Writer sends DATA + HEARTBEAT
-2. Reader processes DATA, or if it missed it, sends ACKNACK requesting retransmission
-3. Writer receives ACKNACK and retransmits the requested DATA
-
-Currently the ESP32 pushes SEDP DATA once (in `handleNewParticipant`) and resends DATA+HB every second (in `sendWriterHeartbeats`), but there's a race condition: the daemon may not have created its WriterProxy yet when ESP32's first DATA arrives, so it sends an ACKNACK to request retransmission. ESP32 ignores this ACKNACK, so the daemon never gets the SEDP publication data.
-
-The same issue applies to the ros_discovery_info writer on the user data port.
-
-## What Needs to Be Done
-
-### Immediate — Handle ACKNACKs (Reliable Writer)
-1. In `recvMetatraffic()`: when an ACKNACK is received for `writerEntityId = SEDP_PUBLICATIONS_WRITER (0x000003C2)`, retransmit SEDP publication DATA
-2. In `recvUserData()`: when an ACKNACK is received for `writerEntityId = ROS_DISC_INFO_WRITER (0x00000102)`, retransmit ros_discovery_info DATA
-3. Both retransmissions should be triggered by the ACKNACK's bitmap indicating SN=1 is not yet received
-
-### Secondary — SEDP Publication PIDs
-Consider adding more PIDs to the SEDP publication message:
-- `PID_PARTICIPANT_GUID` — links the writer back to the participant
-- `PID_KEY_HASH` — endpoint key for keyed topics
-- `PID_DEFAULT_UNICAST_LOCATOR` / `PID_UNICAST_LOCATOR` — explicit locators (fallback uses SPDP defaults)
-- `PID_PROTOCOL_VERSION`, `PID_VENDORID`
-
-FastRTPS handles missing PIDs with defaults, but some may be expected.
-
-### Future — Phase 2
 - Auto-generate ROS 2 publishers from Raft DeviceManager detected devices
-- ROS 2 topic subscription (receive commands)
-- Service server support
+- ROS 2 topic subscription for receiving commands
 - Dynamic topic creation on device attach/detach
+- Service server support
