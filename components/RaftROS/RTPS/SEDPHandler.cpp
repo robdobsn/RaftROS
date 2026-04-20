@@ -65,7 +65,8 @@ uint32_t SEDPHandler::buildPublicationMessage(
     uint32_t reliabilityKind,
     uint32_t durabilityKind,
     uint64_t sequenceNumber,
-    uint32_t ipAddrNetOrder)
+    uint32_t ipAddrNetOrder,
+    uint32_t heartbeatCount)
 {
     if (!pBuf || bufLen < 400)
         return 0;
@@ -155,12 +156,13 @@ uint32_t SEDPHandler::buildPublicationMessage(
         payload, pp);
 
     // HEARTBEAT for this SEDP writer (RELIABLE built-in endpoint)
+    uint32_t hbCount = heartbeatCount > 0 ? heartbeatCount : (uint32_t)sequenceNumber;
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
         ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER,
         ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER,
         0, 1,  // firstSN = 1
         0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),  // lastSN
-        (uint32_t)sequenceNumber);  // count
+        hbCount);
 
     return pos;
 }
@@ -176,7 +178,8 @@ uint32_t SEDPHandler::buildUserDataMessage(
     const uint8_t* writerEntityId,
     const uint8_t* pPayload, uint32_t payloadLen,
     uint64_t sequenceNumber,
-    uint32_t heartbeatCount)
+    uint32_t heartbeatCount,
+    uint64_t firstSN)
 {
     if (!pBuf || bufLen < (uint32_t)(80 + payloadLen))
         return 0;
@@ -203,7 +206,7 @@ uint32_t SEDPHandler::buildUserDataMessage(
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
         ENTITYID_UNKNOWN,
         writerEntityId,
-        0, 1,  // firstSN = 1
+        0, (uint32_t)(firstSN & 0xFFFFFFFF),
         0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
         heartbeatCount);
 
@@ -225,7 +228,8 @@ uint32_t SEDPHandler::buildSubscriptionMessage(
     uint32_t reliabilityKind,
     uint32_t durabilityKind,
     uint64_t sequenceNumber,
-    uint32_t ipAddrNetOrder)
+    uint32_t ipAddrNetOrder,
+    uint32_t heartbeatCount)
 {
     if (!pBuf || bufLen < 300)
         return 0;
@@ -311,12 +315,13 @@ uint32_t SEDPHandler::buildSubscriptionMessage(
         payload, pp);
 
     // HEARTBEAT
+    uint32_t hbCount = heartbeatCount > 0 ? heartbeatCount : (uint32_t)sequenceNumber;
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
         ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER,
         ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
         0, 1,
         0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
-        (uint32_t)sequenceNumber);
+        hbCount);
 
     return pos;
 }

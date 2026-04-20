@@ -71,6 +71,12 @@ static uint64_t livelinessSeqNum = 1;
 static uint32_t heartbeatCount = 0;
 static uint32_t acknackCount = 0;
 
+// Chatter topic (Phase 2)
+static uint64_t chatterSeqNum = 0;
+static uint32_t lastChatterSendMs = 0;
+static const uint32_t CHATTER_PUBLISH_INTERVAL_MS = 1000;
+static uint32_t chatterMsgIndex = 0;
+
 static std::vector<DiscoveredParticipant> discovered;
 
 static uint8_t sendBuf[1024];
@@ -262,6 +268,91 @@ static void processDiscoveredParticipant(DiscoveredParticipant& remote, const st
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper: build ros_discovery_info payload with our writer GIDs included
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
+{
+    const uint8_t* writerIds[] = { ENTITYID_CHATTER_WRITER };
+    return SPDPHandler::buildRosDiscoveryInfoPayload(
+        pBuf, bufLen,
+        participant.getParticipantGuid(),
+        NODE_NAME, NODE_NAMESPACE,
+        writerIds, 1,
+        nullptr, 0);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Build a CDR-encoded std_msgs/String payload
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static uint32_t buildChatterPayload(uint8_t* pBuf, uint32_t bufLen, const char* message)
+{
+    uint32_t msgLen = (uint32_t)strlen(message) + 1;
+    uint32_t totalLen = 4 + 4 + ((msgLen + 3) & ~3u);
+    if (bufLen < totalLen)
+        return 0;
+
+    uint32_t pos = 0;
+    pBuf[pos++] = 0x00;
+    pBuf[pos++] = 0x01;  // CDR_LE
+    pBuf[pos++] = 0x00;
+    pBuf[pos++] = 0x00;
+
+    pBuf[pos++] = msgLen & 0xFF;
+    pBuf[pos++] = (msgLen >> 8) & 0xFF;
+    pBuf[pos++] = (msgLen >> 16) & 0xFF;
+    pBuf[pos++] = (msgLen >> 24) & 0xFF;
+    memcpy(pBuf + pos, message, msgLen);
+    pos += msgLen;
+    while (pos % 4 != 0) pBuf[pos++] = 0;
+
+    return pos;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Publish a chatter message to all discovered participants
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static void publishChatter()
+{
+    char msgStr[64];
+    snprintf(msgStr, sizeof(msgStr), "Hello from %s [%u]", NODE_NAME, chatterMsgIndex++);
+
+    uint8_t chatterPayload[256];
+    uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
+    if (payloadLen == 0)
+        return;
+
+    chatterSeqNum++;
+
+    for (const auto& remote : discovered)
+    {
+        heartbeatCount++;
+        uint32_t msgLen = sedpHandler.buildUserDataMessage(
+            sendBuf, sizeof(sendBuf),
+            participant, remote.guidPrefix,
+            ENTITYID_CHATTER_WRITER,
+            chatterPayload, payloadLen,
+            chatterSeqNum, heartbeatCount,
+            chatterSeqNum);  // firstSN = current (volatile, no history)
+
+        if (msgLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote.userDataPort);
+            dest.sin_addr.s_addr = remote.ipAddr;
+            int sent = sendto(userDataSock, sendBuf, msgLen, 0,
+                              (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "publishChatter seq=%llu \"%s\" sent %d/%d to port %d",
+                  (unsigned long long)chatterSeqNum, msgStr, sent, (int)msgLen,
+                  (int)remote.userDataPort);
+        }
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Send SPDP
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -340,31 +431,54 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
     }
     if (!remote) return;
 
-    if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 && bitmapBaseLow <= 1)
+    if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 && bitmapBaseLow <= 2)
     {
-        LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publication");
-        uint32_t sedpLen = sedpHandler.buildPublicationMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
-            "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-            RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr);
-        if (sedpLen > 0)
+        LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publications (base=%u)", bitmapBaseLow);
+        // Retransmit SN=1 (ros_discovery_info) if needed
+        if (bitmapBaseLow <= 1)
         {
-            struct sockaddr_in dest = {};
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(remote->metatrafficPort);
-            dest.sin_addr.s_addr = remote->ipAddr;
-            int sent = sendto(metatrafficSock, sendBuf, sedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            LOG_I(MODULE_PREFIX, "  SEDP retransmit %d/%d bytes", sent, (int)sedpLen);
+            heartbeatCount++;
+            uint32_t sedpLen = sedpHandler.buildPublicationMessage(
+                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+                ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
+                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr,
+                heartbeatCount);
+            if (sedpLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote->metatrafficPort);
+                dest.sin_addr.s_addr = remote->ipAddr;
+                int sent = sendto(metatrafficSock, sendBuf, sedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+                LOG_I(MODULE_PREFIX, "  SEDP retransmit rosDisc %d/%d bytes", sent, (int)sedpLen);
+            }
+        }
+        // Retransmit SN=2 (/chatter) if needed
+        if (bitmapBaseLow <= 2)
+        {
+            heartbeatCount++;
+            uint32_t chatterSedpLen = sedpHandler.buildPublicationMessage(
+                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+                ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
+                RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sedpSeqNum + 1, myIpAddr,
+                heartbeatCount);
+            if (chatterSedpLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote->metatrafficPort);
+                dest.sin_addr.s_addr = remote->ipAddr;
+                int sent = sendto(metatrafficSock, sendBuf, chatterSedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+                LOG_I(MODULE_PREFIX, "  SEDP retransmit chatter %d/%d bytes", sent, (int)chatterSedpLen);
+            }
         }
     }
     else if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0 && bitmapBaseLow <= 1)
     {
         LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
         uint8_t rosDiscPayload[256];
-        uint32_t rosDiscLen = SPDPHandler::buildRosDiscoveryInfoPayload(
-            rosDiscPayload, sizeof(rosDiscPayload),
-            participant.getParticipantGuid(), NODE_NAME, NODE_NAMESPACE);
+        uint32_t rosDiscLen = buildRosDiscInfoWithGids(rosDiscPayload, sizeof(rosDiscPayload));
         if (rosDiscLen > 0)
         {
             // Hex dump the CDR payload
@@ -384,6 +498,37 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                 dest.sin_addr.s_addr = remote->ipAddr;
                 int sent = sendto(userDataSock, sendBuf, msgLen, 0, (struct sockaddr*)&dest, sizeof(dest));
                 LOG_I(MODULE_PREFIX, "  rosDisc retransmit %d/%d bytes", sent, (int)msgLen);
+            }
+        }
+    }
+    else if (memcmp(writerEID, ENTITYID_CHATTER_WRITER, 4) == 0)
+    {
+        if (chatterSeqNum > 0 && bitmapBaseLow <= chatterSeqNum)
+        {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit chatter seq=%llu",
+                  (unsigned long long)chatterSeqNum);
+            char msgStr[64];
+            snprintf(msgStr, sizeof(msgStr), "Hello from %s [%u]",
+                     NODE_NAME, chatterMsgIndex > 0 ? chatterMsgIndex - 1 : 0);
+            uint8_t chatterPayload[256];
+            uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
+            if (payloadLen > 0)
+            {
+                heartbeatCount++;
+                uint32_t msgLen = sedpHandler.buildUserDataMessage(
+                    sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+                    ENTITYID_CHATTER_WRITER, chatterPayload, payloadLen,
+                    chatterSeqNum, heartbeatCount,
+                    chatterSeqNum);  // firstSN = current (volatile)
+                if (msgLen > 0)
+                {
+                    struct sockaddr_in dest = {};
+                    dest.sin_family = AF_INET;
+                    dest.sin_port = htons(remote->userDataPort);
+                    dest.sin_addr.s_addr = remote->ipAddr;
+                    int sent = sendto(userDataSock, sendBuf, msgLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+                    LOG_I(MODULE_PREFIX, "  chatter retransmit %d/%d bytes", sent, (int)msgLen);
+                }
             }
         }
     }
@@ -637,11 +782,13 @@ static void sendWriterHeartbeats()
     {
         // SEDP publication DATA + HB
         {
+            heartbeatCount++;
             uint32_t sedpLen = sedpHandler.buildPublicationMessage(
                 sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
                 ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
                 "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr);
+                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr,
+                heartbeatCount);
             if (sedpLen > 0)
             {
                 struct sockaddr_in dest = {};
@@ -654,11 +801,13 @@ static void sendWriterHeartbeats()
 
         // SEDP subscription DATA + HB
         {
+            heartbeatCount++;
             uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
                 sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
                 ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
                 "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr);
+                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
+                heartbeatCount);
             if (sedpSubLen > 0)
             {
                 struct sockaddr_in dest = {};
@@ -666,6 +815,24 @@ static void sendWriterHeartbeats()
                 dest.sin_port = htons(remote.metatrafficPort);
                 dest.sin_addr.s_addr = remote.ipAddr;
                 sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+            }
+        }
+
+        // SEDP publication for /chatter DataWriter
+        {
+            heartbeatCount++;
+            uint32_t chatterSedpLen = sedpHandler.buildPublicationMessage(
+                sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
+                ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
+                RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sedpSeqNum + 1, myIpAddr,
+                heartbeatCount);
+            if (chatterSedpLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote.metatrafficPort);
+                dest.sin_addr.s_addr = remote.ipAddr;
+                sendto(metatrafficSock, sendBuf, chatterSedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
             }
         }
 
@@ -689,9 +856,8 @@ static void sendWriterHeartbeats()
         // ros_discovery_info DATA + HB
         {
             uint8_t rosDiscPayload[256];
-            uint32_t rosDiscLen = SPDPHandler::buildRosDiscoveryInfoPayload(
-                rosDiscPayload, sizeof(rosDiscPayload),
-                participant.getParticipantGuid(), NODE_NAME, NODE_NAMESPACE);
+            uint32_t rosDiscLen = buildRosDiscInfoWithGids(
+                rosDiscPayload, sizeof(rosDiscPayload));
             if (rosDiscLen > 0)
             {
                 // Hex dump payload on first send
@@ -746,11 +912,13 @@ static void handleNewParticipant(const DiscoveredParticipant& remote, const stru
     }
 
     // SEDP publication
+    heartbeatCount++;
     uint32_t sedpLen = sedpHandler.buildPublicationMessage(
         sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
         ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
         "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr);
+        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr,
+        heartbeatCount);
     if (sedpLen > 0)
     {
         // Hex dump SEDP publication for debugging
@@ -769,11 +937,13 @@ static void handleNewParticipant(const DiscoveredParticipant& remote, const stru
     }
 
     // SEDP subscription announcement (we subscribe to ros_discovery_info)
+    heartbeatCount++;
     uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
         sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
         ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
         "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr);
+        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
+        heartbeatCount);
     if (sedpSubLen > 0)
     {
         struct sockaddr_in dest = {};
@@ -783,6 +953,26 @@ static void handleNewParticipant(const DiscoveredParticipant& remote, const stru
         int sent = sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
         LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP sub %d/%d to port %d",
               sent, (int)sedpSubLen, (int)remote.metatrafficPort);
+    }
+
+    // SEDP publication announcement for /chatter DataWriter
+    {
+        heartbeatCount++;
+        uint32_t chatterSedpLen = sedpHandler.buildPublicationMessage(
+            sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
+            ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
+            RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sedpSeqNum + 1, myIpAddr,
+            heartbeatCount);
+        if (chatterSedpLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote.metatrafficPort);
+            dest.sin_addr.s_addr = remote.ipAddr;
+            int sent = sendto(metatrafficSock, sendBuf, chatterSedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP chatter pub %d/%d to port %d",
+                  sent, (int)chatterSedpLen, (int)remote.metatrafficPort);
+        }
     }
 
     // Participant message data (liveliness assertion)
@@ -845,7 +1035,7 @@ int main(int argc, char* argv[])
     memcpy(fakeMac, &myIpAddr, 4);
     fakeMac[4] = (uint8_t)(pid >> 8);
     fakeMac[5] = (uint8_t)(pid & 0xFF);
-    participant.init(DOMAIN_ID, NODE_NAME, 2);  // participantId=2 to avoid port conflicts
+    participant.init(DOMAIN_ID, NODE_NAME, 3);  // participantId=3 to avoid port conflicts with ros2 daemon
     participant.setGuidPrefixFromMAC(fakeMac);
 
     printf("GUID prefix: ");
@@ -898,6 +1088,13 @@ int main(int argc, char* argv[])
         {
             sendWriterHeartbeats();
             lastHbMs = now;
+        }
+
+        // Periodic chatter publishing (once active)
+        if (active && (now - lastChatterSendMs >= CHATTER_PUBLISH_INTERVAL_MS))
+        {
+            publishChatter();
+            lastChatterSendMs = now;
         }
 
         purgeStaleParticipants();

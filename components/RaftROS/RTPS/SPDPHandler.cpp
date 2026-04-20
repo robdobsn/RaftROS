@@ -271,16 +271,22 @@ uint32_t SPDPHandler::buildRosDiscoveryInfoPayload(
     uint8_t* pBuf, uint32_t bufLen,
     const uint8_t* participantGuid,
     const char* nodeName,
-    const char* nodeNamespace)
+    const char* nodeNamespace,
+    const uint8_t* const* writerEntityIds,
+    uint32_t numWriterEntityIds,
+    const uint8_t* const* readerEntityIds,
+    uint32_t numReaderEntityIds)
 {
     if (!pBuf || !participantGuid || !nodeName || !nodeNamespace)
         return 0;
 
-    // Estimate: 4 encaps + 24 gid + 4 seq + (4+name+pad) + (4+ns+pad) + 4 + 4 = ~80+
+    // Estimate: 4 encaps + 24 gid + 4 seq + (4+name+pad) + (4+ns+pad) + 4+24*nR + 4+24*nW
     uint32_t nameLen = (uint32_t)strlen(nodeName) + 1;
     uint32_t nsLen = (uint32_t)strlen(nodeNamespace) + 1;
     uint32_t estimate = 4 + 24 + 4 + (4 + ((nameLen + 3) & ~3u)) +
-                         (4 + ((nsLen + 3) & ~3u)) + 4 + 4;
+                         (4 + ((nsLen + 3) & ~3u)) +
+                         4 + 24 * numReaderEntityIds +
+                         4 + 24 * numWriterEntityIds;
     if (bufLen < estimate)
         return 0;
 
@@ -320,11 +326,36 @@ uint32_t SPDPHandler::buildRosDiscoveryInfoPayload(
     pos += nameLen;
     while (pos % 4 != 0) pBuf[pos++] = 0;
 
-    // sequence<Gid> reader_gid_seq = empty
-    pBuf[pos++] = 0; pBuf[pos++] = 0; pBuf[pos++] = 0; pBuf[pos++] = 0;
+    // sequence<Gid> reader_gid_seq
+    pBuf[pos++] = numReaderEntityIds & 0xFF;
+    pBuf[pos++] = (numReaderEntityIds >> 8) & 0xFF;
+    pBuf[pos++] = (numReaderEntityIds >> 16) & 0xFF;
+    pBuf[pos++] = (numReaderEntityIds >> 24) & 0xFF;
+    for (uint32_t i = 0; i < numReaderEntityIds; i++)
+    {
+        // Gid = guidPrefix(12) + entityId(4) + zeros(8) = 24 bytes
+        memcpy(pBuf + pos, participantGuid, 12);  // guidPrefix from participant GUID
+        pos += 12;
+        memcpy(pBuf + pos, readerEntityIds[i], 4);
+        pos += 4;
+        memset(pBuf + pos, 0, 8);
+        pos += 8;
+    }
 
-    // sequence<Gid> writer_gid_seq = empty
-    pBuf[pos++] = 0; pBuf[pos++] = 0; pBuf[pos++] = 0; pBuf[pos++] = 0;
+    // sequence<Gid> writer_gid_seq
+    pBuf[pos++] = numWriterEntityIds & 0xFF;
+    pBuf[pos++] = (numWriterEntityIds >> 8) & 0xFF;
+    pBuf[pos++] = (numWriterEntityIds >> 16) & 0xFF;
+    pBuf[pos++] = (numWriterEntityIds >> 24) & 0xFF;
+    for (uint32_t i = 0; i < numWriterEntityIds; i++)
+    {
+        memcpy(pBuf + pos, participantGuid, 12);
+        pos += 12;
+        memcpy(pBuf + pos, writerEntityIds[i], 4);
+        pos += 4;
+        memset(pBuf + pos, 0, 8);
+        pos += 8;
+    }
 
     return pos;
 }

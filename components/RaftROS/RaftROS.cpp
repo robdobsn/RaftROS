@@ -117,6 +117,14 @@ void RaftROS::loop()
             _lastWriterHbMs = now;
         }
 
+        // Periodic chatter message publishing
+        if (_connState == ConnState::ACTIVE &&
+            (now - _lastChatterSendMs >= CHATTER_PUBLISH_INTERVAL_MS))
+        {
+            publishChatter();
+            _lastChatterSendMs = now;
+        }
+
         // Purge stale discovered participants whose lease has expired
         purgeStaleParticipants();
 
@@ -644,11 +652,8 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
         {
             LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
             uint8_t rosDiscPayload[256];
-            uint32_t rosDiscLen = SPDPHandler::buildRosDiscoveryInfoPayload(
-                rosDiscPayload, sizeof(rosDiscPayload),
-                _participant.getParticipantGuid(),
-                _nodeName.c_str(),
-                _nodeNamespace.c_str());
+            uint32_t rosDiscLen = buildRosDiscInfoWithGids(
+                rosDiscPayload, sizeof(rosDiscPayload));
 
             if (rosDiscLen > 0)
             {
@@ -698,6 +703,43 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
                 int sent = sendto(_metatrafficSock, _sendBuf, sedpSubLen, 0,
                                   (struct sockaddr*)&dest, sizeof(dest));
                 LOG_I(MODULE_PREFIX, "  SEDP sub retransmit %d/%d bytes", sent, (int)sedpSubLen);
+            }
+        }
+    }
+    else if (memcmp(writerEID, ENTITYID_CHATTER_WRITER, 4) == 0)
+    {
+        // They want our chatter data - retransmit latest sample
+        if (_chatterSeqNum > 0 && bitmapBaseLow <= _chatterSeqNum)
+        {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit chatter seq=%llu",
+                  (unsigned long long)_chatterSeqNum);
+
+            char msgStr[64];
+            snprintf(msgStr, sizeof(msgStr), "Hello from %s [%u]",
+                     _nodeName.c_str(), _chatterMsgIndex > 0 ? _chatterMsgIndex - 1 : 0);
+            uint8_t chatterPayload[256];
+            uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
+
+            if (payloadLen > 0)
+            {
+                _heartbeatCount++;
+                uint32_t msgLen = _sedpHandler.buildUserDataMessage(
+                    _sendBuf, sizeof(_sendBuf),
+                    _participant, srcGuidPrefix,
+                    ENTITYID_CHATTER_WRITER,
+                    chatterPayload, payloadLen,
+                    _chatterSeqNum, _heartbeatCount);
+
+                if (msgLen > 0)
+                {
+                    struct sockaddr_in dest = {};
+                    dest.sin_family = AF_INET;
+                    dest.sin_port = htons(remote->userDataPort);
+                    dest.sin_addr.s_addr = remote->ipAddr;
+                    int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
+                                      (struct sockaddr*)&dest, sizeof(dest));
+                    LOG_I(MODULE_PREFIX, "  chatter retransmit %d/%d bytes", sent, (int)msgLen);
+                }
             }
         }
     }
@@ -783,6 +825,29 @@ void RaftROS::sendWriterHeartbeats()
             }
         }
 
+        // 2b) SEDP publication for /chatter DataWriter → remote metatraffic port
+        {
+            uint32_t chatterSedpLen = _sedpHandler.buildPublicationMessage(
+                _sendBuf, sizeof(_sendBuf),
+                _participant, remote.guidPrefix,
+                ENTITYID_CHATTER_WRITER,
+                CHATTER_DDS_TOPIC,
+                CHATTER_DDS_TYPE,
+                RELIABILITY_RELIABLE,
+                DURABILITY_VOLATILE,
+                _chatterSedpSeqNum, _myIpAddr);
+
+            if (chatterSedpLen > 0)
+            {
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote.metatrafficPort);
+                dest.sin_addr.s_addr = remote.ipAddr;
+                sendto(_metatrafficSock, _sendBuf, chatterSedpLen, 0,
+                       (struct sockaddr*)&dest, sizeof(dest));
+            }
+        }
+
         // 3) Participant message data (liveliness) → remote metatraffic port
         {
             _heartbeatCount++;
@@ -806,11 +871,8 @@ void RaftROS::sendWriterHeartbeats()
         // 4) Resend ros_discovery_info DATA + HB → remote user data port
         {
             uint8_t rosDiscPayload[256];
-            uint32_t rosDiscLen = SPDPHandler::buildRosDiscoveryInfoPayload(
-                rosDiscPayload, sizeof(rosDiscPayload),
-                _participant.getParticipantGuid(),
-                _nodeName.c_str(),
-                _nodeNamespace.c_str());
+            uint32_t rosDiscLen = buildRosDiscInfoWithGids(
+                rosDiscPayload, sizeof(rosDiscPayload));
 
             if (rosDiscLen > 0)
             {
@@ -918,6 +980,31 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
         }
     }
 
+    // 2b) SEDP publication announcement for /chatter DataWriter
+    {
+        uint32_t chatterSedpLen = _sedpHandler.buildPublicationMessage(
+            _sendBuf, sizeof(_sendBuf),
+            _participant, remote.guidPrefix,
+            ENTITYID_CHATTER_WRITER,
+            CHATTER_DDS_TOPIC,
+            CHATTER_DDS_TYPE,
+            RELIABILITY_RELIABLE,
+            DURABILITY_VOLATILE,
+            _chatterSedpSeqNum, _myIpAddr);
+
+        if (chatterSedpLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote.metatrafficPort);
+            dest.sin_addr.s_addr = remote.ipAddr;
+            int sent = sendto(_metatrafficSock, _sendBuf, chatterSedpLen, 0,
+                   (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP chatter pub sent %d/%d bytes to port %d",
+                  sent, (int)chatterSedpLen, (int)remote.metatrafficPort);
+        }
+    }
+
     // 3) Participant message data (liveliness assertion)
     {
         _heartbeatCount++;
@@ -944,6 +1031,96 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
 
     _connState = ConnState::ACTIVE;
     _lastWriterHbMs = 0;  // trigger immediate writer HB on next loop
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Helper: build ros_discovery_info payload with our writer GIDs included
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
+{
+    const uint8_t* writerIds[] = { ENTITYID_CHATTER_WRITER };
+    return SPDPHandler::buildRosDiscoveryInfoPayload(
+        pBuf, bufLen,
+        _participant.getParticipantGuid(),
+        _nodeName.c_str(),
+        _nodeNamespace.c_str(),
+        writerIds, 1,   // 1 writer: chatter
+        nullptr, 0);    // 0 readers
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Build a CDR-encoded std_msgs/String payload
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t RaftROS::buildChatterPayload(uint8_t* pBuf, uint32_t bufLen, const char* message)
+{
+    uint32_t msgLen = (uint32_t)strlen(message) + 1;  // include null terminator
+    uint32_t totalLen = 4 + 4 + ((msgLen + 3) & ~3u);  // CDR encap + string length + data + pad
+    if (bufLen < totalLen)
+        return 0;
+
+    uint32_t pos = 0;
+
+    // CDR Encapsulation Header (CDR_LE)
+    pBuf[pos++] = 0x00;
+    pBuf[pos++] = 0x01;
+    pBuf[pos++] = 0x00;
+    pBuf[pos++] = 0x00;
+
+    // CDR string: uint32_t length (including null), then chars + null + pad
+    pBuf[pos++] = msgLen & 0xFF;
+    pBuf[pos++] = (msgLen >> 8) & 0xFF;
+    pBuf[pos++] = (msgLen >> 16) & 0xFF;
+    pBuf[pos++] = (msgLen >> 24) & 0xFF;
+    memcpy(pBuf + pos, message, msgLen);
+    pos += msgLen;
+    while (pos % 4 != 0) pBuf[pos++] = 0;
+
+    return pos;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Publish a chatter message to all discovered participants
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void RaftROS::publishChatter()
+{
+    // Build message string
+    char msgStr[64];
+    snprintf(msgStr, sizeof(msgStr), "Hello from %s [%u]", _nodeName.c_str(), _chatterMsgIndex++);
+
+    // CDR-encode the std_msgs/String
+    uint8_t chatterPayload[256];
+    uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
+    if (payloadLen == 0)
+        return;
+
+    _chatterSeqNum++;
+
+    for (const auto& remote : _discovered)
+    {
+        _heartbeatCount++;
+        uint32_t msgLen = _sedpHandler.buildUserDataMessage(
+            _sendBuf, sizeof(_sendBuf),
+            _participant, remote.guidPrefix,
+            ENTITYID_CHATTER_WRITER,
+            chatterPayload, payloadLen,
+            _chatterSeqNum, _heartbeatCount);
+
+        if (msgLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote.userDataPort);
+            dest.sin_addr.s_addr = remote.ipAddr;
+            int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
+                              (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "publishChatter seq=%llu \"%s\" sent %d/%d to port %d",
+                  (unsigned long long)_chatterSeqNum, msgStr, sent, (int)msgLen,
+                  (int)remote.userDataPort);
+        }
+    }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

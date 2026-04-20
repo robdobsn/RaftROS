@@ -195,7 +195,7 @@ int main()
             reader, writer, 0, 1, 0, 5, 3);
         TEST_ASSERT(n == 32, "HEARTBEAT size = 32");
         TEST_ASSERT(buf[0] == 0x07, "HEARTBEAT submsgId");
-        TEST_ASSERT((buf[1] & 0x02) != 0, "HEARTBEAT FinalFlag set");
+        TEST_ASSERT((buf[1] & 0x02) == 0, "HEARTBEAT FinalFlag not set (expects ACKNACK)");
     }
 
     //=================================================================
