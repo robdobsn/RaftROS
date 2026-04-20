@@ -1,6 +1,6 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-17
+**Last Updated:** 2026-04-20
 
 ## Goal
 
@@ -76,15 +76,60 @@ Clean-room RTPS 2.2 implementation. No third-party DDS libraries.
 - FastDDS needs UDPv4-only profile XML to disable SHM for same-host testing
 - Port formulas: `meta = 7400 + 250*domainId + 10 + 2*participantId`, `user = meta + 1`
 
-## Phase 2: Topic Publishing — TODO
+## Current Status Update (2026-04-20)
 
-Next step: publish real ROS 2 topic data from the ESP32.
+### Newly Verified
+
+- Linux standalone publisher works in the docker ROS 2 testbed when publisher/subscriber are in the same network namespace.
+- Docker build is now non-interactive and reproducible (no wireshark debconf prompt blocking builds).
+- ACKNACK handling in `linux_unit_tests/raftros_standalone.cpp` now includes SEDP subscription retransmit handling for `ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER`.
+- Linux unit tests remain green after the ACKNACK patch: **85 passed, 0 failed**.
+
+### Root Cause Found for Previous "Not Publishing" Symptom
+
+- The primary blocker observed in earlier docker testing was host/container network separation (discovery traffic from host IP space did not reach container DDS participants as expected in that setup).
+- This was not primarily caused by ACKNACK logic.
+
+### Remaining Gap
+
+- ESP32 path still needs Phase 2 completion (topic publishing endpoint lifecycle + runtime validation against ROS 2 subscribers under real WiFi conditions).
+- Linux and ESP32 orchestration code still have drift risk because key runtime logic is duplicated in:
+	- `components/RaftROS/RaftROS.cpp`
+	- `linux_unit_tests/raftros_standalone.cpp`
+
+## Phase 2: Topic Publishing — IN PROGRESS
+
+Immediate objective: publish real ROS 2 topic data from the ESP32 with reliable delivery.
 
 - Announce a new DataWriter endpoint (e.g. `std_msgs/msg/String` on `/chatter`) via SEDP
 - Serialize ROS 2 messages using CDR encoder
 - Send DATA messages to remote subscribers' user data ports
 - Handle HEARTBEAT/ACKNACK reliable delivery for the new writer
 - Update `ros_discovery_info` payload to include the new writer's GID
+- Validate on ESP32 against ROS 2 `demo_nodes_cpp` listener in a controlled testbed
+
+## DRY / Shared-Code Direction (Agreed Technical Direction)
+
+Detailed staged plan: see `devdocs/RaftROS-next-stages-implementation-plan.md`.
+
+To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic should be implemented once in shared code, with thin platform adapters.
+
+### Preferred Structure
+
+- Keep protocol encode/decode in shared modules (already done in `components/RaftROS/RTPS` and `components/RaftROS/CDR`).
+- Move duplicated runtime orchestration (ACKNACK decisions, heartbeat/send policy, participant bookkeeping transitions) into a shared core runtime layer under `components/RaftROS/`.
+- Keep only socket/timer/platform glue in:
+	- ESP32 SysMod wrapper (`RaftROS.cpp`)
+	- Linux standalone wrapper (`raftros_standalone.cpp`)
+
+### Practical Rule
+
+- If logic can be expressed without direct socket API calls or FreeRTOS/Arduino-specific APIs, it belongs in shared core code.
+- Wrappers should mainly provide:
+	- packet send/receive callbacks
+	- current time
+	- local network identity
+	- logging hooks
 
 ## Phase 3: Topic Subscribing — TODO
 
