@@ -64,6 +64,15 @@
 - No functional behavior change in linux tests.
 - Diff between ESP32 and Linux wrappers is mostly platform glue.
 
+### Stage 2 Progress (Current)
+
+- Completed shared runner-based orchestration for:
+  - initial participant announce flow
+  - ACKNACK parse/classify/dispatch flow
+  - periodic writer-heartbeat resend flow
+  - receive submessage dispatch + HEARTBEAT ACK response flow
+- Linux validation baseline remains: `85 passed, 0 failed`.
+
 ## Stage 3: ESP32 Publishing Completion (Medium)
 
 ### Deliverables
@@ -116,11 +125,11 @@
 
 ## Recommended Implementation Order (Immediate)
 
-1. Add/extend ACKNACK branch tests in linux unit tests.
-2. Introduce shared runtime interfaces with no behavior change.
-3. Move one logic slice at a time (ACKNACK handling first, then heartbeat cycle).
-4. Re-run linux tests after each slice.
-5. Validate ESP32 publishing in testbed once runtime extraction stabilizes.
+1. Batch-extract remaining shared participant-state/container logic (lookup, merge/update, purge triggers, and send-target lookup helpers) into RTPS shared modules.
+2. Batch-extract wrapper callback-adapter boilerplate into reusable shared adapter helpers to reduce repeated lambda wiring.
+3. Add/extend linux unit tests around receive callback behavior and participant routing decisions before/after extraction.
+4. Re-run `make -j$(nproc) all standalone && ./linux_unit_tests` after each extraction batch.
+5. Validate ESP32 publishing in the docker/WiFi testbed once the shared runtime convergence batch completes.
 
 ## Risks and Mitigations
 

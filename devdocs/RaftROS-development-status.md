@@ -127,7 +127,45 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 ### Progress Against This Direction
 
 - Completed: shared ACKNACK parser/classifier in `components/RaftROS/RTPS/RTPSAckNack.*`.
-- Next: move heartbeat scheduling/retransmit policy decisions into shared runtime APIs while keeping send/recv adapters platform-specific.
+- Completed: shared reliability policy helpers in `components/RaftROS/RTPS/RTPSReliabilityPolicy.*` used by both ESP32 and Linux handlers for:
+	- HEARTBEAT final-flag ACK response decision
+	- ACKNACK bitmapBase sequence retransmit decision checks
+- Completed: shared periodic scheduling helper in `components/RaftROS/RTPS/RTPSRuntimeSchedule.*` used by both ESP32 and Linux loops for SPDP, writer heartbeat, and chatter publish cadence checks.
+- Completed: shared participant activation helper in `components/RaftROS/RTPS/RTPSParticipantLifecycle.*` used by both ESP32 and Linux for:
+	- inactive -> active transition decision based on discovered participant count
+	- immediate writer-heartbeat trigger when activation occurs
+- Completed: shared builtin endpoint mapping helper in `components/RaftROS/RTPS/RTPSBuiltinEndpointMap.*` used by both ESP32 and Linux metatraffic HEARTBEAT handling to map remote writer entity IDs to local reader entity IDs for ACKNACK generation.
+- Completed: shared discovery merge policy helper in `components/RaftROS/RTPS/RTPSDiscoveryPolicy.*` used by both ESP32 and Linux for:
+	- lease refresh on known participant re-discovery
+	- new participant add eligibility check against max capacity
+	- add-time `discoveredTimeMs` initialization
+- Completed: shared participant lease-expiry policy helper in `components/RaftROS/RTPS/RTPSParticipantLeasePolicy.*` used by both ESP32 and Linux stale participant purge paths for:
+	- lease timeout calculation (2x lease duration with default fallback)
+	- expiration predicate used by purge loops
+- Completed: shared participant set change policy helper in `components/RaftROS/RTPS/RTPSParticipantSetPolicy.*` used by both runtimes for activation-state and immediate writer-heartbeat trigger decisions.
+	- ESP32 now uses this policy for first activation and subsequent participant-add immediate heartbeat behavior.
+	- Linux uses the same policy for activation transition behavior.
+- Completed: shared discovery merge flow in `RTPSDiscoveryPolicy_mergeParticipant(...)` now centralizes refresh/add/capacity decisions and is used by both ESP32 and Linux discovered-participant handlers.
+- Completed: shared initial new-participant announce policy in `components/RaftROS/RTPS/RTPSInitialAnnouncePlan.*` now centralizes which first-contact SPDP/SEDP/PMD sends are enabled; both ESP32 and Linux `handleNewParticipant` now use this shared plan while retaining platform-specific send execution.
+- Completed: shared ordered announce-step sequencing in `RTPSInitialAnnouncePlan_buildSequence(...)` now provides a common action list plus per-step heartbeat/sequence guidance; both ESP32 and Linux wrappers now execute this shared sequence while preserving platform-specific packet send paths.
+- Completed: shared send-target policy mapping in `RTPSInitialAnnouncePlan_getSendTarget(...)` now centralizes socket/destination selection per announce action; both wrappers use a local send adapter driven by this shared mapping.
+- Completed: shared payload-build dispatch in `RTPSInitialAnnouncePlan_getBuildSpec(...)` and shared SEDP endpoint profile mapping in `RTPSInitialAnnouncePlan_getSedpEndpointSpec(...)` now centralize builder selection and endpoint metadata; both wrappers now execute announce actions via shared build/send policy mappings.
+- Completed: shared action-to-log policy in `RTPSInitialAnnouncePlan_getLogSpec(...)` now centralizes action labels and sender-address logging behavior; both wrappers now use this shared metadata for post-send logging.
+- Completed: shared sequence-counter mutation timing policy in `RTPSInitialAnnouncePlan_applySequencePolicy(...)` now centralizes per-action sequence selection and increment timing (including SPDP pre-build increment and Linux chatter sequence compatibility behavior); wrappers now use shared counter-state policy and only persist concrete counter storage.
+- Completed: shared debug behavior policy in `RTPSInitialAnnouncePlan_getDebugSpec(...)` now centralizes runtime/action debug toggles (including Linux SEDP publication hex-dump behavior); wrappers now consume shared debug metadata instead of hardcoded action checks.
+- Completed: shared send-result instrumentation policy in `RTPSInitialAnnouncePlan_classifySendResult(...)` now centralizes success/failure/short-send classification; wrappers consume this metadata for unified post-send status tagging while keeping platform logger calls local.
+- Completed: shared action-iteration execution scaffolding in `RTPSInitialAnnouncePlan_evaluatePreBuild(...)` and `RTPSInitialAnnouncePlan_evaluatePostBuild(...)` now centralizes step preconditions and skip reasons; wrappers now use shared pre/post step gating.
+- Completed: shared heartbeat-count mutation policy in `RTPSInitialAnnouncePlan_applyHeartbeatPolicy(...)` now centralizes increment-before-send rules.
+- Completed: full shared initial-announce execution runner in `RTPSInitialAnnounceRunner.*` now centralizes the step loop (pre/post gating, heartbeat/sequence policy application, debug policy check, send-result classification, and log dispatch gating). ESP32 and Linux wrappers now provide only build/send/debug/log callbacks and runtime state storage.
+- Completed: full shared ACKNACK execution runner in `RTPSAckNackRunner.*` now centralizes ACKNACK parse/classify/decision/action-dispatch flow (including configurable publication-sequence gating differences and chatter-announcement handling). ESP32 and Linux wrappers now primarily provide remote lookup plus action-specific build/send callbacks.
+- Completed: full shared writer-heartbeat execution runner in `RTPSWriterHeartbeatRunner.*` now centralizes periodic writer resend step orchestration (action sequence, heartbeat/liveliness mutation policy, sequence selection policy, send-target mapping, and Linux one-time ros_discovery_info debug dump behavior). ESP32 and Linux wrappers now primarily provide build/send/log callbacks and runtime counter storage.
+- Completed: full shared receive-submessage execution runner in `RTPSRxSubmessageRunner.*` now centralizes RTPS header parse, submessage iteration, HEARTBEAT->ACKNACK response generation, ACKNACK handoff, and DATA/other-submessage dispatch hooks. ESP32 and Linux wrappers now provide channel-specific callback adapters for SPDP parsing, endpoint mapping, socket send, and logging.
+- Completed: shared discovered-participant lookup/routing helper in `RTPSDiscoveredParticipantLookup.*` now centralizes guid-prefix remote lookup and userdata-heartbeat ACK metatraffic-port routing-by-IP; both ESP32 and Linux wrappers now use this helper in ACKNACK remote resolution and receive-path ACK destination resolution.
+- Completed: shared callback-adapter scaffolding in `RTPSRunnerAdapterHelpers.*` now centralizes base `RTPSRxSubmessageRunner` callback wiring (local guid, reader-map policy, ACK destination policy, ACK socket send) and `RTPSAckNackRunner` remote participant resolution callback behavior. ESP32 and Linux wrappers now set policy/context and provide only behavior-specific hooks.
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after receive-runner extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after lookup-helper extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after runner-adapter scaffolding extraction (**85 passed, 0 failed**).
+- Next: continue convergence by extracting shared submessage logging policy helpers (name mapping + channel-specific formatting) and shared retransmit send-target helper wrappers to further reduce wrapper-only lambda code.
 
 ### Practical Rule
 
