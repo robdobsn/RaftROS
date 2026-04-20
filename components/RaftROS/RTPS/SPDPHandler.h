@@ -48,12 +48,18 @@ public:
                                    DiscoveredParticipant& outParticipant);
 
     /// Build the ros_discovery_info CDR payload (ParticipantEntitiesInfo)
+    /// writerEntityIds is an array of 4-byte entity IDs to include in the writer_gid_seq
+    /// readerEntityIds is an array of 4-byte entity IDs to include in the reader_gid_seq
     /// Returns bytes written
     static uint32_t buildRosDiscoveryInfoPayload(
         uint8_t* pBuf, uint32_t bufLen,
         const uint8_t* participantGuid,
         const char* nodeName,
-        const char* nodeNamespace);
+        const char* nodeNamespace,
+        const uint8_t* const* writerEntityIds = nullptr,
+        uint32_t numWriterEntityIds = 0,
+        const uint8_t* const* readerEntityIds = nullptr,
+        uint32_t numReaderEntityIds = 0);
 
 private:
     /// Write a ParameterList entry header (PID + length)

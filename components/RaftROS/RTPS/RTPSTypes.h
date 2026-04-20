@@ -30,6 +30,9 @@ static const uint8_t ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER[4] = {0x00, 0x00
 static const uint8_t ENTITYID_ROS_DISC_INFO_WRITER[4] = {0x00, 0x00, 0x01, 0x03};
 static const uint8_t ENTITYID_ROS_DISC_INFO_READER[4] = {0x00, 0x00, 0x02, 0x04};
 
+// User-defined writer/reader for /chatter topic (std_msgs/String, NO_KEY)
+static const uint8_t ENTITYID_CHATTER_WRITER[4] = {0x00, 0x01, 0x01, 0x03};
+
 // Participant Message Data (liveliness)
 static const uint8_t ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER[4] = {0x00, 0x02, 0x00, 0xC2};
 static const uint8_t ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER[4] = {0x00, 0x02, 0x00, 0xC7};
@@ -114,3 +117,7 @@ static const uint32_t RTPS_HEADER_SIZE = 20;
 // === ROS 2 Discovery Info Topic ===
 inline const char* ROS_DISCOVERY_INFO_TOPIC = "ros_discovery_info";
 inline const char* ROS_DISCOVERY_INFO_TYPE = "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_";
+
+// === ROS 2 /chatter Topic (Phase 2) ===
+inline const char* CHATTER_DDS_TOPIC = "rt/chatter";
+inline const char* CHATTER_DDS_TYPE = "std_msgs::msg::dds_::String_";

@@ -72,6 +72,13 @@ private:
     uint32_t _heartbeatCount = 0;
     uint32_t _acknackCount = 0;
 
+    // Chatter topic (Phase 2) - sequence numbers and timing
+    uint64_t _chatterSeqNum = 0;       // increments each publish
+    uint64_t _chatterSedpSeqNum = 1;   // always 1 (single SEDP pub, static)
+    uint32_t _lastChatterSendMs = 0;
+    static const uint32_t CHATTER_PUBLISH_INTERVAL_MS = 1000;
+    uint32_t _chatterMsgIndex = 0;     // counter for message content
+
     // Discovered remote participants
     std::vector<DiscoveredParticipant> _discovered;
     static const uint32_t MAX_DISCOVERED = 8;
@@ -94,6 +101,13 @@ private:
     void processDiscoveredParticipant(DiscoveredParticipant& remote, const struct sockaddr_in& fromAddr);
     void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
                        const struct sockaddr_in& fromAddr);
+
+    // Chatter topic helpers
+    void publishChatter();
+    uint32_t buildChatterPayload(uint8_t* pBuf, uint32_t bufLen, const char* message);
+
+    // Helper to build ros_discovery_info payload with our writer GIDs
+    uint32_t buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen);
 
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
