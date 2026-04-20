@@ -474,6 +474,26 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             }
         }
     }
+    else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0 && bitmapBaseLow <= 1)
+    {
+        LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP subscription");
+        heartbeatCount++;
+        uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
+            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+            ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
+            "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+            RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
+            heartbeatCount);
+        if (sedpSubLen > 0)
+        {
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_port = htons(remote->metatrafficPort);
+            dest.sin_addr.s_addr = remote->ipAddr;
+            int sent = sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+            LOG_I(MODULE_PREFIX, "  SEDP sub retransmit %d/%d bytes", sent, (int)sedpSubLen);
+        }
+    }
     else if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0 && bitmapBaseLow <= 1)
     {
         LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
