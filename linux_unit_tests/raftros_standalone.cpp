@@ -29,6 +29,19 @@
 #include "RTPSTypes.h"
 #include "RTPSMessage.h"
 #include "RTPSAckNack.h"
+#include "RTPSAckNackRunner.h"
+#include "RTPSReliabilityPolicy.h"
+#include "RTPSRuntimeSchedule.h"
+#include "RTPSParticipantLifecycle.h"
+#include "RTPSBuiltinEndpointMap.h"
+#include "RTPSDiscoveryPolicy.h"
+#include "RTPSParticipantLeasePolicy.h"
+#include "RTPSParticipantSetPolicy.h"
+#include "RTPSInitialAnnouncePlan.h"
+#include "RTPSInitialAnnounceRunner.h"
+#include "RTPSWriterHeartbeatRunner.h"
+#include "RTPSRxSubmessageRunner.h"
+#include "RTPSRunnerAdapterHelpers.h"
 #include "RTPSParticipant.h"
 #include "SPDPHandler.h"
 #include "SEDPHandler.h"
@@ -239,15 +252,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
 
 static void processDiscoveredParticipant(DiscoveredParticipant& remote, const struct sockaddr_in& fromAddr)
 {
-    // Update lease timer if already known
-    for (auto& dp : discovered)
-    {
-        if (memcmp(dp.guidPrefix, remote.guidPrefix, 12) == 0)
-        {
-            dp.discoveredTimeMs = millis();
-            return;
-        }
-    }
+    uint32_t nowMs = millis();
 
     char srcIpStr[16], locIpStr[16];
     strncpy(srcIpStr, inet_ntoa(fromAddr.sin_addr), sizeof(srcIpStr));
@@ -260,10 +265,10 @@ static void processDiscoveredParticipant(DiscoveredParticipant& remote, const st
           srcIpStr, (int)ntohs(fromAddr.sin_port), locIpStr,
           (int)remote.metatrafficPort, (int)remote.userDataPort, (int)remote.leaseDurationSec);
 
-    remote.discoveredTimeMs = millis();
-    if (discovered.size() < MAX_DISCOVERED)
+    RTPSDiscoveryMergeResult mergeResult = RTPSDiscoveryPolicy_mergeParticipant(
+        discovered, remote, nowMs, MAX_DISCOVERED);
+    if (mergeResult == RTPSDiscoveryMergeResult::AddedNew)
     {
-        discovered.push_back(remote);
         handleNewParticipant(remote, fromAddr);
     }
 }
@@ -409,42 +414,47 @@ static void recvSPDP()
 static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
                           const struct sockaddr_in& fromAddr)
 {
-    RTPSAckNackFields ackFields;
-    if (!RTPSAckNack_parse(pContent, contentLen, ackFields))
-        return;
+    (void)fromAddr;
 
-    const uint8_t* readerEID = ackFields.readerEID;
-    const uint8_t* writerEID = ackFields.writerEID;
-    uint32_t bitmapBaseLow = ackFields.bitmapBaseLow;
-    uint32_t numBits = ackFields.numBits;
-    RTPSAckNackWriterKind writerKind = RTPSAckNack_classifyWriter(writerEID);
-
-    LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
-          readerEID[0], readerEID[1], readerEID[2], readerEID[3],
-          writerEID[0], writerEID[1], writerEID[2], writerEID[3],
-          RTPSAckNack_writerKindToStr(writerKind),
-          bitmapBaseLow, numBits);
-
-    const DiscoveredParticipant* remote = nullptr;
-    for (const auto& dp : discovered)
+    struct AckExecCtx
     {
-        if (memcmp(dp.guidPrefix, srcGuidPrefix, 12) == 0)
-        {
-            remote = &dp;
-            break;
-        }
-    }
-    if (!remote) return;
+        RTPSAckNackRunnerAdapterBaseCtx base;
+        const uint8_t* srcGuidPrefix = nullptr;
+    } ctx = { {}, srcGuidPrefix };
 
-    if (writerKind == RTPSAckNackWriterKind::SedpPublications && bitmapBaseLow <= 2)
+    ctx.base.discovered = &discovered;
+
+    RTPSAckNackRunnerCallbacks callbacks;
+    callbacks.logParsed = [](void*, const RTPSAckNackFields& fields, RTPSAckNackWriterKind writerKind)
     {
-        LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publications (base=%u)", bitmapBaseLow);
-        // Retransmit SN=1 (ros_discovery_info) if needed
-        if (bitmapBaseLow <= 1)
+        LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
+              fields.readerEID[0], fields.readerEID[1], fields.readerEID[2], fields.readerEID[3],
+              fields.writerEID[0], fields.writerEID[1], fields.writerEID[2], fields.writerEID[3],
+              RTPSAckNack_writerKindToStr(writerKind),
+              fields.bitmapBaseLow, fields.numBits);
+    };
+    callbacks.resolveRemote = RTPSRunnerAdapter_ackResolveRemote;
+    callbacks.unknownRemote = nullptr;
+    callbacks.getChatterSeq = [](void*) -> uint64_t
+    {
+        return chatterSeqNum;
+    };
+    callbacks.executeAction = [](void* userCtx,
+                                 RTPSAckNackRunnerAction action,
+                                 const RTPSAckNackFields&,
+                                 RTPSAckNackWriterKind)
+    {
+        AckExecCtx* p = static_cast<AckExecCtx*>(userCtx);
+        const DiscoveredParticipant* remote = p->base.remote;
+        if (!remote)
+            return;
+
+        if (action == RTPSAckNackRunnerAction::RetransmitSedpRosDiscoveryPublication)
         {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publications (rosDisc)");
             heartbeatCount++;
             uint32_t sedpLen = sedpHandler.buildPublicationMessage(
-                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+                sendBuf, sizeof(sendBuf), participant, p->srcGuidPrefix,
                 ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
                 "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
                 RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr,
@@ -459,12 +469,12 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                 LOG_I(MODULE_PREFIX, "  SEDP retransmit rosDisc %d/%d bytes", sent, (int)sedpLen);
             }
         }
-        // Retransmit SN=2 (/chatter) if needed
-        if (bitmapBaseLow <= 2)
+        else if (action == RTPSAckNackRunnerAction::RetransmitSedpChatterPublication)
         {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publications (chatter)");
             heartbeatCount++;
             uint32_t chatterSedpLen = sedpHandler.buildPublicationMessage(
-                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+                sendBuf, sizeof(sendBuf), participant, p->srcGuidPrefix,
                 ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
                 RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sedpSeqNum + 1, myIpAddr,
                 heartbeatCount);
@@ -478,57 +488,53 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                 LOG_I(MODULE_PREFIX, "  SEDP retransmit chatter %d/%d bytes", sent, (int)chatterSedpLen);
             }
         }
-    }
-    else if (writerKind == RTPSAckNackWriterKind::SedpSubscriptions && bitmapBaseLow <= 1)
-    {
-        LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP subscription");
-        heartbeatCount++;
-        uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
-            "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-            RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
-            heartbeatCount);
-        if (sedpSubLen > 0)
+        else if (action == RTPSAckNackRunnerAction::RetransmitSedpRosDiscoverySubscription)
         {
-            struct sockaddr_in dest = {};
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(remote->metatrafficPort);
-            dest.sin_addr.s_addr = remote->ipAddr;
-            int sent = sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            LOG_I(MODULE_PREFIX, "  SEDP sub retransmit %d/%d bytes", sent, (int)sedpSubLen);
-        }
-    }
-    else if (writerKind == RTPSAckNackWriterKind::RosDiscoveryInfo && bitmapBaseLow <= 1)
-    {
-        LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
-        uint8_t rosDiscPayload[256];
-        uint32_t rosDiscLen = buildRosDiscInfoWithGids(rosDiscPayload, sizeof(rosDiscPayload));
-        if (rosDiscLen > 0)
-        {
-            // Hex dump the CDR payload
-            fprintf(stderr, "ROSDISC_PAYLOAD_HEX (%u bytes):", rosDiscLen);
-            for (uint32_t i = 0; i < rosDiscLen; i++) fprintf(stderr, " %02x", rosDiscPayload[i]);
-            fprintf(stderr, "\n");
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP subscription");
             heartbeatCount++;
-            uint32_t msgLen = sedpHandler.buildUserDataMessage(
-                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-                ENTITYID_ROS_DISC_INFO_WRITER, rosDiscPayload, rosDiscLen,
-                rosDiscSeqNum, heartbeatCount);
-            if (msgLen > 0)
+            uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
+                sendBuf, sizeof(sendBuf), participant, p->srcGuidPrefix,
+                ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
+                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
+                heartbeatCount);
+            if (sedpSubLen > 0)
             {
                 struct sockaddr_in dest = {};
                 dest.sin_family = AF_INET;
-                dest.sin_port = htons(remote->userDataPort);
+                dest.sin_port = htons(remote->metatrafficPort);
                 dest.sin_addr.s_addr = remote->ipAddr;
-                int sent = sendto(userDataSock, sendBuf, msgLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-                LOG_I(MODULE_PREFIX, "  rosDisc retransmit %d/%d bytes", sent, (int)msgLen);
+                int sent = sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+                LOG_I(MODULE_PREFIX, "  SEDP sub retransmit %d/%d bytes", sent, (int)sedpSubLen);
             }
         }
-    }
-    else if (writerKind == RTPSAckNackWriterKind::Chatter)
-    {
-        if (chatterSeqNum > 0 && bitmapBaseLow <= chatterSeqNum)
+        else if (action == RTPSAckNackRunnerAction::RetransmitRosDiscoveryInfo)
+        {
+            LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
+            uint8_t rosDiscPayload[256];
+            uint32_t rosDiscLen = buildRosDiscInfoWithGids(rosDiscPayload, sizeof(rosDiscPayload));
+            if (rosDiscLen > 0)
+            {
+                fprintf(stderr, "ROSDISC_PAYLOAD_HEX (%u bytes):", rosDiscLen);
+                for (uint32_t i = 0; i < rosDiscLen; i++) fprintf(stderr, " %02x", rosDiscPayload[i]);
+                fprintf(stderr, "\n");
+                heartbeatCount++;
+                uint32_t msgLen = sedpHandler.buildUserDataMessage(
+                    sendBuf, sizeof(sendBuf), participant, p->srcGuidPrefix,
+                    ENTITYID_ROS_DISC_INFO_WRITER, rosDiscPayload, rosDiscLen,
+                    rosDiscSeqNum, heartbeatCount);
+                if (msgLen > 0)
+                {
+                    struct sockaddr_in dest = {};
+                    dest.sin_family = AF_INET;
+                    dest.sin_port = htons(remote->userDataPort);
+                    dest.sin_addr.s_addr = remote->ipAddr;
+                    int sent = sendto(userDataSock, sendBuf, msgLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+                    LOG_I(MODULE_PREFIX, "  rosDisc retransmit %d/%d bytes", sent, (int)msgLen);
+                }
+            }
+        }
+        else if (action == RTPSAckNackRunnerAction::RetransmitChatterData)
         {
             LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit chatter seq=%llu",
                   (unsigned long long)chatterSeqNum);
@@ -541,10 +547,10 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             {
                 heartbeatCount++;
                 uint32_t msgLen = sedpHandler.buildUserDataMessage(
-                    sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
+                    sendBuf, sizeof(sendBuf), participant, p->srcGuidPrefix,
                     ENTITYID_CHATTER_WRITER, chatterPayload, payloadLen,
                     chatterSeqNum, heartbeatCount,
-                    chatterSeqNum);  // firstSN = current (volatile)
+                    chatterSeqNum);
                 if (msgLen > 0)
                 {
                     struct sockaddr_in dest = {};
@@ -556,7 +562,12 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                 }
             }
         }
-    }
+    };
+
+    RTPSAckNackRunnerOptions options;
+    options.publicationsIncludesChatterAnnouncement = true;
+    options.requirePublicationSeq2GateForRetransmit = true;
+    RTPSAckNackRunner_run(srcGuidPrefix, pContent, contentLen, options, callbacks, &ctx);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -573,120 +584,103 @@ static void recvMetatraffic()
     LOG_I(MODULE_PREFIX, "recvMetatraffic %d bytes from %s:%d",
           n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port));
 
-    uint8_t srcGuidPrefix[12];
-    uint32_t hdrLen = RTPSMessage::parseHeader(recvBuf, (uint32_t)n, srcGuidPrefix);
-    if (hdrLen == 0) return;
-
-    uint32_t offset = hdrLen;
-    while (offset < (uint32_t)n)
+    struct RxCtx
     {
-        RTPSSubmessageId submsgId;
-        uint8_t flags;
-        const uint8_t* pContent;
-        uint32_t contentLen;
-        uint32_t submsgSize = RTPSMessage::parseSubmessage(
-            recvBuf + offset, (uint32_t)n - offset, submsgId, flags, pContent, contentLen);
-        if (submsgSize == 0) break;
+        RTPSRxRunnerAdapterBaseCtx base;
+    } rxCtx;
 
-        if (submsgId == SUBMSG_HEARTBEAT && contentLen >= 28)
+    rxCtx.base.localGuidPrefix = participant.getGuidPrefix();
+    rxCtx.base.discovered = &discovered;
+    rxCtx.base.ackSendSock = metatrafficSock;
+    rxCtx.base.readerPolicy = RTPSRxAdapterReaderPolicy::BuiltinEndpointMap;
+    rxCtx.base.ackDestPolicy = RTPSRxAdapterAckDestPolicy::ReplyToSender;
+
+    RTPSRxSubmessageRunnerCallbacks callbacks;
+    RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
+    callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
+    {
+        if (responded)
         {
-            const uint8_t* readerEID = pContent;
-            const uint8_t* writerEID = pContent + 4;
-            uint32_t lastSNLow = RTPSMessage::readLE32(pContent + 24);
-
-            const uint8_t* ourReaderEID = ENTITYID_UNKNOWN;
-            if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0)
-                ourReaderEID = ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER;
-            else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
-                ourReaderEID = ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER;
-            else if (memcmp(writerEID, ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER, 4) == 0)
-                ourReaderEID = ENTITYID_SPDP_BUILTIN_PARTICIPANT_READER;
-            else if (memcmp(writerEID, ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER, 4) == 0)
-                ourReaderEID = ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER;
-            else
-                ourReaderEID = readerEID;
-
-            bool isFinal = (flags & 0x02) != 0;
-            if (!isFinal)
-            {
-                uint8_t ackBuf[80];
-                uint32_t pos = 0;
-                pos += RTPSMessage::writeHeader(ackBuf + pos, sizeof(ackBuf) - pos, participant.getGuidPrefix());
-                pos += RTPSMessage::writeInfoDST(ackBuf + pos, sizeof(ackBuf) - pos, srcGuidPrefix);
-                uint32_t lastSNHigh = RTPSMessage::readLE32(pContent + 20);
-                uint32_t ackBaseLow = lastSNLow + 1;
-                uint32_t ackBaseHigh = lastSNHigh + (ackBaseLow == 0 ? 1 : 0);
-                acknackCount++;
-                pos += RTPSMessage::writeAcknack(ackBuf + pos, sizeof(ackBuf) - pos,
-                    ourReaderEID, writerEID, (int32_t)ackBaseHigh, ackBaseLow, acknackCount);
-
-                int sent = sendto(metatrafficSock, ackBuf, pos, 0, (struct sockaddr*)&fromAddr, sizeof(fromAddr));
-                LOG_I(MODULE_PREFIX, "  HB writerEID=%02X%02X%02X%02X SN=%u -> ACKNACK %d bytes",
-                      writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow, sent);
-            }
-            else
-            {
-                LOG_I(MODULE_PREFIX, "  HB(final) writerEID=%02X%02X%02X%02X SN=%u",
-                      writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow);
-            }
-        }
-        else if (submsgId == SUBMSG_DATA && contentLen >= 24)
-        {
-            const uint8_t* writerEID = pContent + 8;
-            if (memcmp(writerEID, ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER, 4) == 0)
-            {
-                LOG_I(MODULE_PREFIX, "  SPDP DATA on metatraffic");
-                DiscoveredParticipant remote;
-                if (spdpHandler.parseAnnouncementMessage(recvBuf, (uint32_t)n, remote))
-                {
-                    if (memcmp(remote.guidPrefix, participant.getGuidPrefix(), 12) != 0)
-                        processDiscoveredParticipant(remote, fromAddr);
-                }
-            }
-            else
-            {
-                LOG_I(MODULE_PREFIX, "  DATA writerEID=%02X%02X%02X%02X len=%d",
-                      writerEID[0], writerEID[1], writerEID[2], writerEID[3], (int)contentLen);
-                // Hex dump incoming SEDP DATA for debugging
-                if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 ||
-                    memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
-                {
-                    // Dump the serialized payload (after DATA header: extraFlags(2)+octetsToInlineQoS(2)+readerEID(4)+writerEID(4)+SN(8)=20)
-                    if (contentLen > 20)
-                    {
-                        const uint8_t* payload = pContent + 20;
-                        uint32_t payloadLen = contentLen - 20;
-                        fprintf(stderr, "SEDP_INCOMING_%s_HEX (%d bytes):",
-                                memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 ? "PUB" : "SUB",
-                                (int)payloadLen);
-                        for (uint32_t i = 0; i < payloadLen && i < 512; i++)
-                            fprintf(stderr, " %02x", payload[i]);
-                        fprintf(stderr, "\n");
-                    }
-                }
-            }
-        }
-        else if (submsgId == SUBMSG_ACKNACK && contentLen >= 24)
-        {
-            handleAcknack(srcGuidPrefix, pContent, contentLen, fromAddr);
+            LOG_I(MODULE_PREFIX, "  HB writerEID=%02X%02X%02X%02X SN=%u -> ACKNACK %d bytes",
+                  writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow, sentBytes);
         }
         else
         {
-            const char* name = "?";
-            switch (submsgId) {
-                case SUBMSG_DATA:      name = "DATA"; break;
-                case SUBMSG_HEARTBEAT: name = "HB"; break;
-                case SUBMSG_ACKNACK:   name = "AN"; break;
-                case SUBMSG_INFO_DST:  name = "DST"; break;
-                case SUBMSG_INFO_TS:   name = "TS"; break;
-                default: break;
-            }
-            LOG_I(MODULE_PREFIX, "  %s (0x%02X) flags=0x%02X len=%d",
-                  name, (int)submsgId, (int)flags, (int)contentLen);
+            LOG_I(MODULE_PREFIX, "  HB(final) writerEID=%02X%02X%02X%02X SN=%u",
+                  writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow);
         }
+    };
+    callbacks.onData = [](void*,
+                          RTPSRxChannel,
+                          const uint8_t* packet,
+                          uint32_t packetLen,
+                          const uint8_t*,
+                          const struct sockaddr_in& from,
+                          const uint8_t* pContent,
+                          uint32_t contentLen)
+    {
+        const uint8_t* writerEID = pContent + 8;
+        if (memcmp(writerEID, ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER, 4) == 0)
+        {
+            LOG_I(MODULE_PREFIX, "  SPDP DATA on metatraffic");
+            DiscoveredParticipant remote;
+            if (spdpHandler.parseAnnouncementMessage(packet, packetLen, remote))
+            {
+                if (memcmp(remote.guidPrefix, participant.getGuidPrefix(), 12) != 0)
+                    processDiscoveredParticipant(remote, from);
+            }
+        }
+        else
+        {
+            LOG_I(MODULE_PREFIX, "  DATA writerEID=%02X%02X%02X%02X len=%d",
+                  writerEID[0], writerEID[1], writerEID[2], writerEID[3], (int)contentLen);
+            if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 ||
+                memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
+            {
+                if (contentLen > 20)
+                {
+                    const uint8_t* payload = pContent + 20;
+                    uint32_t payloadLen = contentLen - 20;
+                    fprintf(stderr, "SEDP_INCOMING_%s_HEX (%d bytes):",
+                            memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 ? "PUB" : "SUB",
+                            (int)payloadLen);
+                    for (uint32_t i = 0; i < payloadLen && i < 512; i++)
+                        fprintf(stderr, " %02x", payload[i]);
+                    fprintf(stderr, "\n");
+                }
+            }
+        }
+    };
+    callbacks.onAckNack = [](void*,
+                             RTPSRxChannel,
+                             const uint8_t* srcGuidPrefix,
+                             const uint8_t* pContent,
+                             uint32_t contentLen,
+                             const struct sockaddr_in& from)
+    {
+        handleAcknack(srcGuidPrefix, pContent, contentLen, from);
+    };
+    callbacks.onOther = [](void*, RTPSRxChannel, RTPSSubmessageId submsgId, uint8_t flags, uint32_t contentLen)
+    {
+        const char* name = "?";
+        switch (submsgId) {
+            case SUBMSG_DATA:      name = "DATA"; break;
+            case SUBMSG_HEARTBEAT: name = "HB"; break;
+            case SUBMSG_ACKNACK:   name = "AN"; break;
+            case SUBMSG_INFO_DST:  name = "DST"; break;
+            case SUBMSG_INFO_TS:   name = "TS"; break;
+            default: break;
+        }
+        LOG_I(MODULE_PREFIX, "  %s (0x%02X) flags=0x%02X len=%d",
+              name, (int)submsgId, (int)flags, (int)contentLen);
+    };
 
-        offset += submsgSize;
-    }
+    RTPSRxSubmessageRunner_run(
+        recvBuf, (uint32_t)n, fromAddr,
+        RTPSRxChannel::Metatraffic,
+        acknackCount,
+        callbacks,
+        &rxCtx);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -703,76 +697,58 @@ static void recvUserData()
     LOG_I(MODULE_PREFIX, "recvUserData %d bytes from %s:%d",
           n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port));
 
-    uint8_t srcGuidPrefix[12];
-    uint32_t hdrLen = RTPSMessage::parseHeader(recvBuf, (uint32_t)n, srcGuidPrefix);
-    if (hdrLen == 0) return;
-
-    uint32_t offset = hdrLen;
-    while (offset < (uint32_t)n)
+    struct RxCtx
     {
-        RTPSSubmessageId submsgId;
-        uint8_t flags;
-        const uint8_t* pContent;
-        uint32_t contentLen;
-        uint32_t submsgSize = RTPSMessage::parseSubmessage(
-            recvBuf + offset, (uint32_t)n - offset, submsgId, flags, pContent, contentLen);
-        if (submsgSize == 0) break;
+        RTPSRxRunnerAdapterBaseCtx base;
+    } rxCtx;
 
-        if (submsgId == SUBMSG_HEARTBEAT && contentLen >= 28)
-        {
-            const uint8_t* readerEID = pContent;
-            const uint8_t* writerEID = pContent + 4;
-            uint32_t lastSNLow = RTPSMessage::readLE32(pContent + 24);
-            uint32_t lastSNHigh = RTPSMessage::readLE32(pContent + 20);
+    rxCtx.base.localGuidPrefix = participant.getGuidPrefix();
+    rxCtx.base.discovered = &discovered;
+    rxCtx.base.ackSendSock = metatrafficSock;
+    rxCtx.base.readerPolicy = RTPSRxAdapterReaderPolicy::UseHeartbeatReader;
+    rxCtx.base.ackDestPolicy = RTPSRxAdapterAckDestPolicy::RouteToDiscoveredMetatraffic;
 
-            bool isFinal = (flags & 0x02) != 0;
-            if (!isFinal)
-            {
-                uint8_t ackBuf[80];
-                uint32_t pos = 0;
-                pos += RTPSMessage::writeHeader(ackBuf + pos, sizeof(ackBuf) - pos, participant.getGuidPrefix());
-                pos += RTPSMessage::writeInfoDST(ackBuf + pos, sizeof(ackBuf) - pos, srcGuidPrefix);
-                uint32_t ackBaseLow = lastSNLow + 1;
-                uint32_t ackBaseHigh = lastSNHigh + (ackBaseLow == 0 ? 1 : 0);
-                acknackCount++;
-                pos += RTPSMessage::writeAcknack(ackBuf + pos, sizeof(ackBuf) - pos,
-                    readerEID, writerEID, (int32_t)ackBaseHigh, ackBaseLow, acknackCount);
+    RTPSRxSubmessageRunnerCallbacks callbacks;
+    RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
+    callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
+    {
+        if (responded)
+        {
+            LOG_I(MODULE_PREFIX, "  UD HB writerEID=%02X%02X%02X%02X SN=%u -> ACKNACK %d",
+                  writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow, sentBytes);
+        }
+    };
+    callbacks.onData = nullptr;
+    callbacks.onAckNack = [](void*,
+                             RTPSRxChannel,
+                             const uint8_t* srcGuidPrefix,
+                             const uint8_t* pContent,
+                             uint32_t contentLen,
+                             const struct sockaddr_in& from)
+    {
+        handleAcknack(srcGuidPrefix, pContent, contentLen, from);
+    };
+    callbacks.onOther = [](void*, RTPSRxChannel, RTPSSubmessageId submsgId, uint8_t flags, uint32_t contentLen)
+    {
+        const char* name = "?";
+        switch (submsgId) {
+            case SUBMSG_DATA:      name = "DATA"; break;
+            case SUBMSG_HEARTBEAT: name = "HB"; break;
+            case SUBMSG_ACKNACK:   name = "AN"; break;
+            case SUBMSG_INFO_DST:  name = "DST"; break;
+            case SUBMSG_INFO_TS:   name = "TS"; break;
+            default: break;
+        }
+        LOG_I(MODULE_PREFIX, "  UD %s (0x%02X) flags=0x%02X len=%d",
+              name, (int)submsgId, (int)flags, (int)contentLen);
+    };
 
-                // ACKNACKs go to metatraffic port
-                struct sockaddr_in ackDest = fromAddr;
-                for (const auto& dp : discovered)
-                {
-                    if (dp.ipAddr == fromAddr.sin_addr.s_addr)
-                    {
-                        ackDest.sin_port = htons(dp.metatrafficPort);
-                        break;
-                    }
-                }
-                int sent = sendto(metatrafficSock, ackBuf, pos, 0, (struct sockaddr*)&ackDest, sizeof(ackDest));
-                LOG_I(MODULE_PREFIX, "  UD HB writerEID=%02X%02X%02X%02X SN=%u -> ACKNACK %d",
-                      writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow, sent);
-            }
-        }
-        else if (submsgId == SUBMSG_ACKNACK && contentLen >= 24)
-        {
-            handleAcknack(srcGuidPrefix, pContent, contentLen, fromAddr);
-        }
-        else
-        {
-            const char* name = "?";
-            switch (submsgId) {
-                case SUBMSG_DATA:      name = "DATA"; break;
-                case SUBMSG_HEARTBEAT: name = "HB"; break;
-                case SUBMSG_ACKNACK:   name = "AN"; break;
-                case SUBMSG_INFO_DST:  name = "DST"; break;
-                case SUBMSG_INFO_TS:   name = "TS"; break;
-                default: break;
-            }
-            LOG_I(MODULE_PREFIX, "  UD %s (0x%02X) flags=0x%02X len=%d",
-                  name, (int)submsgId, (int)flags, (int)contentLen);
-        }
-        offset += submsgSize;
-    }
+    RTPSRxSubmessageRunner_run(
+        recvBuf, (uint32_t)n, fromAddr,
+        RTPSRxChannel::UserData,
+        acknackCount,
+        callbacks,
+        &rxCtx);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -784,9 +760,7 @@ static void purgeStaleParticipants()
     uint32_t now = millis();
     for (auto it = discovered.begin(); it != discovered.end(); )
     {
-        uint32_t leaseMs = it->leaseDurationSec * 1000 * 2;
-        if (leaseMs == 0) leaseMs = 240000;
-        if ((now - it->discoveredTimeMs) > leaseMs)
+        if (RTPSParticipantLeasePolicy_isExpired(now, it->discoveredTimeMs, it->leaseDurationSec))
         {
             LOG_I(MODULE_PREFIX, "purge stale participant (expired %d sec ago)",
                   (int)((now - it->discoveredTimeMs) / 1000));
@@ -803,114 +777,132 @@ static void purgeStaleParticipants()
 
 static void sendWriterHeartbeats()
 {
+    static bool dumpedRosDiscOnce = false;
+    RTPSWriterHeartbeatCounterState counters = {
+        sedpSeqNum,
+        sedpSubSeqNum,
+        sedpSeqNum + 1,
+        livelinessSeqNum,
+        rosDiscSeqNum,
+        heartbeatCount,
+        dumpedRosDiscOnce,
+    };
+
     for (const auto& remote : discovered)
     {
-        // SEDP publication DATA + HB
+        struct ExecCtx
         {
-            heartbeatCount++;
-            uint32_t sedpLen = sedpHandler.buildPublicationMessage(
-                sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-                ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
-                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr,
-                heartbeatCount);
-            if (sedpLen > 0)
-            {
-                struct sockaddr_in dest = {};
-                dest.sin_family = AF_INET;
-                dest.sin_port = htons(remote.metatrafficPort);
-                dest.sin_addr.s_addr = remote.ipAddr;
-                sendto(metatrafficSock, sendBuf, sedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            }
-        }
+            const DiscoveredParticipant* remote = nullptr;
+        } execCtx = { &remote };
 
-        // SEDP subscription DATA + HB
+        RTPSWriterHeartbeatRunnerCallbacks callbacks;
+        callbacks.buildPayload = [](void* userCtx,
+                                    RTPSWriterHeartbeatAction action,
+                                    uint64_t sequenceNumber,
+                                    uint32_t heartbeatCountCb) -> uint32_t
         {
-            heartbeatCount++;
-            uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
-                sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-                ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
-                "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-                RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
-                heartbeatCount);
-            if (sedpSubLen > 0)
-            {
-                struct sockaddr_in dest = {};
-                dest.sin_family = AF_INET;
-                dest.sin_port = htons(remote.metatrafficPort);
-                dest.sin_addr.s_addr = remote.ipAddr;
-                sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            }
-        }
+            ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
+            const DiscoveredParticipant& remoteRef = *ctx->remote;
 
-        // SEDP publication for /chatter DataWriter
-        {
-            heartbeatCount++;
-            uint32_t chatterSedpLen = sedpHandler.buildPublicationMessage(
-                sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-                ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
-                RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sedpSeqNum + 1, myIpAddr,
-                heartbeatCount);
-            if (chatterSedpLen > 0)
+            switch (action)
             {
-                struct sockaddr_in dest = {};
-                dest.sin_family = AF_INET;
-                dest.sin_port = htons(remote.metatrafficPort);
-                dest.sin_addr.s_addr = remote.ipAddr;
-                sendto(metatrafficSock, sendBuf, chatterSedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            }
-        }
-
-        // Participant message data (liveliness)
-        {
-            heartbeatCount++;
-            livelinessSeqNum++;
-            uint32_t pmdLen = sedpHandler.buildParticipantMessageData(
-                sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-                livelinessSeqNum, heartbeatCount);
-            if (pmdLen > 0)
-            {
-                struct sockaddr_in dest = {};
-                dest.sin_family = AF_INET;
-                dest.sin_port = htons(remote.metatrafficPort);
-                dest.sin_addr.s_addr = remote.ipAddr;
-                sendto(metatrafficSock, sendBuf, pmdLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            }
-        }
-
-        // ros_discovery_info DATA + HB
-        {
-            uint8_t rosDiscPayload[256];
-            uint32_t rosDiscLen = buildRosDiscInfoWithGids(
-                rosDiscPayload, sizeof(rosDiscPayload));
-            if (rosDiscLen > 0)
-            {
-                // Hex dump payload on first send
-                static bool dumpedOnce = false;
-                if (!dumpedOnce) {
-                    dumpedOnce = true;
-                    fprintf(stderr, "ROSDISC_CDR (%u bytes):", rosDiscLen);
-                    for (uint32_t i = 0; i < rosDiscLen; i++) fprintf(stderr, " %02x", rosDiscPayload[i]);
-                    fprintf(stderr, "\n");
-                }
-                // Don't increment rosDiscSeqNum - content is static, always SN=1
-                heartbeatCount++;
-                uint32_t msgLen = sedpHandler.buildUserDataMessage(
-                    sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-                    ENTITYID_ROS_DISC_INFO_WRITER, rosDiscPayload, rosDiscLen,
-                    rosDiscSeqNum, heartbeatCount);
-                if (msgLen > 0)
+                case RTPSWriterHeartbeatAction::SedpRosDiscoveryPublication:
+                    return sedpHandler.buildPublicationMessage(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
+                        "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sequenceNumber, myIpAddr,
+                        heartbeatCountCb);
+                case RTPSWriterHeartbeatAction::SedpRosDiscoverySubscription:
+                    return sedpHandler.buildSubscriptionMessage(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
+                        "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
+                        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sequenceNumber, myIpAddr,
+                        heartbeatCountCb);
+                case RTPSWriterHeartbeatAction::SedpChatterPublication:
+                    return sedpHandler.buildPublicationMessage(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
+                        RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sequenceNumber, myIpAddr,
+                        heartbeatCountCb);
+                case RTPSWriterHeartbeatAction::ParticipantMessageData:
+                    return sedpHandler.buildParticipantMessageData(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        sequenceNumber, heartbeatCountCb);
+                case RTPSWriterHeartbeatAction::RosDiscoveryInfoData:
                 {
-                    struct sockaddr_in dest = {};
-                    dest.sin_family = AF_INET;
-                    dest.sin_port = htons(remote.userDataPort);
-                    dest.sin_addr.s_addr = remote.ipAddr;
-                    int sent = sendto(userDataSock, sendBuf, msgLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-                    LOG_I(MODULE_PREFIX, "sendWriterHB rosDisc %d/%d to port %d", sent, (int)msgLen, (int)remote.userDataPort);
+                    uint8_t rosDiscPayload[256];
+                    uint32_t rosDiscLen = buildRosDiscInfoWithGids(
+                        rosDiscPayload, sizeof(rosDiscPayload));
+                    if (rosDiscLen == 0)
+                        return 0;
+                    return sedpHandler.buildUserDataMessage(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        ENTITYID_ROS_DISC_INFO_WRITER, rosDiscPayload, rosDiscLen,
+                        sequenceNumber, heartbeatCountCb);
                 }
+                default:
+                    return 0;
             }
-        }
+        };
+
+        callbacks.sendPayload = [](void* userCtx,
+                                   RTPSWriterHeartbeatSendTarget sendTarget,
+                                   uint32_t payloadLen) -> int
+        {
+            ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
+            const DiscoveredParticipant& remoteRef = *ctx->remote;
+
+            struct sockaddr_in dest = {};
+            dest.sin_family = AF_INET;
+            dest.sin_addr.s_addr = remoteRef.ipAddr;
+            int sock = -1;
+            if (sendTarget == RTPSWriterHeartbeatSendTarget::Metatraffic)
+            {
+                sock = metatrafficSock;
+                dest.sin_port = htons(remoteRef.metatrafficPort);
+            }
+            else
+            {
+                sock = userDataSock;
+                dest.sin_port = htons(remoteRef.userDataPort);
+            }
+            return sendto(sock, sendBuf, payloadLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+        };
+
+        callbacks.debugPayload = [](void*, RTPSWriterHeartbeatAction action, uint32_t payloadLen)
+        {
+            if (action != RTPSWriterHeartbeatAction::RosDiscoveryInfoData)
+                return;
+            fprintf(stderr, "ROSDISC_CDR (%u bytes):", payloadLen);
+            for (uint32_t i = 0; i < payloadLen; i++) fprintf(stderr, " %02x", sendBuf[i]);
+            fprintf(stderr, "\n");
+        };
+
+        callbacks.logSend = [](void* userCtx,
+                               RTPSWriterHeartbeatAction action,
+                               int sentBytes,
+                               uint32_t payloadLen,
+                               RTPSWriterHeartbeatSendTarget)
+        {
+            if (action != RTPSWriterHeartbeatAction::RosDiscoveryInfoData)
+                return;
+            ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
+            const DiscoveredParticipant& remoteRef = *ctx->remote;
+            LOG_I(MODULE_PREFIX, "sendWriterHB rosDisc %d/%d to port %d", sentBytes, (int)payloadLen, (int)remoteRef.userDataPort);
+        };
+
+        RTPSWriterHeartbeatRunner_run(
+            RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle,
+            counters,
+            callbacks,
+            &execCtx);
     }
+
+    heartbeatCount = counters.heartbeatCount;
+    livelinessSeqNum = counters.livelinessSeqNum;
+    dumpedRosDiscOnce = counters.rosDiscDebugDumped;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -919,104 +911,180 @@ static void sendWriterHeartbeats()
 
 static void handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr)
 {
-    // Unicast SPDP reply
-    spdpSeqNum++;
-    uint32_t spdpLen = spdpHandler.buildAnnouncementMessage(
-        sendBuf, sizeof(sendBuf), participant, myIpAddr, LEASE_DURATION_SEC, spdpSeqNum);
-    if (spdpLen > 0)
+    const RTPSInitialAnnouncePlan announcePlan = RTPSInitialAnnouncePlan_default();
+    const RTPSInitialAnnounceSequence announceSeq = RTPSInitialAnnouncePlan_buildSequence(
+        announcePlan, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle);
+
+    struct ExecCtx
     {
-        int sent = sendto(spdpSock, sendBuf, spdpLen, 0,
-                          (const struct sockaddr*)&senderAddr, sizeof(senderAddr));
-        LOG_I(MODULE_PREFIX, "handleNewParticipant unicast SPDP %d/%d to %s:%d",
-              sent, (int)spdpLen, inet_ntoa(((struct sockaddr_in&)senderAddr).sin_addr),
-              (int)ntohs(senderAddr.sin_port));
+        const DiscoveredParticipant* remote = nullptr;
+        const struct sockaddr_in* senderAddr = nullptr;
+    } execCtx = { &remote, &senderAddr };
 
-        struct sockaddr_in dest = senderAddr;
-        dest.sin_port = htons(participant.getSPDPMulticastPort());
-        sendto(spdpSock, sendBuf, spdpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-    }
+    RTPSInitialAnnounceRunnerCallbacks callbacks;
 
-    // SEDP publication
-    heartbeatCount++;
-    uint32_t sedpLen = sedpHandler.buildPublicationMessage(
-        sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-        ENTITYID_ROS_DISC_INFO_WRITER, "ros_discovery_info",
-        "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSeqNum, myIpAddr,
-        heartbeatCount);
-    if (sedpLen > 0)
+    callbacks.buildPayload = [](void* userCtx,
+                                const RTPSInitialAnnounceStep& step,
+                                uint64_t sequenceNumber,
+                                uint32_t heartbeatCount,
+                                uint32_t previousPayloadLen) -> uint32_t
+    {
+        ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
+        const DiscoveredParticipant& remoteRef = *ctx->remote;
+
+        const RTPSInitialAnnounceBuildSpec buildSpec = RTPSInitialAnnouncePlan_getBuildSpec(step.action);
+        switch (buildSpec.buildKind)
+        {
+            case RTPSInitialAnnounceBuildKind::SpdpAnnouncement:
+                return spdpHandler.buildAnnouncementMessage(
+                    sendBuf, sizeof(sendBuf), participant, myIpAddr, LEASE_DURATION_SEC, sequenceNumber);
+            case RTPSInitialAnnounceBuildKind::ReusePrevious:
+                return previousPayloadLen;
+            case RTPSInitialAnnounceBuildKind::SedpPublication:
+            case RTPSInitialAnnounceBuildKind::SedpSubscription:
+            {
+                const RTPSInitialAnnounceSedpEndpointSpec sedpSpec =
+                    RTPSInitialAnnouncePlan_getSedpEndpointSpec(buildSpec.sedpEndpointProfile);
+                if (!sedpSpec.entityId)
+                    return 0;
+                if (buildSpec.buildKind == RTPSInitialAnnounceBuildKind::SedpPublication)
+                {
+                    return sedpHandler.buildPublicationMessage(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        sedpSpec.entityId, sedpSpec.topicName, sedpSpec.typeName,
+                        sedpSpec.reliabilityKind, sedpSpec.durabilityKind,
+                        sequenceNumber, myIpAddr, heartbeatCount);
+                }
+                return sedpHandler.buildSubscriptionMessage(
+                    sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                    sedpSpec.entityId, sedpSpec.topicName, sedpSpec.typeName,
+                    sedpSpec.reliabilityKind, sedpSpec.durabilityKind,
+                    sequenceNumber, myIpAddr, heartbeatCount);
+            }
+            case RTPSInitialAnnounceBuildKind::ParticipantMessageData:
+                return sedpHandler.buildParticipantMessageData(
+                    sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                    sequenceNumber, heartbeatCount);
+            case RTPSInitialAnnounceBuildKind::RosDiscoveryUserData:
+            case RTPSInitialAnnounceBuildKind::None:
+            default:
+                return 0;
+        }
+    };
+
+    callbacks.sendPayload = [](void* userCtx,
+                               RTPSInitialAnnounceAction action,
+                               uint32_t payloadLen) -> int
+    {
+        ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
+        const DiscoveredParticipant& remoteRef = *ctx->remote;
+        const struct sockaddr_in& senderAddrRef = *ctx->senderAddr;
+
+        if (payloadLen == 0)
+            return -1;
+        const RTPSInitialAnnounceSendTarget target = RTPSInitialAnnouncePlan_getSendTarget(action);
+
+        int sock = -1;
+        switch (target.socket)
+        {
+            case RTPSInitialAnnounceSocket::Spdp:
+                sock = spdpSock;
+                break;
+            case RTPSInitialAnnounceSocket::Metatraffic:
+                sock = metatrafficSock;
+                break;
+            case RTPSInitialAnnounceSocket::UserData:
+                sock = userDataSock;
+                break;
+            default:
+                break;
+        }
+        if (sock < 0)
+            return -1;
+
+        struct sockaddr_in dest = {};
+        switch (target.addressing)
+        {
+            case RTPSInitialAnnounceAddressing::SenderAddr:
+                dest = senderAddrRef;
+                break;
+            case RTPSInitialAnnounceAddressing::SenderAddrWithSpdpPort:
+                dest = senderAddrRef;
+                dest.sin_port = htons(participant.getSPDPMulticastPort());
+                break;
+            case RTPSInitialAnnounceAddressing::RemoteMetatrafficUnicast:
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remoteRef.metatrafficPort);
+                dest.sin_addr.s_addr = remoteRef.ipAddr;
+                break;
+            case RTPSInitialAnnounceAddressing::RemoteUserDataUnicast:
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remoteRef.userDataPort);
+                dest.sin_addr.s_addr = remoteRef.ipAddr;
+                break;
+            default:
+                return -1;
+        }
+
+        return sendto(sock, sendBuf, payloadLen, 0, (struct sockaddr*)&dest, sizeof(dest));
+    };
+
+    callbacks.debugPayload = [](void*, const RTPSInitialAnnounceStep&, uint32_t payloadLen)
     {
         // Hex dump SEDP publication for debugging
-        fprintf(stderr, "SEDP_PUB_HEX (%d bytes):", (int)sedpLen);
-        for (uint32_t i = 0; i < sedpLen; i++)
+        fprintf(stderr, "SEDP_PUB_HEX (%d bytes):", (int)payloadLen);
+        for (uint32_t i = 0; i < payloadLen; i++)
             fprintf(stderr, " %02x", sendBuf[i]);
         fprintf(stderr, "\n");
+    };
 
-        struct sockaddr_in dest = {};
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(remote.metatrafficPort);
-        dest.sin_addr.s_addr = remote.ipAddr;
-        int sent = sendto(metatrafficSock, sendBuf, sedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-        LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP pub %d/%d to port %d",
-              sent, (int)sedpLen, (int)remote.metatrafficPort);
-    }
-
-    // SEDP subscription announcement (we subscribe to ros_discovery_info)
-    heartbeatCount++;
-    uint32_t sedpSubLen = sedpHandler.buildSubscriptionMessage(
-        sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-        ENTITYID_ROS_DISC_INFO_READER, "ros_discovery_info",
-        "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
-        RELIABILITY_RELIABLE, DURABILITY_TRANSIENT_LOCAL, sedpSubSeqNum, myIpAddr,
-        heartbeatCount);
-    if (sedpSubLen > 0)
+    callbacks.logResult = [](void* userCtx,
+                             const RTPSInitialAnnounceStep&,
+                             const RTPSInitialAnnounceLogSpec& logSpec,
+                             const RTPSInitialAnnounceSendResultSpec& sendResult,
+                             int sentBytes,
+                             uint32_t payloadLen)
     {
-        struct sockaddr_in dest = {};
-        dest.sin_family = AF_INET;
-        dest.sin_port = htons(remote.metatrafficPort);
-        dest.sin_addr.s_addr = remote.ipAddr;
-        int sent = sendto(metatrafficSock, sendBuf, sedpSubLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-        LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP sub %d/%d to port %d",
-              sent, (int)sedpSubLen, (int)remote.metatrafficPort);
-    }
+        ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
+        const DiscoveredParticipant& remoteRef = *ctx->remote;
+        const struct sockaddr_in& senderAddrRef = *ctx->senderAddr;
 
-    // SEDP publication announcement for /chatter DataWriter
-    {
-        heartbeatCount++;
-        uint32_t chatterSedpLen = sedpHandler.buildPublicationMessage(
-            sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-            ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
-            RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sedpSeqNum + 1, myIpAddr,
-            heartbeatCount);
-        if (chatterSedpLen > 0)
+        const char* statusPrefix = sendResult.isFailure ? "FAILED " : "";
+        if (logSpec.logToSenderAddress)
         {
-            struct sockaddr_in dest = {};
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(remote.metatrafficPort);
-            dest.sin_addr.s_addr = remote.ipAddr;
-            int sent = sendto(metatrafficSock, sendBuf, chatterSedpLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            LOG_I(MODULE_PREFIX, "handleNewParticipant SEDP chatter pub %d/%d to port %d",
-                  sent, (int)chatterSedpLen, (int)remote.metatrafficPort);
+            LOG_I(MODULE_PREFIX, "handleNewParticipant %s%s %d/%d to %s:%d",
+                  statusPrefix,
+                  logSpec.actionLabel,
+                  sentBytes, (int)payloadLen,
+                  inet_ntoa(((struct sockaddr_in&)senderAddrRef).sin_addr),
+                  (int)ntohs(senderAddrRef.sin_port));
         }
-    }
-
-    // Participant message data (liveliness assertion)
-    {
-        heartbeatCount++;
-        uint32_t pmdLen = sedpHandler.buildParticipantMessageData(
-            sendBuf, sizeof(sendBuf), participant, remote.guidPrefix,
-            livelinessSeqNum, heartbeatCount);
-        if (pmdLen > 0)
+        else
         {
-            struct sockaddr_in dest = {};
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(remote.metatrafficPort);
-            dest.sin_addr.s_addr = remote.ipAddr;
-            int sent = sendto(metatrafficSock, sendBuf, pmdLen, 0, (struct sockaddr*)&dest, sizeof(dest));
-            LOG_I(MODULE_PREFIX, "handleNewParticipant liveliness %d/%d to port %d",
-                  sent, (int)pmdLen, (int)remote.metatrafficPort);
+            LOG_I(MODULE_PREFIX, "handleNewParticipant %s%s %d/%d to port %d",
+                  statusPrefix,
+                  logSpec.actionLabel,
+                  sentBytes, (int)payloadLen, (int)remoteRef.metatrafficPort);
         }
-    }
+    };
+
+    RTPSInitialAnnounceRunnerContext runCtx;
+    runCtx.runtimeFlavor = RTPSInitialAnnounceRuntimeFlavor::LinuxStyle;
+    runCtx.seqCounters = {
+        spdpSeqNum,
+        sedpSeqNum,
+        sedpSubSeqNum,
+        sedpSeqNum + 1,
+        livelinessSeqNum,
+        rosDiscSeqNum,
+    };
+    runCtx.heartbeatCount = heartbeatCount;
+    runCtx.previousPayloadLen = 0;
+
+    RTPSInitialAnnounceRunner_run(announceSeq, runCtx, callbacks, &execCtx);
+
+    spdpSeqNum = runCtx.seqCounters.spdpSeqNum;
+    heartbeatCount = runCtx.heartbeatCount;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1102,21 +1170,21 @@ int main(int argc, char* argv[])
         uint32_t now = millis();
 
         // Periodic SPDP
-        if (now - lastSpdpMs >= SPDP_INTERVAL_MS)
+        if (RTPSRuntimeSchedule_isPeriodicDue(now, lastSpdpMs, SPDP_INTERVAL_MS, false))
         {
             sendSPDP();
             lastSpdpMs = now;
         }
 
         // Periodic heartbeats (once active)
-        if (active && (now - lastHbMs >= WRITER_HB_INTERVAL_MS))
+        if (active && RTPSRuntimeSchedule_isPeriodicDue(now, lastHbMs, WRITER_HB_INTERVAL_MS, true))
         {
             sendWriterHeartbeats();
             lastHbMs = now;
         }
 
         // Periodic chatter publishing (once active)
-        if (active && (now - lastChatterSendMs >= CHATTER_PUBLISH_INTERVAL_MS))
+        if (active && RTPSRuntimeSchedule_isPeriodicDue(now, lastChatterSendMs, CHATTER_PUBLISH_INTERVAL_MS, true))
         {
             publishChatter();
             lastChatterSendMs = now;
@@ -1133,11 +1201,14 @@ int main(int argc, char* argv[])
         }
 
         // Transition to active on first discovery
-        if (!active && !discovered.empty())
-        {
-            active = true;
-            lastHbMs = 0;  // immediate HB
-        }
+        RTPSParticipantSetPolicyResult setPolicy = RTPSParticipantSetPolicy_apply(
+            active,
+            (uint32_t)discovered.size(),
+            false,
+            false);
+        active = setPolicy.shouldBeActive;
+        if (setPolicy.triggerImmediateWriterHeartbeat)
+            RTPSParticipantLifecycle_onActivated(lastHbMs);
     }
 
     printf("\nShutting down...\n");

@@ -15,6 +15,20 @@ SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/RTPS/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/SPDPHandler.cpp \
 	../components/RaftROS/RTPS/RTPSAckNack.cpp \
+	../components/RaftROS/RTPS/RTPSAckNackRunner.cpp \
+	../components/RaftROS/RTPS/RTPSReliabilityPolicy.cpp \
+	../components/RaftROS/RTPS/RTPSRuntimeSchedule.cpp \
+	../components/RaftROS/RTPS/RTPSParticipantLifecycle.cpp \
+	../components/RaftROS/RTPS/RTPSBuiltinEndpointMap.cpp \
+	../components/RaftROS/RTPS/RTPSDiscoveredParticipantLookup.cpp \
+	../components/RaftROS/RTPS/RTPSDiscoveryPolicy.cpp \
+	../components/RaftROS/RTPS/RTPSParticipantLeasePolicy.cpp \
+	../components/RaftROS/RTPS/RTPSParticipantSetPolicy.cpp \
+	../components/RaftROS/RTPS/RTPSInitialAnnouncePlan.cpp \
+	../components/RaftROS/RTPS/RTPSInitialAnnounceRunner.cpp \
+	../components/RaftROS/RTPS/RTPSWriterHeartbeatRunner.cpp \
+	../components/RaftROS/RTPS/RTPSRxSubmessageRunner.cpp \
+	../components/RaftROS/RTPS/RTPSRunnerAdapterHelpers.cpp \
 	../components/RaftROS/RTPS/SEDPHandler.cpp
 
 # Object files
@@ -36,6 +50,20 @@ PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/RTPS/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/SPDPHandler.cpp \
 	../components/RaftROS/RTPS/RTPSAckNack.cpp \
+	../components/RaftROS/RTPS/RTPSAckNackRunner.cpp \
+	../components/RaftROS/RTPS/RTPSReliabilityPolicy.cpp \
+	../components/RaftROS/RTPS/RTPSRuntimeSchedule.cpp \
+	../components/RaftROS/RTPS/RTPSParticipantLifecycle.cpp \
+	../components/RaftROS/RTPS/RTPSBuiltinEndpointMap.cpp \
+	../components/RaftROS/RTPS/RTPSDiscoveredParticipantLookup.cpp \
+	../components/RaftROS/RTPS/RTPSDiscoveryPolicy.cpp \
+	../components/RaftROS/RTPS/RTPSParticipantLeasePolicy.cpp \
+	../components/RaftROS/RTPS/RTPSParticipantSetPolicy.cpp \
+	../components/RaftROS/RTPS/RTPSInitialAnnouncePlan.cpp \
+	../components/RaftROS/RTPS/RTPSInitialAnnounceRunner.cpp \
+	../components/RaftROS/RTPS/RTPSWriterHeartbeatRunner.cpp \
+	../components/RaftROS/RTPS/RTPSRxSubmessageRunner.cpp \
+	../components/RaftROS/RTPS/RTPSRunnerAdapterHelpers.cpp \
 	../components/RaftROS/RTPS/SEDPHandler.cpp
 PROTO_OBJECTS = $(PROTO_SOURCES:.cpp=.o)
 
