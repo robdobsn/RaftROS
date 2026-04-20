@@ -1,5 +1,7 @@
 FROM ros:humble
 
+ARG DEBIAN_FRONTEND=noninteractive
+
 # Install both RMW implementations + diagnostics
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ros-humble-rmw-fastrtps-cpp \
