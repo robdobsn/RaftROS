@@ -14,6 +14,7 @@ SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/RTPS/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/SPDPHandler.cpp \
+	../components/RaftROS/RTPS/RTPSAckNack.cpp \
 	../components/RaftROS/RTPS/SEDPHandler.cpp
 
 # Object files
@@ -34,6 +35,7 @@ PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/RTPS/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/SPDPHandler.cpp \
+	../components/RaftROS/RTPS/RTPSAckNack.cpp \
 	../components/RaftROS/RTPS/SEDPHandler.cpp
 PROTO_OBJECTS = $(PROTO_SOURCES:.cpp=.o)
 
