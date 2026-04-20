@@ -28,6 +28,7 @@
 
 #include "RTPSTypes.h"
 #include "RTPSMessage.h"
+#include "RTPSAckNack.h"
 #include "RTPSParticipant.h"
 #include "SPDPHandler.h"
 #include "SEDPHandler.h"
@@ -408,16 +409,20 @@ static void recvSPDP()
 static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
                           const struct sockaddr_in& fromAddr)
 {
-    if (contentLen < 24) return;
+    RTPSAckNackFields ackFields;
+    if (!RTPSAckNack_parse(pContent, contentLen, ackFields))
+        return;
 
-    const uint8_t* readerEID = pContent;
-    const uint8_t* writerEID = pContent + 4;
-    uint32_t bitmapBaseLow = RTPSMessage::readLE32(pContent + 12);
-    uint32_t numBits = RTPSMessage::readLE32(pContent + 16);
+    const uint8_t* readerEID = ackFields.readerEID;
+    const uint8_t* writerEID = ackFields.writerEID;
+    uint32_t bitmapBaseLow = ackFields.bitmapBaseLow;
+    uint32_t numBits = ackFields.numBits;
+    RTPSAckNackWriterKind writerKind = RTPSAckNack_classifyWriter(writerEID);
 
-    LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X base=%u numBits=%u",
+    LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
           readerEID[0], readerEID[1], readerEID[2], readerEID[3],
           writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+          RTPSAckNack_writerKindToStr(writerKind),
           bitmapBaseLow, numBits);
 
     const DiscoveredParticipant* remote = nullptr;
@@ -431,7 +436,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
     }
     if (!remote) return;
 
-    if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 && bitmapBaseLow <= 2)
+    if (writerKind == RTPSAckNackWriterKind::SedpPublications && bitmapBaseLow <= 2)
     {
         LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP publications (base=%u)", bitmapBaseLow);
         // Retransmit SN=1 (ros_discovery_info) if needed
@@ -474,7 +479,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             }
         }
     }
-    else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0 && bitmapBaseLow <= 1)
+    else if (writerKind == RTPSAckNackWriterKind::SedpSubscriptions && bitmapBaseLow <= 1)
     {
         LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit SEDP subscription");
         heartbeatCount++;
@@ -494,7 +499,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             LOG_I(MODULE_PREFIX, "  SEDP sub retransmit %d/%d bytes", sent, (int)sedpSubLen);
         }
     }
-    else if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0 && bitmapBaseLow <= 1)
+    else if (writerKind == RTPSAckNackWriterKind::RosDiscoveryInfo && bitmapBaseLow <= 1)
     {
         LOG_I(MODULE_PREFIX, "  ACKNACK -> retransmit ros_discovery_info");
         uint8_t rosDiscPayload[256];
@@ -521,7 +526,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             }
         }
     }
-    else if (memcmp(writerEID, ENTITYID_CHATTER_WRITER, 4) == 0)
+    else if (writerKind == RTPSAckNackWriterKind::Chatter)
     {
         if (chatterSeqNum > 0 && bitmapBaseLow <= chatterSeqNum)
         {

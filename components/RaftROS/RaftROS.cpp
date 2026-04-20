@@ -10,6 +10,7 @@
 #include "RestAPIEndpointManager.h"
 #include "RTPSTypes.h"
 #include "RTPSMessage.h"
+#include "RTPSAckNack.h"
 
 // Socket / network headers (ESP-IDF / lwIP)
 #include <sys/socket.h>
@@ -584,19 +585,20 @@ void RaftROS::recvUserData()
 void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
                             const struct sockaddr_in& fromAddr)
 {
-    if (contentLen < 24)
+    RTPSAckNackFields ackFields;
+    if (!RTPSAckNack_parse(pContent, contentLen, ackFields))
         return;
 
-    // ACKNACK layout: readerEID(4) + writerEID(4) + bitmapBase(8) + numBits(4) + [bitmap] + count(4)
-    const uint8_t* readerEID = pContent;
-    const uint8_t* writerEID = pContent + 4;
-    uint32_t bitmapBaseLow = RTPSMessage::readLE32(pContent + 12);
-    // uint32_t bitmapBaseHigh = RTPSMessage::readLE32(pContent + 8); // unused for now
-    uint32_t numBits = RTPSMessage::readLE32(pContent + 16);
+    const uint8_t* readerEID = ackFields.readerEID;
+    const uint8_t* writerEID = ackFields.writerEID;
+    uint32_t bitmapBaseLow = ackFields.bitmapBaseLow;
+    uint32_t numBits = ackFields.numBits;
+    RTPSAckNackWriterKind writerKind = RTPSAckNack_classifyWriter(writerEID);
 
-    LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X base=%u numBits=%u",
+    LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
           readerEID[0], readerEID[1], readerEID[2], readerEID[3],
           writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+          RTPSAckNack_writerKindToStr(writerKind),
           bitmapBaseLow, numBits);
 
     // Find the remote participant
@@ -616,7 +618,7 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
     }
 
     // Check which writer they're requesting data from
-    if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0)
+    if (writerKind == RTPSAckNackWriterKind::SedpPublications)
     {
         // They want our SEDP publication data (SN=1)
         // bitmapBase=1 means they haven't received SN=1 yet; retransmit
@@ -645,7 +647,7 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
             }
         }
     }
-    else if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
+    else if (writerKind == RTPSAckNackWriterKind::RosDiscoveryInfo)
     {
         // They want our ros_discovery_info data (SN=1)
         if (bitmapBaseLow <= 1)
@@ -678,7 +680,7 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
             }
         }
     }
-    else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
+    else if (writerKind == RTPSAckNackWriterKind::SedpSubscriptions)
     {
         // They want our SEDP subscription data (SN=1)
         if (bitmapBaseLow <= 1)
@@ -706,7 +708,7 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
             }
         }
     }
-    else if (memcmp(writerEID, ENTITYID_CHATTER_WRITER, 4) == 0)
+    else if (writerKind == RTPSAckNackWriterKind::Chatter)
     {
         // They want our chatter data - retransmit latest sample
         if (_chatterSeqNum > 0 && bitmapBaseLow <= _chatterSeqNum)

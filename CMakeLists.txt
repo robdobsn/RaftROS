@@ -7,6 +7,7 @@ idf_component_register(
       "components/RaftROS/RTPS/RTPSParticipant.cpp"
       "components/RaftROS/RTPS/SPDPHandler.cpp"
       "components/RaftROS/RTPS/SEDPHandler.cpp"
+      "components/RaftROS/RTPS/RTPSAckNack.cpp"
       "components/RaftROS/RTPS/RTPSMessage.cpp"
       "components/RaftROS/CDR/CDREncoder.cpp"
       "components/RaftROS/CDR/CDRDecoder.cpp"

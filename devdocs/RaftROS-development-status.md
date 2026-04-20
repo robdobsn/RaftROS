@@ -84,6 +84,8 @@ Clean-room RTPS 2.2 implementation. No third-party DDS libraries.
 - Docker build is now non-interactive and reproducible (no wireshark debconf prompt blocking builds).
 - ACKNACK handling in `linux_unit_tests/raftros_standalone.cpp` now includes SEDP subscription retransmit handling for `ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER`.
 - Linux unit tests remain green after the ACKNACK patch: **85 passed, 0 failed**.
+- Initial shared-runtime extraction started: ACKNACK parsing/writer classification moved into shared RTPS utility (`RTPSAckNack`) and consumed by both ESP32 (`RaftROS.cpp`) and Linux standalone (`raftros_standalone.cpp`) handlers.
+- Post-refactor validation remains green: linux unit tests **85 passed, 0 failed** and `raftros_linux` builds successfully.
 
 ### Root Cause Found for Previous "Not Publishing" Symptom
 
@@ -121,6 +123,11 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 - Keep only socket/timer/platform glue in:
 	- ESP32 SysMod wrapper (`RaftROS.cpp`)
 	- Linux standalone wrapper (`raftros_standalone.cpp`)
+
+### Progress Against This Direction
+
+- Completed: shared ACKNACK parser/classifier in `components/RaftROS/RTPS/RTPSAckNack.*`.
+- Next: move heartbeat scheduling/retransmit policy decisions into shared runtime APIs while keeping send/recv adapters platform-specific.
 
 ### Practical Rule
 
