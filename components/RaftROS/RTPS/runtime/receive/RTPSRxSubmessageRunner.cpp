@@ -44,7 +44,7 @@ bool RTPSRxSubmessageRunner_run(
 
             bool responded = false;
             int sent = -1;
-            if (RaftROS::RTPS::Runtime::ReliabilityAndWriterState::shouldRespondToHeartbeat(flags) &&
+            if (RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::shouldRespondToHeartbeat(flags) &&
                 callbacks.getLocalGuidPrefix && callbacks.resolveReaderEID &&
                 callbacks.resolveAckDest && callbacks.sendAck)
             {

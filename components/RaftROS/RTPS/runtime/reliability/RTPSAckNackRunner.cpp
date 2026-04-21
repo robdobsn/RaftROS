@@ -13,7 +13,7 @@ struct RTPSAckNackRunnerEmitCtx
 
 void RTPSAckNackRunner_emitAction(
     void* emitCtx,
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction runtimeAction)
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction runtimeAction)
 {
     auto* ctx = static_cast<RTPSAckNackRunnerEmitCtx*>(emitCtx);
     if (!ctx || !ctx->callbacks || !ctx->callbacks->executeAction || !ctx->fields)
@@ -28,19 +28,19 @@ void RTPSAckNackRunner_run(
     const uint8_t* srcGuidPrefix,
     const uint8_t* pContent,
     uint32_t contentLen,
-    const RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions& options,
+    const RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions& options,
     const RTPSAckNackRunnerCallbacks& callbacks,
     void* userCtx)
 {
     RTPSAckNackFields fields;
-    if (!RaftROS::RTPS::Runtime::ReliabilityAndWriterState::parseAckNack(
+    if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::parseAckNack(
             pContent,
             contentLen,
             fields))
         return;
 
     const RTPSAckNackWriterKind writerKind =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::classifyWriter(fields.writerEID);
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::classifyWriter(fields.writerEID);
     if (callbacks.logParsed)
         callbacks.logParsed(userCtx, fields, writerKind);
 
@@ -61,7 +61,7 @@ void RTPSAckNackRunner_run(
     emitCtx.writerKind = writerKind;
 
     const uint64_t chatterSeq = callbacks.getChatterSeq ? callbacks.getChatterSeq(userCtx) : 0;
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::evaluateAckNackActions(
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::evaluateAckNackActions(
         fields,
         writerKind,
         options,

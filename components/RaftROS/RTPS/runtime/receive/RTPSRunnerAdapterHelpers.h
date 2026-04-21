@@ -69,7 +69,7 @@ struct RTPSAckNackRunnerExecAdapterCtx
     int userDataSock = -1;
     const uint8_t* sendBuf = nullptr;
     uint32_t* heartbeatCount = nullptr;
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackMutationPolicy mutationPolicy;
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackMutationPolicy mutationPolicy;
     struct
     {
         bool dumpRosDiscoveryPayloadHex = false;
@@ -83,7 +83,7 @@ struct RTPSAckNackRunnerExecInitConfig
     int userDataSock = -1;
     const uint8_t* sendBuf = nullptr;
     uint32_t* heartbeatCount = nullptr;
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackMutationPolicy mutationPolicy;
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackMutationPolicy mutationPolicy;
     bool dumpRosDiscoveryPayloadHex = false;
 };
 

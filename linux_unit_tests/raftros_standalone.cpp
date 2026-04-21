@@ -260,10 +260,10 @@ static void processDiscoveredParticipant(DiscoveredParticipant& remote, const st
           srcIpStr, (int)ntohs(fromAddr.sin_port), locIpStr,
           (int)remote.metatrafficPort, (int)remote.userDataPort, (int)remote.leaseDurationSec);
 
-    RaftROS::RTPS::Runtime::DiscoveryRuntime::MergeResult mergeResult =
-        RaftROS::RTPS::Runtime::DiscoveryRuntime::mergeParticipant(
+    RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult mergeResult =
+        RaftRuntime::RTPS::Runtime::DiscoveryRuntime::mergeParticipant(
             discovered, remote, nowMs, MAX_DISCOVERED);
-    if (mergeResult == RaftROS::RTPS::Runtime::DiscoveryRuntime::MergeResult::AddedNew)
+    if (mergeResult == RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult::AddedNew)
     {
         handleNewParticipant(remote, fromAddr);
     }
@@ -319,7 +319,7 @@ static uint32_t buildChatterPayload(uint8_t* pBuf, uint32_t bufLen, const char* 
 static void publishChatter()
 {
     char msgStr[64];
-    snprintf(msgStr, sizeof(msgStr), "Hello from %s [%u]", NODE_NAME, chatterMsgIndex++);
+    snprintf(msgStr, sizeof(msgStr), "Hello from %s [%lu]", NODE_NAME, (unsigned long)chatterMsgIndex++);
 
     uint8_t chatterPayload[256];
     uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
@@ -415,9 +415,9 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
     struct AckExecCtx
     {
         RTPSAckNackRunnerExecAdapterCtx exec;
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpSequenceContext
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpSequenceContext
             sedpSequenceContext;
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataSequenceContext
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataSequenceContext
             userDataSequenceContext;
         RTPSAckNackRunnerActionExecSpec sedpRosDiscoveryPublicationSpec;
         RTPSAckNackRunnerActionExecSpec sedpChatterPublicationSpec;
@@ -436,20 +436,20 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
     execInit.sendBuf = sendBuf;
     execInit.heartbeatCount = &heartbeatCount;
     execInit.mutationPolicy =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackMutationPolicyForFlavor(
-            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackMutationPolicyForFlavor(
+            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
     execInit.dumpRosDiscoveryPayloadHex = true;
     RTPSRunnerAdapter_initAckExecContext(ctx.exec, execInit);
 
     ctx.sedpSequenceContext =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckSedpSequenceContextForFlavor(
-            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckSedpSequenceContextForFlavor(
+            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
             sedpSeqNum,
             sedpSubSeqNum,
             0);
     ctx.userDataSequenceContext =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckUserDataSequenceContextForFlavor(
-            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckUserDataSequenceContextForFlavor(
+            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
             rosDiscSeqNum,
             chatterSeqNum);
 
@@ -459,7 +459,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
         LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
               fields.readerEID[0], fields.readerEID[1], fields.readerEID[2], fields.readerEID[3],
               fields.writerEID[0], fields.writerEID[1], fields.writerEID[2], fields.writerEID[3],
-              RaftROS::RTPS::Runtime::ReliabilityAndWriterState::writerKindToStr(writerKind),
+              RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::writerKindToStr(writerKind),
               fields.bitmapBaseLow, fields.numBits);
     };
     callbackInit.unknownRemote = nullptr;
@@ -474,9 +474,9 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                                                           uint64_t) -> uint32_t
     {
         AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
-        if (!RaftROS::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
-                RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpRosDiscoveryPublication,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
+        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
+                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpRosDiscoveryPublication,
                 p->sedpSequenceContext,
                 plan))
             return 0;
@@ -497,9 +497,9 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                                                      uint64_t) -> uint32_t
     {
         AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
-        if (!RaftROS::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
-                RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpChatterPublication,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
+        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
+                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpChatterPublication,
                 p->sedpSequenceContext,
                 plan))
             return 0;
@@ -520,9 +520,9 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
                                                            uint64_t) -> uint32_t
     {
         AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
-        if (!RaftROS::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
-                RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpRosDiscoverySubscription,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
+        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
+                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpRosDiscoverySubscription,
                 p->sedpSequenceContext,
                 plan))
             return 0;
@@ -547,9 +547,9 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
         uint32_t rosDiscLen = buildRosDiscInfoWithGids(rosDiscPayload, sizeof(rosDiscPayload));
         if (rosDiscLen == 0)
             return 0;
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataPlan plan;
-        if (!RaftROS::RTPS::Runtime::ReliabilityAndWriterState::getAckActionUserDataPlan(
-                RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitRosDiscoveryInfo,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataPlan plan;
+        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionUserDataPlan(
+                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitRosDiscoveryInfo,
                 p->userDataSequenceContext,
                 plan))
             return 0;
@@ -582,15 +582,15 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
         AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
         p->userDataSequenceContext.chatterDataSeqNum = chatterSeq;
         char msgStr[64];
-        snprintf(msgStr, sizeof(msgStr), "Hello from %s [%u]",
-                 NODE_NAME, chatterMsgIndex > 0 ? chatterMsgIndex - 1 : 0);
+        snprintf(msgStr, sizeof(msgStr), "Hello from %s [%lu]",
+             NODE_NAME, (unsigned long)(chatterMsgIndex > 0 ? chatterMsgIndex - 1 : 0));
         uint8_t chatterPayload[256];
         uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
         if (payloadLen == 0)
             return 0;
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataPlan plan;
-        if (!RaftROS::RTPS::Runtime::ReliabilityAndWriterState::getAckActionUserDataPlan(
-                RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitChatterData,
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataPlan plan;
+        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionUserDataPlan(
+                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitChatterData,
                 p->userDataSequenceContext,
                 plan))
             return 0;
@@ -648,8 +648,8 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             RTPSRunnerAdapter_initAckCallbacks(callbacks, callbackInit);
 
     const auto decisionOptions =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackDecisionOptionsForFlavor(
-            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackDecisionOptionsForFlavor(
+            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
     RTPSAckNackRunner_run(srcGuidPrefix, pContent, contentLen, decisionOptions, callbacks, &ctx);
 }
 
@@ -843,7 +843,7 @@ static void purgeStaleParticipants()
     uint32_t now = millis();
     for (auto it = discovered.begin(); it != discovered.end(); )
     {
-        if (RaftROS::RTPS::Runtime::DiscoveryRuntime::isLeaseExpired(
+        if (RaftRuntime::RTPS::Runtime::DiscoveryRuntime::isLeaseExpired(
             now, it->discoveredTimeMs, it->leaseDurationSec))
         {
             LOG_I(MODULE_PREFIX, "purge stale participant (expired %d sec ago)",
@@ -1286,14 +1286,14 @@ int main(int argc, char* argv[])
 
         // Transition to active on first discovery
         RTPSParticipantSetPolicyResult setPolicy =
-            RaftROS::RTPS::Runtime::DiscoveryRuntime::applyParticipantSetPolicy(
+            RaftRuntime::RTPS::Runtime::DiscoveryRuntime::applyParticipantSetPolicy(
                 active,
                 (uint32_t)discovered.size(),
                 false,
                 false);
         active = setPolicy.shouldBeActive;
         if (setPolicy.triggerImmediateWriterHeartbeat)
-            RaftROS::RTPS::Runtime::DiscoveryRuntime::onActivated(lastHbMs);
+            RaftRuntime::RTPS::Runtime::DiscoveryRuntime::onActivated(lastHbMs);
     }
 
     printf("\nShutting down...\n");

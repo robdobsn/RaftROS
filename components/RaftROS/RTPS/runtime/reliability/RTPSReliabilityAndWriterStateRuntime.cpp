@@ -5,7 +5,7 @@
 #include "RTPSTypes.h"
 #include "runtime/wire/RTPSMessage.h"
 
-namespace RaftROS::RTPS::Runtime::ReliabilityAndWriterState
+namespace RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState
 {
 
 RTPSAckActionSedpSequenceContext makeAckSedpSequenceContext(

@@ -33,7 +33,7 @@ void RTPSRunnerAdapter_applyRxBaseCallbacks(RTPSRxSubmessageRunnerCallbacks& cal
             return fallbackReaderEID;
         if (ctx->readerPolicy == RTPSRxAdapterReaderPolicy::UseHeartbeatReader)
             return fallbackReaderEID;
-        return RaftROS::RTPS::Runtime::ReliabilityAndWriterState::localReaderForRemoteWriter(
+        return RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::localReaderForRemoteWriter(
             writerEID,
             fallbackReaderEID);
     };
@@ -55,7 +55,7 @@ void RTPSRunnerAdapter_applyRxBaseCallbacks(RTPSRxSubmessageRunnerCallbacks& cal
         {
             if (ctx->discovered)
             {
-                return RaftROS::RTPS::Runtime::DiscoveryRuntime::assignMetatrafficDestByIp(
+                return RaftRuntime::RTPS::Runtime::DiscoveryRuntime::assignMetatrafficDestByIp(
                     *ctx->discovered, from, outDest);
             }
             outDest = from;
@@ -87,7 +87,7 @@ bool RTPSRunnerAdapter_ackResolveRemote(void* userCtx, const uint8_t* srcGuidPre
     if (!ctx || !ctx->discovered)
         return false;
 
-    ctx->remote = RaftROS::RTPS::Runtime::DiscoveryRuntime::findByGuidPrefix(
+    ctx->remote = RaftRuntime::RTPS::Runtime::DiscoveryRuntime::findByGuidPrefix(
         *ctx->discovered, srcGuidPrefix);
     return ctx->remote != nullptr;
 }
@@ -160,7 +160,7 @@ void RTPSRunnerAdapter_executeAckAction(
 
     if (adapterCtx.heartbeatCount)
     {
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::applyAckActionHeartbeatMutation(
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::applyAckActionHeartbeatMutation(
             action,
             adapterCtx.mutationPolicy,
             *adapterCtx.heartbeatCount);

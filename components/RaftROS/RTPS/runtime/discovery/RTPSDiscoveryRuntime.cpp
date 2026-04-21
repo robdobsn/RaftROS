@@ -3,7 +3,7 @@
 #include <arpa/inet.h>
 #include <cstring>
 
-namespace RaftROS::RTPS::Runtime::DiscoveryRuntime
+namespace RaftRuntime::RTPS::Runtime::DiscoveryRuntime
 {
 
 static constexpr uint32_t DEFAULT_LEASE_TIMEOUT_MS = 240000;

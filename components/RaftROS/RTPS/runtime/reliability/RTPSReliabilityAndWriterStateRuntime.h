@@ -2,7 +2,7 @@
 
 #include <cstdint>
 
-namespace RaftROS::RTPS::Runtime::ReliabilityAndWriterState
+namespace RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState
 {
 
 enum class RTPSAckNackWriterKind
