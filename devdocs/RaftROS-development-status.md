@@ -1,6 +1,6 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-20
+**Last Updated:** 2026-04-21
 
 ## Goal
 
@@ -20,10 +20,10 @@ Clean-room RTPS 2.2 implementation. No third-party DDS libraries.
 | `components/RaftROS/CDR/CDREncoder.cpp/.h` | CDR (Common Data Representation) serializer |
 | `components/RaftROS/CDR/CDRDecoder.cpp/.h` | CDR deserializer |
 | `components/RaftROS/RTPS/RTPSTypes.h` | Constants: entity IDs, PID codes, port formulas, QoS values |
-| `components/RaftROS/RTPS/RTPSMessage.cpp/.h` | RTPS header/submessage read/write (DATA, HEARTBEAT, ACKNACK, INFO_DST, INFO_TS) |
-| `components/RaftROS/RTPS/RTPSParticipant.cpp/.h` | GUID management, port calculation, locator building |
-| `components/RaftROS/RTPS/SPDPHandler.cpp/.h` | SPDP announcement build/parse, ros_discovery_info CDR payload |
-| `components/RaftROS/RTPS/SEDPHandler.cpp/.h` | SEDP publication/subscription/liveliness message build, user data message build |
+| `components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp/.h` | RTPS header/submessage read/write (DATA, HEARTBEAT, ACKNACK, INFO_DST, INFO_TS) |
+| `components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp/.h` | GUID management, port calculation, locator building |
+| `components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp/.h` | SPDP announcement build/parse, ros_discovery_info CDR payload |
+| `components/RaftROS/RTPS/runtime/announce/SEDPHandler.cpp/.h` | SEDP publication/subscription/liveliness message build, user data message build |
 | `linux_unit_tests/` | Linux-hosted unit tests + standalone linux RTPS node (`raftros_standalone.cpp`) |
 | `unit_tests/` | ESP-IDF Unity tests |
 | `examples/ExampleDiscoverable/` | ESP32 app that runs RaftROS as a SysMod |
@@ -214,6 +214,62 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 - Continued: ACKNACK callback-bundle wiring is now centralized via `RTPSRunnerAdapter_initAckCallbacks(...)`, so wrappers provide a compact function-pointer callback init config while shared code applies common remote-resolution wiring. This keeps the implementation ESP32-friendly (no dynamic allocation, stack-only context, static callback wiring).
 - Continued: ACKNACK hex-dump debug instrumentation is now compile-time gated in shared adapter helpers via `RAFTROS_ACK_HEX_DUMP_ENABLE` (default OFF for embedded builds). Linux unit-test build explicitly enables this flag in `linux_unit_tests/Makefile` to preserve developer diagnostics while keeping ESP32 release builds lean.
 - Continued: ACKNACK verbose action/result log labels are now compile-time gated via `RAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE` (default OFF for embedded builds). Linux unit-test build explicitly enables this flag so local diagnostics remain detailed without forcing verbose strings into embedded firmware builds.
+- Continued: ACKNACK runtime flavor policy presets are now centralized in reliability runtime (`makeAckNackDecisionOptionsForFlavor(...)`, `makeAckNackMutationPolicyForFlavor(...)`, `makeAckSedpSequenceContextForFlavor(...)`, `makeAckUserDataSequenceContextForFlavor(...)`). ESP and Linux wrappers now consume these shared flavor helpers instead of hardcoding inline policy booleans.
+- Continued: ACK runner option wiring is now centralized via `RTPSRunnerAdapter_initAckRunnerOptions(...)`, reducing wrapper-level field-by-field option mapping and keeping runner-vs-runtime option translation in shared adapter code.
+- Continued: ACKNACK runner API now consumes shared runtime decision options directly (`RTPSAckNackDecisionOptions`) instead of a duplicate runner-local options struct. Wrappers now pass flavor-derived decision options straight into `RTPSAckNackRunner_run(...)`, and the temporary adapter mapping helper was removed.
+- Continued: ACKNACK runner action type is now unified with shared runtime action type (`RTPSAckNackDecisionAction`) via aliasing in `RTPSAckNackRunner.h`; duplicate runner-action enum and runtime<->runner action mapping glue were removed from runner/adapter helper code paths.
+- Continued: ACK runner/adapter internals now call reliability runtime source-of-truth APIs directly for ACKNACK parse/classify and builtin reader mapping (`parseAckNack`, `classifyWriter`, `localReaderForRemoteWriter`) instead of going through legacy compatibility-wrapper entry points.
+- Continued: first discovery-wrapper removal pass completed. Removed legacy compatibility wrapper files from `components/RaftROS/RTPS/`:
+	- `RTPSParticipantLifecycle.*`
+	- `RTPSDiscoveryPolicy.*`
+	- `RTPSParticipantLeasePolicy.*`
+	- `RTPSParticipantSetPolicy.*`
+	- `RTPSDiscoveredParticipantLookup.*`
+	Build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now link only runtime source-of-truth modules for those concerns.
+- Continued: `RTPSDiscoveryRuntime.h` is now self-contained for participant-set policy result typing (no dependency on removed legacy participant-set header).
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **19 -> 14** in this pass.
+- Continued: reliability-wrapper removal pass completed. Removed legacy compatibility wrapper files from `components/RaftROS/RTPS/`:
+	- `RTPSAckNack.cpp` (function-wrapper shim removed; shared ACKNACK types remain in `RTPSAckNack.h`)
+	- `RTPSReliabilityPolicy.*`
+	- `RTPSBuiltinEndpointMap.*`
+	Build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now link direct runtime reliability source-of-truth only.
+- Continued: wrapper and runner call sites now use reliability runtime APIs directly for writer-kind log labels and heartbeat-response policy checks.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **14 -> 11** in this pass (**19 -> 11** cumulative across simplification passes).
+- Continued: removed final ACKNACK shim header (`RTPSAckNack.h`) by making reliability runtime header self-contained for ACKNACK shared types (`RTPSAckNackFields`, `RTPSAckNackWriterKind`). `RTPSAckNackRunner.h` now aliases those types from runtime namespace directly.
+- Continued: receive-path orchestration was relocated from top-level RTPS folder into `runtime/receive/`:
+	- `RTPSRxSubmessageRunner.*` -> `runtime/receive/RTPSRxSubmessageRunner.*`
+	- `RTPSRunnerAdapterHelpers.*` -> `runtime/receive/RTPSRunnerAdapterHelpers.*`
+	Wrapper include sites (`RaftROS.cpp`, `raftros_standalone.cpp`) and build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now reference the runtime path directly.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **11 -> 9** in this pass (**19 -> 9** cumulative across simplification passes).
+- Continued: announce/heartbeat orchestration was relocated from top-level RTPS folder into `runtime/announce/`:
+	- `RTPSInitialAnnouncePlan.*` -> `runtime/announce/RTPSInitialAnnouncePlan.*`
+	- `RTPSInitialAnnounceRunner.*` -> `runtime/announce/RTPSInitialAnnounceRunner.*`
+	- `RTPSWriterHeartbeatRunner.*` -> `runtime/announce/RTPSWriterHeartbeatRunner.*`
+	Wrapper include sites (`RaftROS.cpp`, `raftros_standalone.cpp`) and build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now reference the runtime path directly.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **9 -> 6** in this pass (**19 -> 6** cumulative across simplification passes).
+- Continued: ACKNACK orchestration runner was relocated from top-level RTPS folder into `runtime/reliability/`:
+	- `RTPSAckNackRunner.*` -> `runtime/reliability/RTPSAckNackRunner.*`
+	Wrapper include sites (`RaftROS.cpp`, `raftros_standalone.cpp`) and receive-adapter include wiring (`runtime/receive/RTPSRunnerAdapterHelpers.h`) now reference the runtime path directly.
+	Build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now compile the runtime path directly.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **6 -> 5** in this pass (**19 -> 5** cumulative across simplification passes).
+- Continued: shared schedule policy helper was relocated from top-level RTPS folder into `runtime/schedule/`:
+	- `RTPSRuntimeSchedule.*` -> `runtime/schedule/RTPSRuntimeSchedule.*`
+	Wrapper include sites (`RaftROS.cpp`, `raftros_standalone.cpp`) and build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now reference the runtime path directly.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **5 -> 4** in this pass (**19 -> 4** cumulative across simplification passes).
+- Continued: SPDP/SEDP protocol handlers were relocated into runtime ownership boundaries:
+	- `SPDPHandler.*` -> `runtime/discovery/SPDPHandler.*`
+	- `SEDPHandler.*` -> `runtime/announce/SEDPHandler.*`
+	Wrapper include sites (`RaftROS.h`, `raftros_standalone.cpp`, `linux_unit_tests/main.cpp`) and runtime helper includes now reference runtime paths directly.
+	Build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now compile runtime paths directly.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **4 -> 2** in this pass (**19 -> 2** cumulative across simplification passes).
+- Continued: wire/core protocol foundations were relocated into runtime ownership boundaries:
+	- `RTPSMessage.*` -> `runtime/wire/RTPSMessage.*`
+	- `RTPSParticipant.*` -> `runtime/core/RTPSParticipant.*`
+	Wrapper and runtime module include sites (`RaftROS.cpp/.h`, `raftros_standalone.cpp`, `linux_unit_tests/main.cpp`, reliability/receive/discovery/announce runtime modules) now reference runtime paths directly.
+	Build lists (`linux_unit_tests/Makefile`, `CMakeLists.txt`) now compile runtime paths directly.
+- Simplification milestone: RTPS top-level `.cpp` count reduced from **2 -> 0** in this pass (**19 -> 0** cumulative across simplification passes).
+- Stabilization pass: stale include/source reference scan confirmed no remaining references to removed top-level runtime-orchestration files.
+- Stabilization pass: include/structure hygiene cleanup applied in runtime modules (`runtime/reliability/RTPSAckNackRunner.cpp` redundant include removed, `runtime/receive/RTPSRunnerAdapterHelpers.cpp` empty anonymous namespace removed).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after receive-runner extraction (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after lookup-helper extraction (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after runner-adapter scaffolding extraction (**85 passed, 0 failed**).
@@ -231,7 +287,21 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK context-init helper extraction (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK callback-bundle init extraction (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after compile-time ACK hex-dump gating (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after announce-runtime relocation (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK runner relocation to `runtime/reliability` (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after schedule-helper relocation to `runtime/schedule` (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after stabilization-pass hygiene cleanup (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after SPDP/SEDP runtime-boundary relocation (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after RTPSMessage/RTPSParticipant runtime-boundary relocation (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after compile-time ACK verbose label gating (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK runtime flavor-policy helper extraction and shared runner-option init wiring (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK runner-options API unification to shared runtime decision options (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK action-type unification and mapping-removal cleanup (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after direct reliability-runtime call migration in ACK runner/adapter internals (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after discovery-wrapper file removal and build-list pruning (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after reliability-wrapper file removal and build-list pruning (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK shim-header removal and runtime-type ownership consolidation (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after receive-runtime file relocation and top-level source pruning (**85 passed, 0 failed**).
 - Next: continue Phase 2 by moving remaining writer-state/reliability action-execution policy behind `RTPSReliabilityAndWriterStateRuntime` while preserving wrapper callback APIs.
 
 ### Practical Rule

@@ -1,6 +1,6 @@
-#include "RTPSRxSubmessageRunner.h"
+#include "runtime/receive/RTPSRxSubmessageRunner.h"
 
-#include "RTPSReliabilityPolicy.h"
+#include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
 
 bool RTPSRxSubmessageRunner_run(
     const uint8_t* packet,
@@ -44,7 +44,7 @@ bool RTPSRxSubmessageRunner_run(
 
             bool responded = false;
             int sent = -1;
-            if (RTPSReliability_shouldRespondToHeartbeat(flags) &&
+            if (RaftROS::RTPS::Runtime::ReliabilityAndWriterState::shouldRespondToHeartbeat(flags) &&
                 callbacks.getLocalGuidPrefix && callbacks.resolveReaderEID &&
                 callbacks.resolveAckDest && callbacks.sendAck)
             {

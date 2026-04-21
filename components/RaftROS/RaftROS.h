@@ -9,9 +9,9 @@
 #pragma once
 
 #include "RaftSysMod.h"
-#include "RTPSParticipant.h"
-#include "SPDPHandler.h"
-#include "SEDPHandler.h"
+#include "runtime/core/RTPSParticipant.h"
+#include "runtime/discovery/SPDPHandler.h"
+#include "runtime/announce/SEDPHandler.h"
 #include <vector>
 
 class APISourceInfo;

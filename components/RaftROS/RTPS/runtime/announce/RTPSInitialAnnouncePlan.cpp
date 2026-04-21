@@ -1,4 +1,4 @@
-#include "RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSInitialAnnouncePlan.h"
 #include "RTPSTypes.h"
 
 static void appendStep(RTPSInitialAnnounceSequence& seq,
@@ -17,9 +17,6 @@ static void appendStep(RTPSInitialAnnounceSequence& seq,
 RTPSInitialAnnouncePlan RTPSInitialAnnouncePlan_default()
 {
     RTPSInitialAnnouncePlan plan;
-    // Keep current behavior:
-    // - send SPDP replies and SEDP/participant message bundle immediately
-    // - defer initial ros_discovery_info user data burst
     plan.sendInitialRosDiscoveryUserData = false;
     return plan;
 }
@@ -197,7 +194,6 @@ uint64_t RTPSInitialAnnouncePlan_applySequencePolicy(
     switch (step.seqCounterHint)
     {
         case RTPSSeqCounterHint::Spdp:
-            // Keep existing behavior: SPDP sequence increments before build.
             counters.spdpSeqNum++;
             return counters.spdpSeqNum;
         case RTPSSeqCounterHint::SedpRosWriter:
@@ -205,7 +201,6 @@ uint64_t RTPSInitialAnnouncePlan_applySequencePolicy(
         case RTPSSeqCounterHint::SedpRosReader:
             return counters.sedpRosReaderSeqNum;
         case RTPSSeqCounterHint::SedpChatterWriter:
-            // Preserve linux standalone current behavior (shares SEDP stream +1).
             if (runtimeFlavor == RTPSInitialAnnounceRuntimeFlavor::LinuxStyle)
                 return counters.sedpRosWriterSeqNum + 1;
             return counters.sedpChatterWriterSeqNum;

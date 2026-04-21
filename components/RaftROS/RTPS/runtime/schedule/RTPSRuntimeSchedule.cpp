@@ -1,4 +1,4 @@
-#include "RTPSRuntimeSchedule.h"
+#include "runtime/schedule/RTPSRuntimeSchedule.h"
 
 bool RTPSRuntimeSchedule_isPeriodicDue(uint32_t nowMs,
                                        uint32_t lastRunMs,

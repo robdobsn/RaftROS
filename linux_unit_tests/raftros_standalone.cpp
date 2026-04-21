@@ -27,21 +27,19 @@
 #include <poll.h>
 
 #include "RTPSTypes.h"
-#include "RTPSMessage.h"
-#include "RTPSAckNack.h"
-#include "RTPSAckNackRunner.h"
-#include "RTPSReliabilityPolicy.h"
-#include "RTPSRuntimeSchedule.h"
-#include "RTPSBuiltinEndpointMap.h"
-#include "RTPSInitialAnnouncePlan.h"
-#include "RTPSInitialAnnounceRunner.h"
-#include "RTPSWriterHeartbeatRunner.h"
-#include "RTPSRxSubmessageRunner.h"
-#include "RTPSRunnerAdapterHelpers.h"
+#include "runtime/wire/RTPSMessage.h"
+#include "runtime/reliability/RTPSAckNackRunner.h"
+#include "runtime/schedule/RTPSRuntimeSchedule.h"
+#include "runtime/announce/RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSInitialAnnounceRunner.h"
+#include "runtime/announce/RTPSWriterHeartbeatRunner.h"
+#include "runtime/receive/RTPSRxSubmessageRunner.h"
+#include "runtime/receive/RTPSRunnerAdapterHelpers.h"
 #include "runtime/discovery/RTPSDiscoveryRuntime.h"
-#include "RTPSParticipant.h"
-#include "SPDPHandler.h"
-#include "SEDPHandler.h"
+#include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
+#include "runtime/core/RTPSParticipant.h"
+#include "runtime/discovery/SPDPHandler.h"
+#include "runtime/announce/SEDPHandler.h"
 #include "Logger.h"
 
 static const char* MODULE_PREFIX = "RaftROS";
@@ -437,22 +435,23 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
     execInit.userDataSock = userDataSock;
     execInit.sendBuf = sendBuf;
     execInit.heartbeatCount = &heartbeatCount;
-    execInit.mutationPolicy.incrementHeartbeatOnSedpRetransmit = true;
-    execInit.mutationPolicy.incrementHeartbeatOnUserDataRetransmit = true;
+    execInit.mutationPolicy =
+        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackMutationPolicyForFlavor(
+            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
     execInit.dumpRosDiscoveryPayloadHex = true;
     RTPSRunnerAdapter_initAckExecContext(ctx.exec, execInit);
 
     ctx.sedpSequenceContext =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckSedpSequenceContext(
+        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckSedpSequenceContextForFlavor(
+            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
             sedpSeqNum,
             sedpSubSeqNum,
-            0,
-            true);
+            0);
     ctx.userDataSequenceContext =
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckUserDataSequenceContext(
+        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckUserDataSequenceContextForFlavor(
+            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
             rosDiscSeqNum,
-            chatterSeqNum,
-            true);
+            chatterSeqNum);
 
     RTPSAckNackRunnerCallbackInitConfig callbackInit;
     callbackInit.logParsed = [](void*, const RTPSAckNackFields& fields, RTPSAckNackWriterKind writerKind)
@@ -460,7 +459,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
         LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
               fields.readerEID[0], fields.readerEID[1], fields.readerEID[2], fields.readerEID[3],
               fields.writerEID[0], fields.writerEID[1], fields.writerEID[2], fields.writerEID[3],
-              RTPSAckNack_writerKindToStr(writerKind),
+              RaftROS::RTPS::Runtime::ReliabilityAndWriterState::writerKindToStr(writerKind),
               fields.bitmapBaseLow, fields.numBits);
     };
     callbackInit.unknownRemote = nullptr;
@@ -648,10 +647,10 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             RTPSAckNackRunnerCallbacks callbacks;
             RTPSRunnerAdapter_initAckCallbacks(callbacks, callbackInit);
 
-    RTPSAckNackRunnerOptions options;
-    options.publicationsIncludesChatterAnnouncement = true;
-    options.requirePublicationSeq2GateForRetransmit = true;
-    RTPSAckNackRunner_run(srcGuidPrefix, pContent, contentLen, options, callbacks, &ctx);
+    const auto decisionOptions =
+        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackDecisionOptionsForFlavor(
+            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
+    RTPSAckNackRunner_run(srcGuidPrefix, pContent, contentLen, decisionOptions, callbacks, &ctx);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

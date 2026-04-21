@@ -2,10 +2,31 @@
 
 #include <cstdint>
 
-#include "RTPSAckNack.h"
-
 namespace RaftROS::RTPS::Runtime::ReliabilityAndWriterState
 {
+
+enum class RTPSAckNackWriterKind
+{
+    Unknown = 0,
+    SedpPublications,
+    SedpSubscriptions,
+    RosDiscoveryInfo,
+    Chatter,
+};
+
+struct RTPSAckNackFields
+{
+    const uint8_t* readerEID = nullptr;
+    const uint8_t* writerEID = nullptr;
+    uint32_t bitmapBaseLow = 0;
+    uint32_t numBits = 0;
+};
+
+enum class RTPSAckNackRuntimeFlavor : uint8_t
+{
+    EspStyle = 0,
+    LinuxStandalone,
+};
 
 enum class RTPSAckNackDecisionAction
 {
@@ -76,6 +97,23 @@ RTPSAckActionUserDataSequenceContext makeAckUserDataSequenceContext(
     uint64_t rosDiscoveryInfoSeqNum,
     uint64_t chatterDataSeqNum,
     bool chatterFirstSNMatchesSequence);
+
+RTPSAckNackDecisionOptions makeAckNackDecisionOptionsForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor);
+
+RTPSAckNackMutationPolicy makeAckNackMutationPolicyForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor);
+
+RTPSAckActionSedpSequenceContext makeAckSedpSequenceContextForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor,
+    uint64_t rosDiscoveryPublicationSeqNum,
+    uint64_t rosDiscoverySubscriptionSeqNum,
+    uint64_t chatterPublicationSeqNum);
+
+RTPSAckActionUserDataSequenceContext makeAckUserDataSequenceContextForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor,
+    uint64_t rosDiscoveryInfoSeqNum,
+    uint64_t chatterDataSeqNum);
 
 typedef void (*RTPSAckNackDecisionEmitActionFn)(
     void* emitCtx,

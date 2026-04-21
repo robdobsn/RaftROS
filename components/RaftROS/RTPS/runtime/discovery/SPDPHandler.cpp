@@ -7,8 +7,8 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "SPDPHandler.h"
-#include "RTPSMessage.h"
-#include "RTPSParticipant.h"
+#include "runtime/wire/RTPSMessage.h"
+#include "runtime/core/RTPSParticipant.h"
 
 SPDPHandler::SPDPHandler()
 {

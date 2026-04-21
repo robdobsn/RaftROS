@@ -14,11 +14,11 @@
 #include "utils.h"
 #include "CDREncoder.h"
 #include "CDRDecoder.h"
-#include "RTPSMessage.h"
+#include "runtime/wire/RTPSMessage.h"
 #include "RTPSTypes.h"
-#include "RTPSParticipant.h"
-#include "SPDPHandler.h"
-#include "SEDPHandler.h"
+#include "runtime/core/RTPSParticipant.h"
+#include "runtime/discovery/SPDPHandler.h"
+#include "runtime/announce/SEDPHandler.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
