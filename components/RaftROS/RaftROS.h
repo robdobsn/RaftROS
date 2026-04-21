@@ -65,7 +65,7 @@ private:
     uint32_t _lastWriterHbMs = 0;
     static const uint32_t WRITER_HB_INTERVAL_MS = 1000;
     uint64_t _spdpSeqNum = 0;
-    uint64_t _sedpSeqNum = 1;     // always 1 (single SEDP pub, never changes)
+    uint64_t _sedpSeqNum = 1;     // seq 1 on SEDP pubs writer = ros_disc_info publication
     uint64_t _sedpSubSeqNum = 1;  // always 1 (single SEDP sub, never changes)
     uint64_t _rosDiscSeqNum = 1;  // always 1 (single ros_discovery_info sample)
     uint64_t _livelinessSeqNum = 0; // incremented each liveliness send
@@ -74,7 +74,7 @@ private:
 
     // Chatter topic (Phase 2) - sequence numbers and timing
     uint64_t _chatterSeqNum = 0;       // increments each publish
-    uint64_t _chatterSedpSeqNum = 1;   // always 1 (single SEDP pub, static)
+    uint64_t _chatterSedpSeqNum = 2;   // seq 2 on SEDP pubs writer = chatter publication
     uint32_t _lastChatterSendMs = 0;
     static const uint32_t CHATTER_PUBLISH_INTERVAL_MS = 1000;
     uint32_t _chatterMsgIndex = 0;     // counter for message content
@@ -82,6 +82,11 @@ private:
     // Discovered remote participants
     std::vector<DiscoveredParticipant> _discovered;
     static const uint32_t MAX_DISCOVERED = 8;
+
+    // Diagnostic tracking (for detecting silent list/state transitions)
+    std::size_t _lastLoggedDiscoveredCount = 0;
+    uint32_t _lastDiscoveredHealthLogMs = 0;
+    static const uint32_t DISCOVERED_HEALTH_LOG_INTERVAL_MS = 5000;
 
     // Buffers for UDP I/O
     uint8_t _sendBuf[1024] = {};

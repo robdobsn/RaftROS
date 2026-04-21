@@ -1,13 +1,21 @@
 # RaftROS Next Stages Implementation Plan
 
-**Date:** 2026-04-20
-**Scope:** Complete ESP32 publishing while converging Linux and ESP32 runtimes toward one shared core.
+**Date:** 2026-04-21
+**Scope:** Phase 2 (ESP32 topic publishing) is now complete and verified end-to-end. Remaining work: finish shared-runtime convergence, add Phase 3 topic subscribing, and Phase 4 DeviceManager integration.
 
-## Objectives
+## Status Summary
 
-1. Get reliable ROS 2 topic publishing working on ESP32 in a repeatable testbed.
-2. Reduce divergence between Linux and ESP32 runtime logic.
-3. Establish a structure that supports both embedded and future native Linux applications.
+- Stage 1 (Lock in current behavior) — **done** for discovery and publish paths.
+- Stage 2 (Extract shared runtime core) — **mostly done**; all four runtime flows (initial announce, ACKNACK, writer heartbeat, receive submessage dispatch) are now shared runners. A small amount of writer-state/action-execution policy still lives in wrappers.
+- Stage 3 (ESP32 publishing completion) — **done and verified 2026-04-21**: `/chatter` publishes at 1 Hz, `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints every sample, RELIABLE + VOLATILE QoS honored, ACKNACK-driven retransmit proven to recover from initial LWIP send-queue drops.
+- Stage 4 (Native Linux app path alignment) — **in progress**; most orchestration is shared; `raftros_standalone.cpp` is now mostly callbacks.
+- Stage 5 (Hardening and test expansion) — **ongoing**.
+
+## Objectives (forward)
+
+1. Finish convergence of the remaining writer-state/action-execution policy under `RTPSReliabilityAndWriterStateRuntime`.
+2. Add topic subscribing (Phase 3): SEDP reader announcement, reader-side ACKNACK, CDR deserialization, message dispatch hook.
+3. Start Phase 4: auto-wire publishers from Raft DeviceManager data sources through StatePublisher into RaftROS as a CommsChannel.
 
 ## Guiding Principles
 
@@ -16,83 +24,65 @@
 - Add tests before and after moving logic to protect behavior.
 - Preserve current externally visible behavior while refactoring.
 
-## Stage 1: Lock In Current Behavior (Short)
+## Stage 1: Lock In Current Behavior — DONE ✅
 
-### Deliverables
+### Deliverables (delivered)
 
-- Baseline protocol traces for:
+- Baseline protocol traces exist for:
   - discovery only
   - discovery + `/chatter` publish
-  - ACKNACK-triggered retransmit paths
-- Saved known-good command set for docker validation.
+  - ACKNACK-triggered retransmit paths (both SEDP publications and chatter user-data)
+- Known-good command set for docker validation captured in `devdocs/RaftROS-development-status.md`.
+- Known-good command set for real-hardware validation captured in `/memories/repo/raftros-rtps-findings.md`.
 
-### Tasks
+### Exit Criteria (met)
 
-- Capture packet/log signatures for Linux standalone currently known to work.
-- Add a short verification checklist in `devdocs` for quick regressions.
-- Add unit tests for any ACKNACK branch not currently covered.
+- Linux path still passes unit tests (**85 passed, 0 failed**) and reproduces expected pub/sub in docker.
+- ESP32 path verified on WiFi against FastDDS Humble host.
 
-### Exit Criteria
+## Stage 2: Extract Shared Runtime Core — MOSTLY DONE
 
-- Existing Linux path still passes unit tests and reproduces expected pub/sub in docker.
+### Deliverables (delivered)
 
-## Stage 2: Extract Shared Runtime Core (Medium)
+- Platform-neutral runtime modules under `components/RaftROS/RTPS/runtime/`:
+  - `runtime/discovery/` — participant set merge, lease expiry, activation
+  - `runtime/reliability/` — ACKNACK decisions, writer-state policy, flavor presets
+  - `runtime/announce/` — initial announce runner, writer-heartbeat runner, SEDP/SPDP handlers
+  - `runtime/receive/` — RX submessage runner, runner-adapter helpers
+  - `runtime/schedule/` — periodic cadence helper
+  - `runtime/wire/` — RTPS message read/write
+  - `runtime/core/` — participant/GUID/port/locator helpers
+- ESP32 and Linux wrappers calling the same runtime APIs via runner callbacks.
 
-### Deliverables
+### Remaining
 
-- New platform-neutral runtime module under `components/RaftROS/` (for example `CoreRuntime`), containing:
-  - participant state updates
-  - heartbeat scheduling decisions
-  - ACKNACK handling decisions/retransmit selection
-  - endpoint sequence/heartbeat counters
-- ESP32 and Linux wrappers calling the same runtime APIs.
-
-### Tasks
-
-- Introduce minimal interfaces:
-  - `sendPacket(channel, bytes, len, remote)`
-  - `nowMs()`
-  - `getLocalParticipantInfo()`
-  - `log(level, msg)`
-- Move logic incrementally from:
-  - `components/RaftROS/RaftROS.cpp`
-  - `linux_unit_tests/raftros_standalone.cpp`
-- Keep RTPS/CDR encoding where it already exists.
+- Move the last bits of writer-state / action-execution policy (still sitting in wrappers) behind `RTPSReliabilityAndWriterStateRuntime` while preserving existing wrapper callback APIs.
 
 ### Exit Criteria
 
-- No functional behavior change in linux tests.
-- Diff between ESP32 and Linux wrappers is mostly platform glue.
+- Diff between ESP32 and Linux wrappers stays mostly platform glue (sockets, timers, logging) — already largely true.
 
-### Stage 2 Progress (Current)
+## Stage 3: ESP32 Publishing Completion — DONE ✅
 
-- Completed shared runner-based orchestration for:
-  - initial participant announce flow
-  - ACKNACK parse/classify/dispatch flow
-  - periodic writer-heartbeat resend flow
-  - receive submessage dispatch + HEARTBEAT ACK response flow
-- Linux validation baseline remains: `85 passed, 0 failed`.
+### Deliverables (delivered)
 
-## Stage 3: ESP32 Publishing Completion (Medium)
+- ESP32 advertises and publishes `/chatter` reliably.
+- `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` on the PC receives periodic messages.
+- ACKNACK-driven retransmit confirmed for both SEDP publications (chatter announcement) and chatter user-data.
 
-### Deliverables
+### Bring-up fixes that landed
 
-- ESP32 advertises and publishes `/chatter` (or chosen first topic) reliably.
-- `ros2 topic echo` receives periodic messages from ESP32.
-- ACKNACK-driven retransmit confirmed for writer path.
+- `EspStyle` flavor now enables chatter retransmit on SEDP publications ACKNACK (`publicationsIncludesChatterAnnouncement=true`).
+- Chatter SEDP DATA on writer `000003C2` now uses `seq=2` (vs `ros_discovery_info` at `seq=1`) to avoid duplicate-SN discard on the PC.
+- VOLATILE chatter HEARTBEAT `firstSN` now equals the current sequence number so newly-matched subscribers do not NACK historical samples.
+- `publishChatter()` passes `_chatterSeqNum` as `firstSN` to `SEDPHandler::buildUserDataMessage`.
+- `ctx.sedpChatterPublicationSpec.buildMessage` is now a live lambda calling `SEDPHandler::buildPublicationMessage` via `getAckActionSedpPlan(RetransmitSedpChatterPublication, …)` — previously `nullptr`.
 
-### Tasks
+### Exit Criteria (met)
 
-- Ensure SEDP writer announcement for published topic is sent on participant discovery and heartbeat cycle.
-- Ensure message payload generation and writer sequence handling are stable.
-- Confirm `ros_discovery_info` entity list includes active writer GIDs.
-- Validate with ROS 2 listener and topic introspection commands.
+- Stable publish observed for >= 2 minutes with no endpoint disappearance and no ACKNACK retransmit storm.
 
-### Exit Criteria
-
-- Stable publish observed for >= 2 minutes in testbed with no endpoint disappearance.
-
-## Stage 4: Native Linux App Path Alignment (Medium)
+## Stage 4: Native Linux App Path Alignment — IN PROGRESS
 
 ### Deliverables
 
@@ -101,15 +91,15 @@
 
 ### Tasks
 
-- Reduce `raftros_standalone.cpp` to setup + IO loop + callbacks.
-- Document required integration hooks for non-Raft Linux apps.
+- Continue reducing `raftros_standalone.cpp` to setup + IO loop + callbacks.
+- Document required integration hooks for non-Raft Linux apps (what a host app must implement: socket send, current time, local GUID/IP, log).
 - Keep docker validation script as a smoke test.
 
 ### Exit Criteria
 
-- Linux standalone still works and code duplication is materially reduced.
+- Linux standalone still works and code duplication is materially reduced (already largely true post-runtime extraction).
 
-## Stage 5: Hardening and Test Expansion (Ongoing)
+## Stage 5: Hardening and Test Expansion — ONGOING
 
 ### Deliverables
 
@@ -118,30 +108,66 @@
 
 ### Suggested Tests
 
-- ACKNACK base transitions (`base=1`, `base=2`, larger gaps)
+- ACKNACK base transitions (`base=1`, `base=2`, larger gaps), including the VOLATILE firstSN = currentSeq invariant
 - Participant lease expiry/rejoin
 - Writer heartbeat cadence under packet loss
 - Multiple discovered participants (port/address routing)
+- Initial-burst LWIP ENOMEM recovery: fail the 3rd+ unicast in `handleNewParticipant` in simulation, assert that the reliable path still delivers the chatter announcement.
 
-## Recommended Implementation Order (Immediate)
+## Stage 6: Topic Subscribing (Phase 3) — NEXT
 
-1. Batch-extract remaining shared participant-state/container logic (lookup, merge/update, purge triggers, and send-target lookup helpers) into RTPS shared modules.
-2. Batch-extract wrapper callback-adapter boilerplate into reusable shared adapter helpers to reduce repeated lambda wiring.
-3. Add/extend linux unit tests around receive callback behavior and participant routing decisions before/after extraction.
-4. Re-run `make -j$(nproc) all standalone && ./linux_unit_tests` after each extraction batch.
-5. Validate ESP32 publishing in the docker/WiFi testbed once the shared runtime convergence batch completes.
+### Deliverables
+
+- ESP32 can subscribe to a ROS 2 topic (e.g., `/cmd`) and receive `std_msgs/msg/String` (or similar) from a ROS 2 publisher.
+- Reader-side ACKNACK generation for RELIABLE topics.
+- CDR deserialization of standard message types.
+- Dispatch hook: user application SysMod receives a typed callback per incoming message.
+
+### Tasks
+
+- Add SEDP subscription announcement for the user topic (mirroring the existing chatter publication path).
+- Update `ros_discovery_info` payload to include the new reader GID.
+- Extend the RX submessage runner to route user-data DATA into a shared reader runtime.
+- Implement reader-side ACKNACK (RELIABLE) with heartbeat-count tracking per remote writer.
+- Add CDR decode path for the initial supported message types.
+
+### Exit Criteria
+
+- `ros2 topic pub /cmd std_msgs/msg/String "{data: hello}"` from the PC is received and logged by the ESP32 within one publisher heartbeat.
+
+## Stage 7: DeviceManager Auto-Publishing (Phase 4) — FUTURE
+
+### Deliverables
+
+- `RaftROS` registers as a `CommsChannel` with `CommsCoreIF`.
+- Configured `pubSources` wire StatePublisher subscriptions (e.g., `devjson`, `devbin`) into the RaftROS channel.
+- DeviceTypeRecord → ROS 2 message type mapping (`clas` tag → `sensor_msgs/*`).
+- Dynamic SEDP publication announcement as devices appear/disappear.
+
+### Exit Criteria
+
+- Plugging an I2C sensor into a running ExampleDiscoverable board creates a new ROS 2 topic visible in `ros2 topic list` within one SEDP heartbeat.
+
+## Recommended Immediate Implementation Order
+
+1. Finish moving remaining wrapper-side writer-state/action-execution policy behind `RTPSReliabilityAndWriterStateRuntime`.
+2. Add a focused unit test for VOLATILE `firstSN == currentSeq` HEARTBEAT invariant (regression guard for Stage 3 Fix 15).
+3. Add a focused unit test for "two DataWriter announcements on the same SEDP publications writer must use distinct sequence numbers" (regression guard for Stage 3 Fix 16).
+4. Start Stage 6 (Phase 3 — subscribing) with a skeleton reader runtime behind new runner callbacks, mirroring the writer runner structure.
+5. Re-run `make -j$(nproc) all standalone && ./linux_unit_tests` after each extraction batch.
 
 ## Risks and Mitigations
 
-- **Risk:** Refactor breaks currently working Linux path.
-  - **Mitigation:** Keep each move small; run unit tests and docker smoke after every step.
-- **Risk:** ESP32 timing/network behavior differs from Linux assumptions.
-  - **Mitigation:** Keep timing and socket behavior behind platform callbacks; avoid Linux-specific defaults in shared core.
-- **Risk:** Discovery/publishing drift reappears.
-  - **Mitigation:** Shared runtime owns state machine; wrappers only adapt IO.
+- **Risk:** Refactor breaks currently working Linux or ESP32 path.
+  - **Mitigation:** Keep each move small; run unit tests and docker smoke after every step; re-flash ESP32 and re-run `ros2 topic echo /chatter` after ACKNACK/writer-state changes.
+- **Risk:** Reader-side reliability subtleties (missed heartbeats, out-of-order DATA) introduce the same kind of hard-to-diagnose bugs seen in the writer path.
+  - **Mitigation:** Put reader decision logic in shared runtime from day one; keep wrappers to IO only; mirror the writer-side test pattern.
+- **Risk:** Dynamic endpoint creation (Phase 4) conflicts with the static SEDP sequence numbering assumptions.
+  - **Mitigation:** Track a per-writer SEDP-pub sequence counter already centralized — just ensure new writers get a fresh unique SN; cover with unit tests before go-live.
 
 ## Definition of Done for the Next Milestone
 
-- ESP32 `/chatter` publisher works in ROS 2 testbed.
-- Linux and ESP32 use the same ACKNACK and heartbeat orchestration logic in shared code.
+- Phase 3: ESP32 receives a ROS 2 topic reliably, with shared reader runtime behind runner callbacks.
+- Phase 2 regression tests in place (VOLATILE firstSN invariant; distinct SEDP-pub SNs).
+- Linux and ESP32 use the same writer and reader orchestration logic in shared code.
 - Unit tests pass and devdocs reflect test commands and expected outputs.

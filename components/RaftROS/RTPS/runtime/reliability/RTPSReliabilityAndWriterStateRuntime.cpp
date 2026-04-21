@@ -48,7 +48,12 @@ RTPSAckNackDecisionOptions makeAckNackDecisionOptionsForFlavor(
 
         case RTPSAckNackRuntimeFlavor::EspStyle:
         default:
-            options.publicationsIncludesChatterAnnouncement = false;
+            // Retransmit the /chatter SEDP publication announcement on ACKNACK.
+            // Needed because the initial unicast burst at match time can drop
+            // packets (LWIP send-queue ENOMEM), and without retransmit the PC
+            // never learns about the /chatter writer, so ros2 topic echo stays
+            // silent even though user data is being sent.
+            options.publicationsIncludesChatterAnnouncement = true;
             options.requirePublicationSeq2GateForRetransmit = false;
             break;
     }
@@ -95,8 +100,10 @@ RTPSAckActionUserDataSequenceContext makeAckUserDataSequenceContextForFlavor(
     uint64_t rosDiscoveryInfoSeqNum,
     uint64_t chatterDataSeqNum)
 {
-    const bool chatterFirstSNMatchesSequence =
-        runtimeFlavor == RTPSAckNackRuntimeFlavor::LinuxStandalone;
+    // For VOLATILE /chatter QoS, HEARTBEAT firstSN must equal the current
+    // sequence number so newly-matched readers don't request missed samples.
+    (void)runtimeFlavor;
+    const bool chatterFirstSNMatchesSequence = true;
     return makeAckUserDataSequenceContext(
         rosDiscoveryInfoSeqNum,
         chatterDataSeqNum,

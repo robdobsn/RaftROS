@@ -6,7 +6,12 @@
 
 Make an ESP32-S3 (running Raft firmware) appear as a native ROS 2 node — without micro-ROS or any agent process — using a clean-room RTPS 2.2 implementation as a Raft SysMod.
 
-**Phase 1 (Discovery) is COMPLETE.** The ESP32 appears as `/raft_esp32` in `ros2 node list`.
+**Phase 1 (Discovery) and Phase 2 (Topic Publishing) are COMPLETE.**
+- `ros2 node list` shows `/raft_esp32`.
+- `ros2 topic list` shows `/chatter`.
+- `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints a sample per second.
+
+Verified end-to-end on 2026-04-21 against ROS 2 Humble + FastDDS 2.6.11, ESP32-S3 on real WiFi (PC `192.168.1.92`, ESP32 `192.168.1.173`).
 
 ## Architecture
 
@@ -33,6 +38,40 @@ Clean-room RTPS 2.2 implementation. No third-party DDS libraries.
 - **ESP32-S3**, MAC `94:a9:90:3a:51:b0`, WiFi STA IP `192.168.1.173`
 - **ROS 2 Humble** with FastRTPS 2.6.11, running on WSL2 (mirrored networking), IP `192.168.1.92`
 - Domain ID 0 → SPDP multicast `239.255.0.1:7400`, metatraffic unicast `:7410`, user data unicast `:7411`
+
+## Phase 2: Topic Publishing — COMPLETE ✅
+
+Immediate objective was to publish real ROS 2 topic data from the ESP32 with reliable delivery.
+
+### What Works (ESP32, 2026-04-21)
+
+- ESP32 announces an additional DataWriter endpoint for `/chatter` (`std_msgs/msg/String`, RELIABLE + VOLATILE) via SEDP publications on writer `000003C2` at sequence number 2 (distinct from the `ros_discovery_info` announcement at sequence 1 on the same writer).
+- `publishChatter()` serializes `std_msgs/msg/String` using the CDR encoder and sends DATA + HEARTBEAT on the user data port (`7411`) once per second.
+- HEARTBEAT `firstSN` matches the current sequence number for the VOLATILE chatter writer so newly-matched subscribers do not request historical samples.
+- ACKNACK-driven retransmit works on both the SEDP publications path (chatter announcement recovery) and the chatter user-data path.
+- `ros_discovery_info` writer GID list still advertises the chatter writer as part of the participant's node entities.
+
+### Verification
+
+- On PC: `env -u PYTHONPATH PYTHONNOUSERSITE=1 ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints `data: Hello from raft_esp32 [N]` once per second indefinitely.
+- On PC: `ros2 topic info /chatter --no-daemon -v` shows one Publisher with QoS RELIABLE + VOLATILE, node `raft_esp32`.
+- On ESP32: ACKNACK log shows `readerEID=00000504 writerEID=00010103 (chatter) base=N numBits=0` with `N` advancing — no retransmit storm.
+- Linux unit tests and standalone linux publisher remain green (**85 passed, 0 failed**) after the ESP fixes.
+
+### Additional Fixes Applied During Phase 2 Bring-up
+
+| # | Fix | Details |
+|---|-----|---------|
+| 15 | VOLATILE chatter HB `firstSN = currentSeq` | Heartbeat `firstSN=1` on a VOLATILE writer caused newly-matched subscribers to NACK an ever-growing gap of historical samples. Fix: advertise `firstSN = chatterSeqNum`. Added `firstSN` parameter to `SEDPHandler::buildUserDataMessage`; centralized for ESP in `RTPSReliabilityAndWriterStateRuntime::makeAckUserDataSequenceContextForFlavor` via `chatterFirstSNMatchesSequence=true`. |
+| 16 | Chatter SEDP publication sequence number | The `ros_discovery_info` and `/chatter` SEDP DATA messages share writer entity `000003C2`. Both were emitted at `seq=1`, so the PC discarded the chatter announcement as a replay. Fix: `_chatterSedpSeqNum = 2` in `RaftROS.h`. `ros_discovery_info` keeps `seq=1`. |
+| 17 | Enable chatter retransmit in `EspStyle` flavor | ACKNACK on SEDP publications (`000003C2`) did not retransmit the `/chatter` announcement because `publicationsIncludesChatterAnnouncement=false` under `EspStyle`. Combined with LWIP ENOMEM losing the 3rd+ sendto in the initial unicast burst, the PC never learned about `/chatter`. Fix (A): set `publicationsIncludesChatterAnnouncement=true` in `makeAckNackDecisionOptionsForFlavor` for `EspStyle`. Fix (B): wire `ctx.sedpChatterPublicationSpec.buildMessage` to call `SEDPHandler::buildPublicationMessage` using `getAckActionSedpPlan(RetransmitSedpChatterPublication, …)`. |
+
+### Phase 2 Key Learnings
+
+- **VOLATILE + RELIABLE writers must advertise `firstSN == lastSN`** in HEARTBEAT. Firing `firstSN=1` with `lastSN=N` invites the subscriber to NACK samples that no longer exist, producing a retransmit storm.
+- **Two DataWriter announcements on the same SEDP publications writer must use distinct sequence numbers**, or the second is silently discarded as duplicate.
+- **LWIP send queue is narrow on ESP32-S3**: the initial 5-packet unicast burst from `handleNewParticipant` still loses the 3rd and later sends with `errno=ENOMEM`. End-to-end delivery now relies on the reliable-retransmit path rather than first-try success; do not remove the retransmit wiring to "clean up" the flow.
+- **ROS 2 CLI on the PC needs `env -u PYTHONPATH PYTHONNOUSERSITE=1 … --no-daemon`** to avoid the user-site numpy collision and the daemon XMLRPC timeout on this host. This is captured in `/memories/repo/raftros-rtps-findings.md` but should stay in mind for future validation.
 
 ## Phase 1: Discovery — COMPLETE ✅
 
@@ -125,21 +164,13 @@ Latest run (2026-04-20) passed with:
 
 ### Remaining Gap
 
-- ESP32 path still needs Phase 2 completion (topic publishing endpoint lifecycle + runtime validation against ROS 2 subscribers under real WiFi conditions).
-- Linux and ESP32 orchestration code still have drift risk because key runtime logic is duplicated in:
-	- `components/RaftROS/RaftROS.cpp`
-	- `linux_unit_tests/raftros_standalone.cpp`
+- Phase 2 (ESP32 `/chatter` publishing) is complete and verified end-to-end against ROS 2 Humble + FastDDS.
+- Phases 3 (subscribing) and 4 (auto-wiring from DeviceManager) are still TODO.
+- Linux and ESP32 orchestration code continues to converge on a shared runtime; remaining drift lives in the thin wrappers only (`components/RaftROS/RaftROS.cpp` vs `linux_unit_tests/raftros_standalone.cpp`).
 
-## Phase 2: Topic Publishing — IN PROGRESS
+## Phase 2: Topic Publishing — See "Phase 2: Topic Publishing — COMPLETE ✅" above
 
-Immediate objective: publish real ROS 2 topic data from the ESP32 with reliable delivery.
-
-- Announce a new DataWriter endpoint (e.g. `std_msgs/msg/String` on `/chatter`) via SEDP
-- Serialize ROS 2 messages using CDR encoder
-- Send DATA messages to remote subscribers' user data ports
-- Handle HEARTBEAT/ACKNACK reliable delivery for the new writer
-- Update `ros_discovery_info` payload to include the new writer's GID
-- Validate on ESP32 against ROS 2 `demo_nodes_cpp` listener in a controlled testbed
+Historical notes on the shared-runtime convergence work that landed alongside Phase 2 are kept under "DRY / Shared-Code Direction" below.
 
 ## DRY / Shared-Code Direction (Agreed Technical Direction)
 
@@ -302,7 +333,7 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 - Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after reliability-wrapper file removal and build-list pruning (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK shim-header removal and runtime-type ownership consolidation (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after receive-runtime file relocation and top-level source pruning (**85 passed, 0 failed**).
-- Next: continue Phase 2 by moving remaining writer-state/reliability action-execution policy behind `RTPSReliabilityAndWriterStateRuntime` while preserving wrapper callback APIs.
+- Next: start Phase 3 (topic subscribing). Continue moving remaining writer-state/reliability action-execution policy behind `RTPSReliabilityAndWriterStateRuntime` while preserving wrapper callback APIs; add a reader-side ACKNACK + deserialization path with the same shared-runtime discipline.
 
 ### Practical Rule
 

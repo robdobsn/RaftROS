@@ -145,6 +145,23 @@ void RaftROS::loop()
 
         // Check for incoming user data (ros_discovery_info from remote, etc.)
         recvUserData();
+
+        // Diagnostic: periodic health line + detect size transitions
+        if (_discovered.size() != _lastLoggedDiscoveredCount)
+        {
+            LOG_I(MODULE_PREFIX, "health discoveredCount %u->%u state=%d",
+                  (unsigned)_lastLoggedDiscoveredCount,
+                  (unsigned)_discovered.size(),
+                  (int)_connState);
+            _lastLoggedDiscoveredCount = _discovered.size();
+        }
+        if (RTPSRuntimeSchedule_isPeriodicDue(now, _lastDiscoveredHealthLogMs,
+                                              DISCOVERED_HEALTH_LOG_INTERVAL_MS, true))
+        {
+            LOG_I(MODULE_PREFIX, "health periodic discoveredCount=%u state=%d",
+                  (unsigned)_discovered.size(), (int)_connState);
+            _lastDiscoveredHealthLogMs = now;
+        }
         break;
     }
     }
@@ -340,22 +357,37 @@ void RaftROS::processDiscoveredParticipant(DiscoveredParticipant& remote, const 
           (int)remote.leaseDurationSec);
 
     // Merge participant into discovered set and apply side effects on new additions.
+    std::size_t prevCount = _discovered.size();
     RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult mergeResult =
         RaftRuntime::RTPS::Runtime::DiscoveryRuntime::mergeParticipant(
             _discovered, remote, nowMs, MAX_DISCOVERED);
+    const char* mergeStr = (mergeResult == RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult::AddedNew) ? "NEW"
+                        : (mergeResult == RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult::RefreshedExisting) ? "REFRESH"
+                        : "FULL";
+    LOG_I(MODULE_PREFIX, "processDiscoveredParticipant %s guidPfx=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x count %u->%u",
+          mergeStr,
+          remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
+          remote.guidPrefix[4], remote.guidPrefix[5], remote.guidPrefix[6], remote.guidPrefix[7],
+          remote.guidPrefix[8], remote.guidPrefix[9], remote.guidPrefix[10], remote.guidPrefix[11],
+          (unsigned)prevCount, (unsigned)_discovered.size());
     if (mergeResult == RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult::AddedNew)
     {
         handleNewParticipant(remote, fromAddr);
 
+        bool wasActive = (_connState == ConnState::ACTIVE);
         RTPSParticipantSetPolicyResult setPolicy =
             RaftRuntime::RTPS::Runtime::DiscoveryRuntime::applyParticipantSetPolicy(
-                _connState == ConnState::ACTIVE,
+                wasActive,
                 (uint32_t)_discovered.size(),
                 true,
                 true);
 
-        if (setPolicy.shouldBeActive)
+        if (setPolicy.shouldBeActive && !wasActive)
+        {
+            LOG_I(MODULE_PREFIX, "stateTransition ANNOUNCING->ACTIVE discoveredCount=%u",
+                  (unsigned)_discovered.size());
             _connState = ConnState::ACTIVE;
+        }
         if (setPolicy.triggerImmediateWriterHeartbeat)
             RaftRuntime::RTPS::Runtime::DiscoveryRuntime::onActivated(_lastWriterHbMs);
     }
@@ -639,7 +671,28 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
     };
 
     ctx.sedpChatterPublicationSpec.sendChannel = RTPSAckNackRunnerSendChannel::Metatraffic;
-    ctx.sedpChatterPublicationSpec.buildMessage = nullptr;
+    ctx.sedpChatterPublicationSpec.buildMessage = [](void* actionCtx,
+                                                     const uint8_t* srcGuidPrefix,
+                                                     uint64_t) -> uint32_t
+    {
+        AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
+        RaftROS* self = p->self;
+        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
+        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
+                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpChatterPublication,
+                p->sedpSequenceContext,
+                plan))
+            return 0;
+        return self->_sedpHandler.buildPublicationMessage(
+            self->_sendBuf, sizeof(self->_sendBuf),
+            self->_participant, srcGuidPrefix,
+            plan.endpoint.entityId,
+            plan.endpoint.topicName,
+            plan.endpoint.typeName,
+            plan.endpoint.reliabilityKind,
+            plan.endpoint.durabilityKind,
+            plan.sequenceNumber, self->_myIpAddr);
+    };
 
     ctx.sedpRosDiscoverySubscriptionSpec.sendChannel = RTPSAckNackRunnerSendChannel::Metatraffic;
     ctx.sedpRosDiscoverySubscriptionSpec.buildMessage = [](void* actionCtx,
@@ -789,18 +842,33 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
 void RaftROS::purgeStaleParticipants()
 {
     uint32_t now = millis();
+    std::size_t prevCount = _discovered.size();
     for (auto it = _discovered.begin(); it != _discovered.end(); )
     {
         if (RaftRuntime::RTPS::Runtime::DiscoveryRuntime::isLeaseExpired(
             now, it->discoveredTimeMs, it->leaseDurationSec))
         {
-            LOG_I(MODULE_PREFIX, "purgeStale removing participant lease expired (%d sec ago)",
-                  (int)((now - it->discoveredTimeMs) / 1000));
+            LOG_I(MODULE_PREFIX, "purgeStale removing participant guidPfx=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x lease expired (%d sec ago, leaseDur=%us)",
+                  it->guidPrefix[0], it->guidPrefix[1], it->guidPrefix[2], it->guidPrefix[3],
+                  it->guidPrefix[4], it->guidPrefix[5], it->guidPrefix[6], it->guidPrefix[7],
+                  it->guidPrefix[8], it->guidPrefix[9], it->guidPrefix[10], it->guidPrefix[11],
+                  (int)((now - it->discoveredTimeMs) / 1000),
+                  (unsigned)it->leaseDurationSec);
             it = _discovered.erase(it);
         }
         else
         {
             ++it;
+        }
+    }
+    if (_discovered.size() != prevCount)
+    {
+        LOG_I(MODULE_PREFIX, "purgeStale count %u->%u",
+              (unsigned)prevCount, (unsigned)_discovered.size());
+        if (_discovered.empty() && prevCount > 0)
+        {
+            LOG_W(MODULE_PREFIX, "purgeStale discovered list now EMPTY - chatter/HB will stop (state=%d)",
+                  (int)_connState);
         }
     }
 }
@@ -1204,7 +1272,8 @@ void RaftROS::publishChatter()
             _participant, remote.guidPrefix,
             ENTITYID_CHATTER_WRITER,
             chatterPayload, payloadLen,
-            _chatterSeqNum, _heartbeatCount);
+            _chatterSeqNum, _heartbeatCount,
+            _chatterSeqNum /* firstSN = current for VOLATILE QoS */);
 
         if (msgLen > 0)
         {
@@ -1214,9 +1283,13 @@ void RaftROS::publishChatter()
             dest.sin_addr.s_addr = remote.ipAddr;
             int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
                               (struct sockaddr*)&dest, sizeof(dest));
-            LOG_I(MODULE_PREFIX, "publishChatter seq=%llu \"%s\" sent %d/%d to port %d",
+            char destIpStr[16];
+            strncpy(destIpStr, inet_ntoa(*(struct in_addr*)&remote.ipAddr), sizeof(destIpStr));
+            destIpStr[sizeof(destIpStr)-1] = '\0';
+            LOG_I(MODULE_PREFIX, "publishChatter seq=%llu \"%s\" sent %d/%d to %s:%d (discCount=%u)",
                   (unsigned long long)_chatterSeqNum, msgStr, sent, (int)msgLen,
-                  (int)remote.userDataPort);
+                  destIpStr, (int)remote.userDataPort,
+                  (unsigned)_discovered.size());
         }
     }
 }
