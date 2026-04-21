@@ -2,7 +2,12 @@
 
 #include <cstddef>
 #include <cstdint>
+#ifdef ESP_PLATFORM
+#include "lwip/sockets.h"
+#include "lwip/inet.h"
+#else
 #include <netinet/in.h>
+#endif
 #include <vector>
 
 #include "runtime/discovery/SPDPHandler.h"
@@ -13,7 +18,7 @@ struct RTPSParticipantSetPolicyResult
     bool triggerImmediateWriterHeartbeat = false;
 };
 
-namespace RaftROS::RTPS::Runtime::DiscoveryRuntime
+namespace RaftRuntime::RTPS::Runtime::DiscoveryRuntime
 {
 
 enum class MergeResult : uint8_t

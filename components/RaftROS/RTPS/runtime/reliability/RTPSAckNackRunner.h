@@ -4,11 +4,11 @@
 #include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
 
 using RTPSAckNackFields =
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackFields;
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackFields;
 using RTPSAckNackWriterKind =
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackWriterKind;
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackWriterKind;
 using RTPSAckNackRunnerAction =
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction;
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction;
 
 typedef void (*RTPSAckNackRunnerLogParsedFn)(
     void* userCtx,
@@ -42,6 +42,6 @@ void RTPSAckNackRunner_run(
     const uint8_t* srcGuidPrefix,
     const uint8_t* pContent,
     uint32_t contentLen,
-    const RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions& options,
+    const RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions& options,
     const RTPSAckNackRunnerCallbacks& callbacks,
     void* userCtx);

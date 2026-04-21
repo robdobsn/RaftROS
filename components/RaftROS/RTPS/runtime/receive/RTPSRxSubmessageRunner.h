@@ -1,7 +1,12 @@
 #pragma once
 
 #include <stdint.h>
+
+#ifdef ESP_PLATFORM
+#include "lwip/sockets.h"
+#else
 #include <netinet/in.h>
+#endif
 
 #include "runtime/wire/RTPSMessage.h"
 
