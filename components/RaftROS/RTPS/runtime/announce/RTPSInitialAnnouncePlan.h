@@ -162,56 +162,44 @@ struct RTPSInitialAnnounceSequence
     uint8_t numSteps = 0;
 };
 
-// Returns the policy for first-contact announcement bundle on participant discovery.
 RTPSInitialAnnouncePlan RTPSInitialAnnouncePlan_default();
 
-// Builds ordered initial-announce actions with side-effect guidance.
 RTPSInitialAnnounceSequence RTPSInitialAnnouncePlan_buildSequence(
     const RTPSInitialAnnouncePlan& plan,
     RTPSInitialAnnounceRuntimeFlavor runtimeFlavor);
 
-// Maps an action to its send socket/addressing policy.
 RTPSInitialAnnounceSendTarget RTPSInitialAnnouncePlan_getSendTarget(
     RTPSInitialAnnounceAction action);
 
-// Maps an action to its payload builder kind and endpoint profile.
 RTPSInitialAnnounceBuildSpec RTPSInitialAnnouncePlan_getBuildSpec(
     RTPSInitialAnnounceAction action);
 
-// Maps a SEDP endpoint profile to concrete entity/topic/type/qos values.
 RTPSInitialAnnounceSedpEndpointSpec RTPSInitialAnnouncePlan_getSedpEndpointSpec(
     RTPSInitialAnnounceSedpEndpointProfile profile);
 
-// Maps an action to shared logging metadata.
 RTPSInitialAnnounceLogSpec RTPSInitialAnnouncePlan_getLogSpec(
     RTPSInitialAnnounceAction action);
 
-// Applies sequence-counter mutation timing policy for a step and returns the sequence number to use.
 uint64_t RTPSInitialAnnouncePlan_applySequencePolicy(
     const RTPSInitialAnnounceStep& step,
     RTPSInitialAnnounceRuntimeFlavor runtimeFlavor,
     RTPSInitialAnnounceCounterState& counters);
 
-// Maps action/runtime to optional debug behavior.
 RTPSInitialAnnounceDebugSpec RTPSInitialAnnouncePlan_getDebugSpec(
     RTPSInitialAnnounceAction action,
     RTPSInitialAnnounceRuntimeFlavor runtimeFlavor);
 
-// Classifies send result for shared instrumentation policy.
 RTPSInitialAnnounceSendResultSpec RTPSInitialAnnouncePlan_classifySendResult(
     int sentBytes,
     uint32_t expectedBytes);
 
-// Evaluates whether a step should be skipped before building payload.
 RTPSInitialAnnounceStepEvaluation RTPSInitialAnnouncePlan_evaluatePreBuild(
     const RTPSInitialAnnounceStep& step,
     uint32_t previousPayloadLen);
 
-// Evaluates whether a step should be skipped after build.
 RTPSInitialAnnounceStepEvaluation RTPSInitialAnnouncePlan_evaluatePostBuild(
     uint32_t payloadLen);
 
-// Applies heartbeat mutation policy for a step.
 uint32_t RTPSInitialAnnouncePlan_applyHeartbeatPolicy(
     const RTPSInitialAnnounceStep& step,
     uint32_t heartbeatCount);

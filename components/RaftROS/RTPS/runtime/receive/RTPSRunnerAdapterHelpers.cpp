@@ -1,9 +1,8 @@
-#include "RTPSRunnerAdapterHelpers.h"
+#include "runtime/receive/RTPSRunnerAdapterHelpers.h"
 
 #include <cstdio>
 #include <sys/socket.h>
 
-#include "RTPSBuiltinEndpointMap.h"
 #include "runtime/discovery/RTPSDiscoveryRuntime.h"
 
 #ifndef RAFTROS_ACK_HEX_DUMP_ENABLE
@@ -13,38 +12,6 @@
 #ifndef RAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE
 #define RAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE 0
 #endif
-
-namespace
-{
-
-bool RTPSRunnerAdapter_mapToRuntimeAction(
-    RTPSAckNackRunnerAction action,
-    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction& runtimeAction)
-{
-    using RuntimeAction = RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction;
-    switch (action)
-    {
-        case RTPSAckNackRunnerAction::RetransmitSedpRosDiscoveryPublication:
-            runtimeAction = RuntimeAction::RetransmitSedpRosDiscoveryPublication;
-            return true;
-        case RTPSAckNackRunnerAction::RetransmitSedpChatterPublication:
-            runtimeAction = RuntimeAction::RetransmitSedpChatterPublication;
-            return true;
-        case RTPSAckNackRunnerAction::RetransmitSedpRosDiscoverySubscription:
-            runtimeAction = RuntimeAction::RetransmitSedpRosDiscoverySubscription;
-            return true;
-        case RTPSAckNackRunnerAction::RetransmitRosDiscoveryInfo:
-            runtimeAction = RuntimeAction::RetransmitRosDiscoveryInfo;
-            return true;
-        case RTPSAckNackRunnerAction::RetransmitChatterData:
-            runtimeAction = RuntimeAction::RetransmitChatterData;
-            return true;
-        default:
-            return false;
-    }
-}
-
-}
 
 void RTPSRunnerAdapter_applyRxBaseCallbacks(RTPSRxSubmessageRunnerCallbacks& callbacks)
 {
@@ -66,7 +33,9 @@ void RTPSRunnerAdapter_applyRxBaseCallbacks(RTPSRxSubmessageRunnerCallbacks& cal
             return fallbackReaderEID;
         if (ctx->readerPolicy == RTPSRxAdapterReaderPolicy::UseHeartbeatReader)
             return fallbackReaderEID;
-        return RTPSBuiltinEndpointMap_localReaderForRemoteWriter(writerEID, fallbackReaderEID);
+        return RaftROS::RTPS::Runtime::ReliabilityAndWriterState::localReaderForRemoteWriter(
+            writerEID,
+            fallbackReaderEID);
     };
 
     callbacks.resolveAckDest = [](void* userCtx,
@@ -191,14 +160,10 @@ void RTPSRunnerAdapter_executeAckAction(
 
     if (adapterCtx.heartbeatCount)
     {
-        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction runtimeAction;
-        if (RTPSRunnerAdapter_mapToRuntimeAction(action, runtimeAction))
-        {
-            RaftROS::RTPS::Runtime::ReliabilityAndWriterState::applyAckActionHeartbeatMutation(
-                runtimeAction,
-                adapterCtx.mutationPolicy,
-                *adapterCtx.heartbeatCount);
-        }
+        RaftROS::RTPS::Runtime::ReliabilityAndWriterState::applyAckActionHeartbeatMutation(
+            action,
+            adapterCtx.mutationPolicy,
+            *adapterCtx.heartbeatCount);
     }
 
     const uint32_t msgLen = execSpec->buildMessage(actionCtx, srcGuidPrefix, chatterSeq);

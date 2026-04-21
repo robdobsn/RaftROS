@@ -1,22 +1,14 @@
 #pragma once
 
 #include <stdint.h>
-#include "RTPSAckNack.h"
+#include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
 
-enum class RTPSAckNackRunnerAction
-{
-    RetransmitSedpRosDiscoveryPublication = 0,
-    RetransmitSedpChatterPublication,
-    RetransmitSedpRosDiscoverySubscription,
-    RetransmitRosDiscoveryInfo,
-    RetransmitChatterData,
-};
-
-struct RTPSAckNackRunnerOptions
-{
-    bool publicationsIncludesChatterAnnouncement = false;
-    bool requirePublicationSeq2GateForRetransmit = false;
-};
+using RTPSAckNackFields =
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackFields;
+using RTPSAckNackWriterKind =
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackWriterKind;
+using RTPSAckNackRunnerAction =
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction;
 
 typedef void (*RTPSAckNackRunnerLogParsedFn)(
     void* userCtx,
@@ -50,6 +42,6 @@ void RTPSAckNackRunner_run(
     const uint8_t* srcGuidPrefix,
     const uint8_t* pContent,
     uint32_t contentLen,
-    const RTPSAckNackRunnerOptions& options,
+    const RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions& options,
     const RTPSAckNackRunnerCallbacks& callbacks,
     void* userCtx);

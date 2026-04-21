@@ -3,7 +3,7 @@
 #include <cstring>
 
 #include "RTPSTypes.h"
-#include "RTPSMessage.h"
+#include "runtime/wire/RTPSMessage.h"
 
 namespace RaftROS::RTPS::Runtime::ReliabilityAndWriterState
 {
@@ -33,6 +33,74 @@ RTPSAckActionUserDataSequenceContext makeAckUserDataSequenceContext(
     context.chatterDataSeqNum = chatterDataSeqNum;
     context.chatterFirstSNMatchesSequence = chatterFirstSNMatchesSequence;
     return context;
+}
+
+RTPSAckNackDecisionOptions makeAckNackDecisionOptionsForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor)
+{
+    RTPSAckNackDecisionOptions options;
+    switch (runtimeFlavor)
+    {
+        case RTPSAckNackRuntimeFlavor::LinuxStandalone:
+            options.publicationsIncludesChatterAnnouncement = true;
+            options.requirePublicationSeq2GateForRetransmit = true;
+            break;
+
+        case RTPSAckNackRuntimeFlavor::EspStyle:
+        default:
+            options.publicationsIncludesChatterAnnouncement = false;
+            options.requirePublicationSeq2GateForRetransmit = false;
+            break;
+    }
+    return options;
+}
+
+RTPSAckNackMutationPolicy makeAckNackMutationPolicyForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor)
+{
+    RTPSAckNackMutationPolicy mutationPolicy;
+    switch (runtimeFlavor)
+    {
+        case RTPSAckNackRuntimeFlavor::LinuxStandalone:
+            mutationPolicy.incrementHeartbeatOnSedpRetransmit = true;
+            mutationPolicy.incrementHeartbeatOnUserDataRetransmit = true;
+            break;
+
+        case RTPSAckNackRuntimeFlavor::EspStyle:
+        default:
+            mutationPolicy.incrementHeartbeatOnSedpRetransmit = false;
+            mutationPolicy.incrementHeartbeatOnUserDataRetransmit = true;
+            break;
+    }
+    return mutationPolicy;
+}
+
+RTPSAckActionSedpSequenceContext makeAckSedpSequenceContextForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor,
+    uint64_t rosDiscoveryPublicationSeqNum,
+    uint64_t rosDiscoverySubscriptionSeqNum,
+    uint64_t chatterPublicationSeqNum)
+{
+    const bool deriveChatterPublicationFromRosDiscoveryPublication =
+        runtimeFlavor == RTPSAckNackRuntimeFlavor::LinuxStandalone;
+    return makeAckSedpSequenceContext(
+        rosDiscoveryPublicationSeqNum,
+        rosDiscoverySubscriptionSeqNum,
+        chatterPublicationSeqNum,
+        deriveChatterPublicationFromRosDiscoveryPublication);
+}
+
+RTPSAckActionUserDataSequenceContext makeAckUserDataSequenceContextForFlavor(
+    RTPSAckNackRuntimeFlavor runtimeFlavor,
+    uint64_t rosDiscoveryInfoSeqNum,
+    uint64_t chatterDataSeqNum)
+{
+    const bool chatterFirstSNMatchesSequence =
+        runtimeFlavor == RTPSAckNackRuntimeFlavor::LinuxStandalone;
+    return makeAckUserDataSequenceContext(
+        rosDiscoveryInfoSeqNum,
+        chatterDataSeqNum,
+        chatterFirstSNMatchesSequence);
 }
 
 bool shouldRespondToHeartbeat(uint8_t heartbeatFlags)

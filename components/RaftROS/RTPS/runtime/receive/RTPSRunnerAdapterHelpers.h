@@ -3,9 +3,9 @@
 #include <stdint.h>
 #include <vector>
 
-#include "SPDPHandler.h"
-#include "RTPSAckNackRunner.h"
-#include "RTPSRxSubmessageRunner.h"
+#include "runtime/discovery/SPDPHandler.h"
+#include "runtime/reliability/RTPSAckNackRunner.h"
+#include "runtime/receive/RTPSRxSubmessageRunner.h"
 #include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
 
 enum class RTPSRxAdapterReaderPolicy : uint8_t

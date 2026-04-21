@@ -5,8 +5,13 @@
 #include <netinet/in.h>
 #include <vector>
 
-#include "SPDPHandler.h"
-#include "RTPSParticipantSetPolicy.h"
+#include "runtime/discovery/SPDPHandler.h"
+
+struct RTPSParticipantSetPolicyResult
+{
+    bool shouldBeActive = false;
+    bool triggerImmediateWriterHeartbeat = false;
+};
 
 namespace RaftROS::RTPS::Runtime::DiscoveryRuntime
 {

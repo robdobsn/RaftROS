@@ -1,7 +1,7 @@
 #pragma once
 
 #include <stdint.h>
-#include "RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSInitialAnnouncePlan.h"
 
 struct RTPSInitialAnnounceRunnerContext
 {

@@ -3,7 +3,7 @@
 #include <stdint.h>
 #include <netinet/in.h>
 
-#include "RTPSMessage.h"
+#include "runtime/wire/RTPSMessage.h"
 
 enum class RTPSRxChannel
 {

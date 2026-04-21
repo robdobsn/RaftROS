@@ -7,8 +7,8 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "SEDPHandler.h"
-#include "RTPSMessage.h"
-#include "RTPSParticipant.h"
+#include "runtime/wire/RTPSMessage.h"
+#include "runtime/core/RTPSParticipant.h"
 
 SEDPHandler::SEDPHandler()
 {
