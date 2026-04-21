@@ -931,18 +931,25 @@ Common issues when testing Phase 1 and how to diagnose them:
 | `ros2 node list` hangs | Domain ID mismatch | Verify both ESP32 and host use `ROS_DOMAIN_ID=0` |
 | Intermittent discovery | WiFi power saving dropping multicast | Disable WiFi power save in sdkconfig: `CONFIG_ESP_WIFI_SLP_DEFAULT_MIN_ACTIVE_TIME=0` |
 
-### Phase 2: Static Publishing
+### Phase 2: Static Publishing — COMPLETE ✅
 
-**Goal:** Publish sensor data on pre-configured topics
+**Goal:** Publish data on pre-configured topics ✅ verified 2026-04-21 with `/chatter` (`std_msgs/msg/String`).
 
-- Announce new DataWriter endpoints via SEDP (in addition to the existing `ros_discovery_info` writer)
-- CDR encoding for standard ROS 2 message types (`sensor_msgs/Imu`, `sensor_msgs/Temperature`, `sensor_msgs/Range`, `std_msgs/String`)
-- Reliable QoS delivery is already implemented (HEARTBEAT/ACKNACK) from Phase 1
-- Manual configuration of device-to-topic mapping in SysType JSON
-- Integration with DeviceManager data callbacks
-- Update `ros_discovery_info` payload to include the new writer GIDs
+**Deliverable delivered:** `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints a sample per second from the ESP32 indefinitely.
 
-**Deliverable:** `ros2 topic echo /raft_esp32/imu` shows live IMU data from an I2C sensor
+What landed:
+
+- Second DataWriter endpoint (`/chatter`, RELIABLE + VOLATILE) announced via SEDP publications on the same writer as `ros_discovery_info` but at a distinct sequence number (1 → `ros_discovery_info`, 2 → `/chatter`).
+- CDR encoder used to serialize `std_msgs/msg/String` payloads.
+- DATA + HEARTBEAT sent on the user data port (`7411`) once per second.
+- Reliable QoS delivery uses the existing (Phase 1) HEARTBEAT/ACKNACK runtime; the chatter writer additionally advertises `HEARTBEAT firstSN == currentSeq` to honor VOLATILE semantics.
+- `ros_discovery_info` writer GID list advertises the chatter writer as part of the participant's node entities.
+
+Key learnings from Phase 2 bring-up (documented in `RaftROS-development-status.md` Phase 2 section):
+
+- VOLATILE writers must advertise `HEARTBEAT firstSN == currentSeq`, otherwise newly-matched subscribers NACK historical samples that no longer exist and drive a retransmit storm.
+- Two DataWriter announcements that share a SEDP publications writer entity must use distinct sequence numbers.
+- The `EspStyle` ACKNACK flavor must enable chatter retransmit on SEDP publications ACKNACK (`publicationsIncludesChatterAnnouncement=true`) because the initial unicast burst from `handleNewParticipant` regularly loses the 3rd+ packet to LWIP ENOMEM on the ESP32.
 
 ### Phase 3: Dynamic Auto-Configuration
 
