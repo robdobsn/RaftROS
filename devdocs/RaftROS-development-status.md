@@ -87,10 +87,41 @@ Clean-room RTPS 2.2 implementation. No third-party DDS libraries.
 - Initial shared-runtime extraction started: ACKNACK parsing/writer classification moved into shared RTPS utility (`RTPSAckNack`) and consumed by both ESP32 (`RaftROS.cpp`) and Linux standalone (`raftros_standalone.cpp`) handlers.
 - Post-refactor validation remains green: linux unit tests **85 passed, 0 failed** and `raftros_linux` builds successfully.
 
+### Canonical Docker Validation Rule (Linux Build)
+
+To avoid host/container networking ambiguity, treat this as the required docker regression path:
+
+1. Build linux artifacts on host:
+- `cd linux_unit_tests && make -j$(nproc) all standalone`
+
+2. Start docker test container:
+- `cd docker && docker compose up -d --build`
+
+3. Copy linux standalone binary into container and run it **inside** the container:
+- `docker cp linux_unit_tests/raftros_linux raftros-test:/workspace/raftros_linux`
+- `docker exec raftros-test chmod +x /workspace/raftros_linux`
+- `docker exec raftros-test bash -lc 'source /opt/ros/humble/setup.bash; /workspace/raftros_linux -i eth0 > /tmp/raftros_linux_in_container.out 2> /tmp/raftros_linux_in_container.err'`
+
+4. Run ROS 2 checks in the same container:
+- `docker exec raftros-test bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID=0; export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTRTPS_DEFAULT_PROFILES_FILE=/workspace/scripts/fastdds_profile.xml; ros2 node list --no-daemon --spin-time 25'`
+- `docker exec raftros-test bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID=0; export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTRTPS_DEFAULT_PROFILES_FILE=/workspace/scripts/fastdds_profile.xml; ros2 topic list --no-daemon --spin-time 15'`
+- `docker exec raftros-test bash -lc 'source /opt/ros/humble/setup.bash; export ROS_DOMAIN_ID=0; export RMW_IMPLEMENTATION=rmw_fastrtps_cpp; export FASTRTPS_DEFAULT_PROFILES_FILE=/workspace/scripts/fastdds_profile.xml; timeout 30 ros2 topic echo /chatter std_msgs/msg/String --once --no-daemon'`
+
+Expected pass indicators:
+- `/raft_linux` appears in `ros2 node list`
+- `/chatter` appears in `ros2 topic list`
+- one chatter sample is printed by `ros2 topic echo --once`
+
+Latest run (2026-04-20) passed with:
+- `ros2 node list`: `/raft_linux`
+- `ros2 topic list`: `/chatter`, `/parameter_events`, `/rosout`
+- `ros2 topic echo /chatter --once`: `data: Hello from raft_linux [41]`
+
 ### Root Cause Found for Previous "Not Publishing" Symptom
 
 - The primary blocker observed in earlier docker testing was host/container network separation (discovery traffic from host IP space did not reach container DDS participants as expected in that setup).
 - This was not primarily caused by ACKNACK logic.
+- Practical implication: do not use host-publisher + container-subscriber as the primary pass/fail gate for linux docker validation in this environment; keep publisher and ROS 2 validation tools in the same container namespace.
 
 ### Remaining Gap
 
@@ -162,10 +193,46 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 - Completed: full shared receive-submessage execution runner in `RTPSRxSubmessageRunner.*` now centralizes RTPS header parse, submessage iteration, HEARTBEAT->ACKNACK response generation, ACKNACK handoff, and DATA/other-submessage dispatch hooks. ESP32 and Linux wrappers now provide channel-specific callback adapters for SPDP parsing, endpoint mapping, socket send, and logging.
 - Completed: shared discovered-participant lookup/routing helper in `RTPSDiscoveredParticipantLookup.*` now centralizes guid-prefix remote lookup and userdata-heartbeat ACK metatraffic-port routing-by-IP; both ESP32 and Linux wrappers now use this helper in ACKNACK remote resolution and receive-path ACK destination resolution.
 - Completed: shared callback-adapter scaffolding in `RTPSRunnerAdapterHelpers.*` now centralizes base `RTPSRxSubmessageRunner` callback wiring (local guid, reader-map policy, ACK destination policy, ACK socket send) and `RTPSAckNackRunner` remote participant resolution callback behavior. ESP32 and Linux wrappers now set policy/context and provide only behavior-specific hooks.
+- Started: Phase 1 discovery-module consolidation with new cohesive module entry point:
+	- `components/RaftROS/RTPS/runtime/discovery/RTPSDiscoveryRuntime.h/.cpp`
+	- ESP and Linux wrappers now call `DiscoveryRuntime` for participant merge, activation side effects, and lease-expiry checks.
+	- `RTPSRunnerAdapterHelpers` now resolves discovered participants and metatraffic ACK destination via `DiscoveryRuntime` APIs.
+- Continued: `DiscoveryRuntime` is now the discovery source-of-truth implementation for merge/lookup/lease/activation behavior; legacy micro-helper files (`RTPSDiscoveryPolicy`, `RTPSDiscoveredParticipantLookup`, `RTPSParticipantLeasePolicy`, `RTPSParticipantLifecycle`, `RTPSParticipantSetPolicy`) were converted to compatibility wrappers delegating to `DiscoveryRuntime`.
+- Started: Phase 2 reliability-module consolidation with new source-of-truth module entry point:
+	- `components/RaftROS/RTPS/runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h/.cpp`
+	- Legacy reliability helpers (`RTPSReliabilityPolicy`, `RTPSAckNack`, `RTPSBuiltinEndpointMap`) now delegate to this reliability module via compatibility wrappers.
+- Continued: `RTPSAckNackRunner` retransmit-decision branching is now centralized in `RTPSReliabilityAndWriterStateRuntime::evaluateAckNackActions(...)`; the runner now acts as a thin adapter that performs parse/log/remote-resolve and dispatches runtime-selected actions via existing callbacks.
+- Continued: shared ACKNACK action execution adapter added in `RTPSRunnerAdapterHelpers` (`RTPSRunnerAdapter_executeAckAction(...)` plus per-action build/send specs). ESP (`RaftROS.cpp`) and Linux standalone (`raftros_standalone.cpp`) now use this shared execution path for destination selection and socket-send dispatch, while keeping wrapper-specific payload builders.
+- Continued: ACKNACK writer-heartbeat mutation policy is now centralized in reliability runtime (`applyAckActionHeartbeatMutation(...)`) and applied by the shared ACK execution adapter using wrapper-configured mutation profiles (ESP vs Linux behavior preserved via policy flags).
+- Continued: ACKNACK action log-label/result-label mapping is now centralized in `RTPSRunnerAdapterHelpers` (`RTPSRunnerAdapter_ackActionLogLabel(...)`, `RTPSRunnerAdapter_ackActionResultLabel(...)`), reducing wrapper-local per-action logging switch logic in ESP and Linux handlers.
+- Continued: ACKNACK SEDP retransmit endpoint metadata (entity/topic/type/QoS for ros_discovery_info and chatter announcement actions) is now centralized in reliability runtime (`getAckActionSedpPublicationProfile(...)`, `getAckActionSedpSubscriptionProfile(...)`), and both wrappers now consume runtime-provided profiles in ACK action builders.
+- Continued: ACKNACK SEDP retransmit sequence-number selection is now centralized in reliability runtime (`getAckActionSedpSequenceNumber(...)`) via per-wrapper sequence-context policy; Linux `sedpSeqNum + 1` chatter compatibility behavior is preserved via context policy flag rather than wrapper-local arithmetic.
+- Continued: ACKNACK user-data payload debug instrumentation policy is now centralized via shared adapter debug policy (`RTPSRunnerAdapter_shouldDumpAckPayload(...)`, `RTPSRunnerAdapter_logHexPayload(...)`); Linux enables ros_discovery_info payload hex-dump through policy, ESP keeps it disabled.
+- Continued: ACKNACK SEDP action builder scaffolding is reduced via runtime combined plan resolver (`getAckActionSedpPlan(...)`) that returns endpoint metadata + sequence number together; wrappers now initialize sequence context once and consume a single per-action plan in SEDP ACK builders.
+- Continued: ACKNACK user-data action envelope policy is now centralized in reliability runtime (`getAckActionUserDataPlan(...)`) with per-wrapper sequence context and optional firstSN override policy; wrappers now consume runtime writer/sequence/firstSN plans for both ros_discovery_info and chatter ACK data retransmits.
+- Continued: ACKNACK context initialization boilerplate is reduced through shared setup helpers (`RTPSRunnerAdapter_initAckExecContext(...)`, `makeAckSedpSequenceContext(...)`, `makeAckUserDataSequenceContext(...)`); wrappers now declare concise init configs instead of manually setting each context field.
+- Continued: ACKNACK callback-bundle wiring is now centralized via `RTPSRunnerAdapter_initAckCallbacks(...)`, so wrappers provide a compact function-pointer callback init config while shared code applies common remote-resolution wiring. This keeps the implementation ESP32-friendly (no dynamic allocation, stack-only context, static callback wiring).
+- Continued: ACKNACK hex-dump debug instrumentation is now compile-time gated in shared adapter helpers via `RAFTROS_ACK_HEX_DUMP_ENABLE` (default OFF for embedded builds). Linux unit-test build explicitly enables this flag in `linux_unit_tests/Makefile` to preserve developer diagnostics while keeping ESP32 release builds lean.
+- Continued: ACKNACK verbose action/result log labels are now compile-time gated via `RAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE` (default OFF for embedded builds). Linux unit-test build explicitly enables this flag so local diagnostics remain detailed without forcing verbose strings into embedded firmware builds.
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after receive-runner extraction (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after lookup-helper extraction (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after runner-adapter scaffolding extraction (**85 passed, 0 failed**).
-- Next: continue convergence by extracting shared submessage logging policy helpers (name mapping + channel-specific formatting) and shared retransmit send-target helper wrappers to further reduce wrapper-only lambda code.
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after DiscoveryRuntime Phase 1 start (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after DiscoveryRuntime source-of-truth/wrapper conversion (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK runtime decision-planner extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK shared action-execution adapter extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK heartbeat-mutation policy extraction into reliability runtime (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK shared log-label policy extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK SEDP endpoint metadata extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK SEDP sequence-policy extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK payload debug-policy extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK SEDP combined-plan extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK user-data combined-plan extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK context-init helper extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACK callback-bundle init extraction (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after compile-time ACK hex-dump gating (**85 passed, 0 failed**).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after compile-time ACK verbose label gating (**85 passed, 0 failed**).
+- Next: continue Phase 2 by moving remaining writer-state/reliability action-execution policy behind `RTPSReliabilityAndWriterStateRuntime` while preserving wrapper callback APIs.
 
 ### Practical Rule
 

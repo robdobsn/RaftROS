@@ -2,7 +2,7 @@
 CC = g++
 
 # Compiler flags
-CFLAGS = -Wall -std=c++20 -lc -g -DRAFT_CORE
+CFLAGS = -Wall -std=c++20 -lc -g -DRAFT_CORE -DRAFTROS_ACK_HEX_DUMP_ENABLE=1 -DRAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE=1
 
 # Include paths
 INCLUDES = -I../components/RaftROS -I../components/RaftROS/RTPS -I../components/RaftROS/CDR -I./RaftCore/components/core/Utils -I./RaftCore/components/core/ArduinoUtils -I.
@@ -29,6 +29,8 @@ SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/RTPS/RTPSWriterHeartbeatRunner.cpp \
 	../components/RaftROS/RTPS/RTPSRxSubmessageRunner.cpp \
 	../components/RaftROS/RTPS/RTPSRunnerAdapterHelpers.cpp \
+	../components/RaftROS/RTPS/runtime/discovery/RTPSDiscoveryRuntime.cpp \
+	../components/RaftROS/RTPS/runtime/reliability/RTPSReliabilityAndWriterStateRuntime.cpp \
 	../components/RaftROS/RTPS/SEDPHandler.cpp
 
 # Object files
@@ -64,6 +66,8 @@ PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/RTPS/RTPSWriterHeartbeatRunner.cpp \
 	../components/RaftROS/RTPS/RTPSRxSubmessageRunner.cpp \
 	../components/RaftROS/RTPS/RTPSRunnerAdapterHelpers.cpp \
+	../components/RaftROS/RTPS/runtime/discovery/RTPSDiscoveryRuntime.cpp \
+	../components/RaftROS/RTPS/runtime/reliability/RTPSReliabilityAndWriterStateRuntime.cpp \
 	../components/RaftROS/RTPS/SEDPHandler.cpp
 PROTO_OBJECTS = $(PROTO_SOURCES:.cpp=.o)
 
