@@ -1,21 +1,13 @@
 #include "RTPSDiscoveredParticipantLookup.h"
 
-#include <string.h>
-#include <arpa/inet.h>
+#include "runtime/discovery/RTPSDiscoveryRuntime.h"
 
 const DiscoveredParticipant* RTPSDiscoveredParticipantLookup_findByGuidPrefix(
     const std::vector<DiscoveredParticipant>& discovered,
     const uint8_t* guidPrefix)
 {
-    if (!guidPrefix)
-        return nullptr;
-
-    for (const auto& dp : discovered)
-    {
-        if (memcmp(dp.guidPrefix, guidPrefix, 12) == 0)
-            return &dp;
-    }
-    return nullptr;
+    return RaftROS::RTPS::Runtime::DiscoveryRuntime::findByGuidPrefix(
+        discovered, guidPrefix);
 }
 
 bool RTPSDiscoveredParticipantLookup_assignMetatrafficDestByIp(
@@ -23,14 +15,6 @@ bool RTPSDiscoveredParticipantLookup_assignMetatrafficDestByIp(
     const struct sockaddr_in& fromAddr,
     struct sockaddr_in& outDest)
 {
-    outDest = fromAddr;
-    for (const auto& dp : discovered)
-    {
-        if (dp.ipAddr == fromAddr.sin_addr.s_addr)
-        {
-            outDest.sin_port = htons(dp.metatrafficPort);
-            return true;
-        }
-    }
-    return false;
+    return RaftROS::RTPS::Runtime::DiscoveryRuntime::assignMetatrafficDestByIp(
+        discovered, fromAddr, outDest);
 }

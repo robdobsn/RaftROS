@@ -1,5 +1,61 @@
 #include "RTPSAckNackRunner.h"
-#include "RTPSReliabilityPolicy.h"
+
+#include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
+
+namespace
+{
+
+struct RTPSAckNackRunnerEmitCtx
+{
+    const RTPSAckNackRunnerCallbacks* callbacks = nullptr;
+    void* userCtx = nullptr;
+    const RTPSAckNackFields* fields = nullptr;
+    RTPSAckNackWriterKind writerKind = RTPSAckNackWriterKind::Unknown;
+};
+
+bool RTPSAckNackRunner_mapRuntimeAction(
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction runtimeAction,
+    RTPSAckNackRunnerAction& runnerAction)
+{
+    using RuntimeAction = RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction;
+    switch (runtimeAction)
+    {
+        case RuntimeAction::RetransmitSedpRosDiscoveryPublication:
+            runnerAction = RTPSAckNackRunnerAction::RetransmitSedpRosDiscoveryPublication;
+            return true;
+        case RuntimeAction::RetransmitSedpChatterPublication:
+            runnerAction = RTPSAckNackRunnerAction::RetransmitSedpChatterPublication;
+            return true;
+        case RuntimeAction::RetransmitSedpRosDiscoverySubscription:
+            runnerAction = RTPSAckNackRunnerAction::RetransmitSedpRosDiscoverySubscription;
+            return true;
+        case RuntimeAction::RetransmitRosDiscoveryInfo:
+            runnerAction = RTPSAckNackRunnerAction::RetransmitRosDiscoveryInfo;
+            return true;
+        case RuntimeAction::RetransmitChatterData:
+            runnerAction = RTPSAckNackRunnerAction::RetransmitChatterData;
+            return true;
+        default:
+            return false;
+    }
+}
+
+void RTPSAckNackRunner_emitAction(
+    void* emitCtx,
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction runtimeAction)
+{
+    auto* ctx = static_cast<RTPSAckNackRunnerEmitCtx*>(emitCtx);
+    if (!ctx || !ctx->callbacks || !ctx->callbacks->executeAction || !ctx->fields)
+        return;
+
+    RTPSAckNackRunnerAction runnerAction;
+    if (!RTPSAckNackRunner_mapRuntimeAction(runtimeAction, runnerAction))
+        return;
+
+    ctx->callbacks->executeAction(ctx->userCtx, runnerAction, *ctx->fields, ctx->writerKind);
+}
+
+}
 
 void RTPSAckNackRunner_run(
     const uint8_t* srcGuidPrefix,
@@ -27,73 +83,23 @@ void RTPSAckNackRunner_run(
     if (!callbacks.executeAction)
         return;
 
-    switch (writerKind)
-    {
-        case RTPSAckNackWriterKind::SedpPublications:
-        {
-            const bool gatePass = !options.requirePublicationSeq2GateForRetransmit ||
-                                  RTPSReliability_acknackRequestsSeq(fields.bitmapBaseLow, 2);
-            if (!gatePass)
-                return;
+    RTPSAckNackRunnerEmitCtx emitCtx;
+    emitCtx.callbacks = &callbacks;
+    emitCtx.userCtx = userCtx;
+    emitCtx.fields = &fields;
+    emitCtx.writerKind = writerKind;
 
-            if (RTPSReliability_acknackRequestsSeq(fields.bitmapBaseLow, 1))
-            {
-                callbacks.executeAction(
-                    userCtx,
-                    RTPSAckNackRunnerAction::RetransmitSedpRosDiscoveryPublication,
-                    fields,
-                    writerKind);
-            }
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions runtimeOptions;
+    runtimeOptions.publicationsIncludesChatterAnnouncement = options.publicationsIncludesChatterAnnouncement;
+    runtimeOptions.requirePublicationSeq2GateForRetransmit =
+        options.requirePublicationSeq2GateForRetransmit;
 
-            if (options.publicationsIncludesChatterAnnouncement &&
-                RTPSReliability_acknackRequestsSeq(fields.bitmapBaseLow, 2))
-            {
-                callbacks.executeAction(
-                    userCtx,
-                    RTPSAckNackRunnerAction::RetransmitSedpChatterPublication,
-                    fields,
-                    writerKind);
-            }
-            return;
-        }
-
-        case RTPSAckNackWriterKind::SedpSubscriptions:
-            if (RTPSReliability_acknackRequestsSeq(fields.bitmapBaseLow, 1))
-            {
-                callbacks.executeAction(
-                    userCtx,
-                    RTPSAckNackRunnerAction::RetransmitSedpRosDiscoverySubscription,
-                    fields,
-                    writerKind);
-            }
-            return;
-
-        case RTPSAckNackWriterKind::RosDiscoveryInfo:
-            if (RTPSReliability_acknackRequestsSeq(fields.bitmapBaseLow, 1))
-            {
-                callbacks.executeAction(
-                    userCtx,
-                    RTPSAckNackRunnerAction::RetransmitRosDiscoveryInfo,
-                    fields,
-                    writerKind);
-            }
-            return;
-
-        case RTPSAckNackWriterKind::Chatter:
-        {
-            const uint64_t chatterSeq = callbacks.getChatterSeq ? callbacks.getChatterSeq(userCtx) : 0;
-            if ((chatterSeq > 0) && RTPSReliability_acknackRequestsSeq(fields.bitmapBaseLow, chatterSeq))
-            {
-                callbacks.executeAction(
-                    userCtx,
-                    RTPSAckNackRunnerAction::RetransmitChatterData,
-                    fields,
-                    writerKind);
-            }
-            return;
-        }
-
-        default:
-            return;
-    }
+    const uint64_t chatterSeq = callbacks.getChatterSeq ? callbacks.getChatterSeq(userCtx) : 0;
+    RaftROS::RTPS::Runtime::ReliabilityAndWriterState::evaluateAckNackActions(
+        fields,
+        writerKind,
+        runtimeOptions,
+        chatterSeq,
+        RTPSAckNackRunner_emitAction,
+        &emitCtx);
 }

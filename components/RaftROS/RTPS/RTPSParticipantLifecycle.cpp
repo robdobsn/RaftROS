@@ -1,11 +1,18 @@
 #include "RTPSParticipantLifecycle.h"
 
+#include "runtime/discovery/RTPSDiscoveryRuntime.h"
+
 bool RTPSParticipantLifecycle_shouldActivate(bool isCurrentlyActive, uint32_t discoveredCount)
 {
-    return !isCurrentlyActive && (discoveredCount > 0);
+    return RaftROS::RTPS::Runtime::DiscoveryRuntime::applyParticipantSetPolicy(
+               isCurrentlyActive,
+               discoveredCount,
+               false,
+               false)
+        .shouldBeActive;
 }
 
 void RTPSParticipantLifecycle_onActivated(uint32_t& lastWriterHeartbeatMs)
 {
-    lastWriterHeartbeatMs = 0;
+    RaftROS::RTPS::Runtime::DiscoveryRuntime::onActivated(lastWriterHeartbeatMs);
 }
