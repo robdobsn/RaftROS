@@ -64,6 +64,13 @@ RTPSInitialAnnounceSequence RTPSInitialAnnouncePlan_buildSequence(
                    heartbeatForSedp,
                    RTPSSeqCounterHint::SedpChatterWriter);
     }
+    if (plan.sendSedpChatterReader)
+    {
+        appendStep(seq,
+                   RTPSInitialAnnounceAction::SedpChatterReader,
+                   heartbeatForSedp,
+                   RTPSSeqCounterHint::SedpChatterReader);
+    }
     if (plan.sendParticipantMessageData)
     {
         appendStep(seq,
@@ -96,6 +103,7 @@ RTPSInitialAnnounceSendTarget RTPSInitialAnnouncePlan_getSendTarget(
         case RTPSInitialAnnounceAction::SedpRosDiscoveryWriter:
         case RTPSInitialAnnounceAction::SedpRosDiscoveryReader:
         case RTPSInitialAnnounceAction::SedpChatterWriter:
+        case RTPSInitialAnnounceAction::SedpChatterReader:
         case RTPSInitialAnnounceAction::ParticipantMessageData:
             return { RTPSInitialAnnounceSocket::Metatraffic,
                      RTPSInitialAnnounceAddressing::RemoteMetatrafficUnicast };
@@ -127,6 +135,9 @@ RTPSInitialAnnounceBuildSpec RTPSInitialAnnouncePlan_getBuildSpec(
         case RTPSInitialAnnounceAction::SedpChatterWriter:
             return { RTPSInitialAnnounceBuildKind::SedpPublication,
                      RTPSInitialAnnounceSedpEndpointProfile::ChatterWriter };
+        case RTPSInitialAnnounceAction::SedpChatterReader:
+            return { RTPSInitialAnnounceBuildKind::SedpSubscription,
+                     RTPSInitialAnnounceSedpEndpointProfile::ChatterReader };
         case RTPSInitialAnnounceAction::ParticipantMessageData:
             return { RTPSInitialAnnounceBuildKind::ParticipantMessageData,
                      RTPSInitialAnnounceSedpEndpointProfile::None };
@@ -161,6 +172,12 @@ RTPSInitialAnnounceSedpEndpointSpec RTPSInitialAnnouncePlan_getSedpEndpointSpec(
                      CHATTER_DDS_TYPE,
                      RELIABILITY_RELIABLE,
                      DURABILITY_VOLATILE };
+        case RTPSInitialAnnounceSedpEndpointProfile::ChatterReader:
+            return { ENTITYID_CHATTER_READER,
+                     CHATTER_IN_DDS_TOPIC,
+                     CHATTER_IN_DDS_TYPE,
+                     RELIABILITY_RELIABLE,
+                     DURABILITY_VOLATILE };
         default:
             return {};
     }
@@ -179,6 +196,8 @@ RTPSInitialAnnounceLogSpec RTPSInitialAnnouncePlan_getLogSpec(
             return { "SEDP sub", false, true };
         case RTPSInitialAnnounceAction::SedpChatterWriter:
             return { "SEDP chatter pub", false, true };
+        case RTPSInitialAnnounceAction::SedpChatterReader:
+            return { "SEDP chatter sub", false, true };
         case RTPSInitialAnnounceAction::ParticipantMessageData:
             return { "liveliness", false, true };
         default:
@@ -204,6 +223,10 @@ uint64_t RTPSInitialAnnouncePlan_applySequencePolicy(
             if (runtimeFlavor == RTPSInitialAnnounceRuntimeFlavor::LinuxStyle)
                 return counters.sedpRosWriterSeqNum + 1;
             return counters.sedpChatterWriterSeqNum;
+        case RTPSSeqCounterHint::SedpChatterReader:
+            if (runtimeFlavor == RTPSInitialAnnounceRuntimeFlavor::LinuxStyle)
+                return counters.sedpRosReaderSeqNum + 1;
+            return counters.sedpChatterReaderSeqNum;
         case RTPSSeqCounterHint::Liveliness:
             return counters.livelinessSeqNum;
         case RTPSSeqCounterHint::RosDiscoveryUserData:

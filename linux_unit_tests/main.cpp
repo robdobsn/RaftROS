@@ -20,6 +20,13 @@
 #include "runtime/discovery/SPDPHandler.h"
 #include "runtime/announce/SEDPHandler.h"
 #include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
+#include "runtime/reliability/RTPSReaderRuntime.h"
+#include "runtime/reliability/RTPSReaderRunner.h"
+#include "runtime/reliability/RTPSReaderStateMap.h"
+#include "runtime/receive/RTPSRxSubmessageRunner.h"
+#include "runtime/announce/RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSWriterHeartbeatRunner.h"
+#include "runtime/dispatch/RTPSUserDispatch.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -605,6 +612,894 @@ int main()
                     "Linux two SEDP publications on same writer have distinct seq");
         TEST_ASSERT(linuxChatterPlan.sequenceNumber == linuxRosDiscPlan.sequenceNumber + 1,
                     "Linux derives chatter SEDP pub seq = rosDiscovery seq + 1");
+    }
+
+    //=================================================================
+    // Reader runtime: incoming DATA accept/dedup/gap tracking
+    //=================================================================
+    {
+        printf("Test: Reader DATA accept / dedup / gap handling\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+
+        RTPSReaderWriterState st;
+        st.reliabilityKind = RTPSReaderReliabilityKind::Reliable;
+
+        // First DATA SN=1 is the next-expected sample -> Accept; contiguous advances.
+        RTPSReaderDataFields d1; d1.writerSeqNum = 1;
+        TEST_ASSERT(evaluateIncomingDataDecision(st, d1) == RTPSReaderDataAction::Accept,
+                    "first DATA SN=1 accepted");
+        applyAcceptedDataToReaderState(st, 1);
+        TEST_ASSERT(st.highestContiguousSeq == 1, "contiguous advances to 1");
+        TEST_ASSERT(st.receivedBitmap == 0, "bitmap empty after contiguous advance");
+
+        // Re-delivery of SN=1 is dedup.
+        TEST_ASSERT(evaluateIncomingDataDecision(st, d1) == RTPSReaderDataAction::Dedup,
+                    "duplicate DATA SN=1 deduped");
+
+        // SN=3 arrives before SN=2 -> Accept but held in bitmap; contiguous stays at 1.
+        RTPSReaderDataFields d3; d3.writerSeqNum = 3;
+        TEST_ASSERT(evaluateIncomingDataDecision(st, d3) == RTPSReaderDataAction::Accept,
+                    "out-of-order DATA SN=3 accepted");
+        applyAcceptedDataToReaderState(st, 3);
+        TEST_ASSERT(st.highestContiguousSeq == 1, "contiguous remains 1 with gap at 2");
+        TEST_ASSERT(st.highestSeenSeq == 3, "highestSeen advances to 3");
+        TEST_ASSERT((st.receivedBitmap & 0x2ULL) != 0,
+                    "bitmap marks SN=3 (offset 1 from base 2)");
+
+        // Re-delivery of SN=3 while held -> dedup.
+        TEST_ASSERT(evaluateIncomingDataDecision(st, d3) == RTPSReaderDataAction::Dedup,
+                    "duplicate held DATA SN=3 deduped");
+
+        // Missing SN=2 arrives -> Accept and window collapses up to SN=3.
+        RTPSReaderDataFields d2; d2.writerSeqNum = 2;
+        TEST_ASSERT(evaluateIncomingDataDecision(st, d2) == RTPSReaderDataAction::Accept,
+                    "gap-filling DATA SN=2 accepted");
+        applyAcceptedDataToReaderState(st, 2);
+        TEST_ASSERT(st.highestContiguousSeq == 3,
+                    "contiguous collapses through held SN=3");
+        TEST_ASSERT(st.receivedBitmap == 0, "bitmap empty after collapse");
+    }
+
+    //=================================================================
+    // Reader runtime: HEARTBEAT -> ACKNACK decision
+    //=================================================================
+    {
+        printf("Test: Reader HEARTBEAT -> ACKNACK decision\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+
+        RTPSReaderWriterState st;
+        st.reliabilityKind = RTPSReaderReliabilityKind::Reliable;
+
+        // Writer announces [1..5]; reader has nothing -> ACKNACK base=1, 5 missing bits all zero.
+        RTPSReaderHeartbeatFields hb;
+        hb.firstSN = 1;
+        hb.lastSN = 5;
+        hb.count = 1;
+        hb.finalFlag = false;
+        hb.livelinessFlag = false;
+        auto d = evaluateIncomingHeartbeatDecision(st, hb);
+        TEST_ASSERT(d.sendAckNack, "HB announces gap, reader must ACKNACK");
+        TEST_ASSERT(d.ackNackBase == 1, "ACKNACK base = 1 (first missing)");
+        TEST_ASSERT(d.ackNackNumBits == 5, "ACKNACK numBits covers [1..5]");
+        TEST_ASSERT(d.ackNackBitmap == 0, "no SNs received -> all NACK bits clear");
+        TEST_ASSERT(d.ackNackCount == 1, "outgoing count starts at 1");
+
+        // Apply and record SN=1,2,3 received.
+        applyHeartbeatProcessedToReaderState(st, hb, /*ackNackSent*/ true);
+        applyAcceptedDataToReaderState(st, 1);
+        applyAcceptedDataToReaderState(st, 2);
+        applyAcceptedDataToReaderState(st, 3);
+        TEST_ASSERT(st.highestContiguousSeq == 3, "contiguous after 1,2,3 = 3");
+
+        // Same HB again (count unchanged, FINAL clear) -> still NACK [4..5].
+        hb.count = 1;
+        d = evaluateIncomingHeartbeatDecision(st, hb);
+        TEST_ASSERT(d.sendAckNack, "HB without FINAL still requires ACKNACK");
+        TEST_ASSERT(d.ackNackBase == 4, "ACKNACK base = 4 (next missing)");
+        TEST_ASSERT(d.ackNackNumBits == 2, "numBits covers [4..5]");
+        TEST_ASSERT(d.ackNackBitmap == 0, "no SNs in [4..5] received");
+
+        // HB with FINAL and same count -> no reply (writer already knows our state).
+        hb.finalFlag = true;
+        d = evaluateIncomingHeartbeatDecision(st, hb);
+        TEST_ASSERT(!d.sendAckNack,
+                    "duplicate FINAL heartbeat requires no reply");
+
+        // Reader catches up to SN=5; HB with FINAL+same-count still quiet.
+        applyAcceptedDataToReaderState(st, 4);
+        applyAcceptedDataToReaderState(st, 5);
+        d = evaluateIncomingHeartbeatDecision(st, hb);
+        TEST_ASSERT(!d.sendAckNack,
+                    "caught-up reader: FINAL duplicate HB produces no ACKNACK");
+
+        // Writer advances count (new HB) with FINAL clear while reader fully caught up ->
+        // empty confirmation ACKNACK base = lastSN+1, numBits = 0.
+        hb.count = 2;
+        hb.finalFlag = false;
+        d = evaluateIncomingHeartbeatDecision(st, hb);
+        TEST_ASSERT(d.sendAckNack, "new HB without FINAL elicits confirmation ACKNACK");
+        TEST_ASSERT(d.ackNackBase == 6 && d.ackNackNumBits == 0,
+                    "confirmation ACKNACK base=lastSN+1 with numBits=0");
+
+        // Best-effort reader never ACKNACKs.
+        RTPSReaderWriterState be;
+        be.reliabilityKind = RTPSReaderReliabilityKind::BestEffort;
+        hb.finalFlag = false;
+        hb.count = 1;
+        d = evaluateIncomingHeartbeatDecision(be, hb);
+        TEST_ASSERT(!d.sendAckNack,
+                    "best-effort reader never emits ACKNACK");
+    }
+
+    //=================================================================
+    // Reader runner: HEARTBEAT/DATA submessage parsing + orchestration
+    //=================================================================
+    {
+        printf("Test: Reader runner HEARTBEAT submessage parse\n");
+
+        // HEARTBEAT content layout: readerEID(4) writerEID(4) firstSN(8) lastSN(8) count(4)
+        uint8_t hbContent[28] = {0};
+        // readerEID
+        hbContent[0] = 0x00; hbContent[1] = 0x00; hbContent[2] = 0x01; hbContent[3] = 0x07;
+        // writerEID
+        hbContent[4] = 0x00; hbContent[5] = 0x00; hbContent[6] = 0x01; hbContent[7] = 0x02;
+        // firstSN = 3 (LE, high then low)
+        hbContent[8] = 0; hbContent[9] = 0; hbContent[10] = 0; hbContent[11] = 0;
+        hbContent[12] = 3; hbContent[13] = 0; hbContent[14] = 0; hbContent[15] = 0;
+        // lastSN = 7
+        hbContent[16] = 0; hbContent[17] = 0; hbContent[18] = 0; hbContent[19] = 0;
+        hbContent[20] = 7; hbContent[21] = 0; hbContent[22] = 0; hbContent[23] = 0;
+        // count = 42
+        hbContent[24] = 42; hbContent[25] = 0; hbContent[26] = 0; hbContent[27] = 0;
+
+        RTPSReaderHeartbeatParsed parsed;
+        TEST_ASSERT(RTPSReaderRunner_parseHeartbeat(hbContent, sizeof(hbContent),
+                                                     /*flags*/ 0x01, parsed),
+                    "HEARTBEAT parse succeeds at min length");
+        TEST_ASSERT(parsed.fields.firstSN == 3, "firstSN decoded");
+        TEST_ASSERT(parsed.fields.lastSN == 7, "lastSN decoded");
+        TEST_ASSERT(parsed.fields.count == 42, "count decoded");
+        TEST_ASSERT(!parsed.fields.finalFlag, "no FINAL flag");
+        TEST_ASSERT(!parsed.fields.livelinessFlag, "no LIVELINESS flag");
+
+        // FINAL flag (bit 1) + LIVELINESS flag (bit 2).
+        TEST_ASSERT(RTPSReaderRunner_parseHeartbeat(hbContent, sizeof(hbContent),
+                                                     /*flags*/ 0x01 | 0x02 | 0x04, parsed),
+                    "HEARTBEAT parse with FINAL+LIVELINESS");
+        TEST_ASSERT(parsed.fields.finalFlag, "FINAL flag propagated");
+        TEST_ASSERT(parsed.fields.livelinessFlag, "LIVELINESS flag propagated");
+
+        // Short content rejected.
+        TEST_ASSERT(!RTPSReaderRunner_parseHeartbeat(hbContent, 27, 0x01, parsed),
+                    "short HEARTBEAT content rejected");
+    }
+
+    {
+        printf("Test: Reader runner DATA submessage parse\n");
+
+        // DATA content layout (D-flag set, no inline QoS):
+        // extraFlags(2) octetsToInlineQos(2) readerEID(4) writerEID(4) writerSN(8) [payload]
+        // octetsToInlineQos = 16 (from start of readerEID to start of payload when no inline QoS)
+        const uint8_t payloadBytes[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x02, 0x03, 0x04 };
+        uint8_t dataContent[20 + sizeof(payloadBytes)] = {0};
+        // extraFlags = 0
+        dataContent[0] = 0; dataContent[1] = 0;
+        // octetsToInlineQos = 16
+        dataContent[2] = 16; dataContent[3] = 0;
+        // readerEID
+        dataContent[4] = 0x00; dataContent[5] = 0x00; dataContent[6] = 0x00; dataContent[7] = 0x04;
+        // writerEID
+        dataContent[8] = 0x00; dataContent[9] = 0x00; dataContent[10] = 0x00; dataContent[11] = 0x03;
+        // writerSN = 99
+        dataContent[12] = 0; dataContent[13] = 0; dataContent[14] = 0; dataContent[15] = 0;
+        dataContent[16] = 99; dataContent[17] = 0; dataContent[18] = 0; dataContent[19] = 0;
+        // payload
+        memcpy(dataContent + 20, payloadBytes, sizeof(payloadBytes));
+
+        RTPSReaderDataParsed parsed;
+        // flags: E=1, D=1 (0x01 | 0x04 = 0x05)
+        TEST_ASSERT(RTPSReaderRunner_parseData(dataContent, sizeof(dataContent),
+                                                /*flags*/ 0x05, parsed),
+                    "DATA parse succeeds with D flag");
+        TEST_ASSERT(parsed.fields.writerSeqNum == 99, "writerSN decoded");
+        TEST_ASSERT(parsed.payload != nullptr, "payload pointer set");
+        TEST_ASSERT(parsed.payloadLen == sizeof(payloadBytes), "payload length correct");
+        TEST_ASSERT(parsed.payload[0] == 0xDE && parsed.payload[3] == 0xEF,
+                    "payload bytes match source buffer");
+
+        // No D flag -> no payload exposed.
+        TEST_ASSERT(RTPSReaderRunner_parseData(dataContent, sizeof(dataContent),
+                                                /*flags*/ 0x01, parsed),
+                    "DATA parse without D flag still succeeds (header only)");
+        TEST_ASSERT(parsed.payload == nullptr && parsed.payloadLen == 0,
+                    "no D flag -> no payload");
+
+        // Short content rejected.
+        TEST_ASSERT(!RTPSReaderRunner_parseData(dataContent, 19, 0x05, parsed),
+                    "short DATA content rejected");
+    }
+
+    {
+        printf("Test: Reader runner orchestration - HEARTBEAT dispatches to state + sends ACKNACK\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+
+        struct Ctx {
+            RTPSReaderWriterState state;
+            int resolveCalls = 0;
+            int sendCalls = 0;
+            int observerCalls = 0;
+            RTPSReaderHeartbeatDecision lastDecision{};
+            const uint8_t* lastWriterEID = nullptr;
+        } ctx;
+        ctx.state.reliabilityKind = RTPSReaderReliabilityKind::Reliable;
+
+        RTPSReaderRunnerCallbacks cb;
+        cb.resolveState = [](void* u, const uint8_t*, const uint8_t* wEID) -> RTPSReaderWriterState* {
+            auto* c = static_cast<Ctx*>(u);
+            c->resolveCalls++;
+            c->lastWriterEID = wEID;
+            return &c->state;
+        };
+        cb.sendAckNack = [](void* u, const uint8_t*, const uint8_t*, const uint8_t*,
+                             const RTPSReaderHeartbeatDecision& d) {
+            auto* c = static_cast<Ctx*>(u);
+            c->sendCalls++;
+            c->lastDecision = d;
+        };
+        cb.onHeartbeatParsed = [](void* u, const RTPSReaderHeartbeatParsed&,
+                                   const RTPSReaderHeartbeatDecision&) {
+            static_cast<Ctx*>(u)->observerCalls++;
+        };
+
+        // Build HB content announcing SNs [1..3], count=1, no FINAL.
+        uint8_t hbContent[28] = {0};
+        hbContent[6] = 0x01; hbContent[7] = 0x02; // writerEID marker
+        hbContent[12] = 1;  // firstSN low = 1
+        hbContent[20] = 3;  // lastSN low = 3
+        hbContent[24] = 1;  // count = 1
+
+        uint8_t srcPrefix[12] = {0xAA, 0xBB, 0xCC, 0xDD, 0, 0, 0, 0, 0, 0, 0, 0};
+        RTPSReaderRunner_onHeartbeat(srcPrefix, hbContent, sizeof(hbContent),
+                                      /*flags*/ 0x01, cb, &ctx);
+
+        TEST_ASSERT(ctx.resolveCalls == 1, "resolveState called once");
+        TEST_ASSERT(ctx.sendCalls == 1, "ACKNACK send invoked (gap detected)");
+        TEST_ASSERT(ctx.observerCalls == 1, "observer invoked");
+        TEST_ASSERT(ctx.lastWriterEID == hbContent + 4, "writerEID points into content");
+        TEST_ASSERT(ctx.lastDecision.ackNackBase == 1, "ACKNACK base = 1");
+        TEST_ASSERT(ctx.lastDecision.ackNackNumBits == 3, "ACKNACK numBits = 3");
+        TEST_ASSERT(ctx.state.lastHeartbeatCount == 1, "HB count recorded in state");
+        TEST_ASSERT(ctx.state.outgoingAckNackCount == 1, "outgoing ACKNACK count advanced");
+
+        // Same HB again with FINAL -> no send (duplicate), but state still touched.
+        ctx.sendCalls = 0;
+        hbContent[24] = 1; // count unchanged
+        RTPSReaderRunner_onHeartbeat(srcPrefix, hbContent, sizeof(hbContent),
+                                      /*flags*/ 0x01 | 0x02, cb, &ctx);
+        TEST_ASSERT(ctx.sendCalls == 0, "duplicate FINAL HB -> no ACKNACK send");
+
+        // Null resolver -> early exit, no send.
+        ctx.resolveCalls = 0;
+        ctx.sendCalls = 0;
+        RTPSReaderRunnerCallbacks cb2 = cb;
+        cb2.resolveState = [](void*, const uint8_t*, const uint8_t*) -> RTPSReaderWriterState* { return nullptr; };
+        RTPSReaderRunner_onHeartbeat(srcPrefix, hbContent, sizeof(hbContent), 0x01, cb2, &ctx);
+        TEST_ASSERT(ctx.sendCalls == 0, "null state -> no ACKNACK");
+    }
+
+    {
+        printf("Test: Reader runner orchestration - DATA accept/dedup dispatches to user\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+
+        struct Ctx {
+            RTPSReaderWriterState state;
+            int acceptDispatches = 0;
+            RTPSReaderDataAction lastAction = RTPSReaderDataAction::Drop;
+            uint64_t lastAcceptedSN = 0;
+        } ctx;
+
+        RTPSReaderRunnerCallbacks cb;
+        cb.resolveState = [](void* u, const uint8_t*, const uint8_t*) -> RTPSReaderWriterState* {
+            return &static_cast<Ctx*>(u)->state;
+        };
+        cb.dispatchData = [](void* u, const uint8_t*, const RTPSReaderDataParsed& p) {
+            auto* c = static_cast<Ctx*>(u);
+            c->acceptDispatches++;
+            c->lastAcceptedSN = p.fields.writerSeqNum;
+        };
+        cb.onDataDecision = [](void* u, const RTPSReaderDataParsed&, RTPSReaderDataAction a) {
+            static_cast<Ctx*>(u)->lastAction = a;
+        };
+
+        // Build DATA content for SN=1 with 4-byte payload.
+        uint8_t dataContent[20 + 4] = {0};
+        dataContent[2] = 16; // octetsToInlineQos
+        dataContent[16] = 1; // writerSN low = 1
+        dataContent[20] = 0xAB;
+        dataContent[21] = 0xCD;
+        dataContent[22] = 0xEF;
+        dataContent[23] = 0x01;
+
+        uint8_t srcPrefix[12] = {0};
+        // flags: E | D
+        RTPSReaderRunner_onData(srcPrefix, dataContent, sizeof(dataContent), 0x05, cb, &ctx);
+        TEST_ASSERT(ctx.lastAction == RTPSReaderDataAction::Accept, "first DATA accepted");
+        TEST_ASSERT(ctx.acceptDispatches == 1, "dispatchData called once");
+        TEST_ASSERT(ctx.lastAcceptedSN == 1, "dispatched SN = 1");
+        TEST_ASSERT(ctx.state.highestContiguousSeq == 1, "state advanced");
+
+        // Re-send same SN -> dedup, no dispatch.
+        RTPSReaderRunner_onData(srcPrefix, dataContent, sizeof(dataContent), 0x05, cb, &ctx);
+        TEST_ASSERT(ctx.lastAction == RTPSReaderDataAction::Dedup, "replay -> Dedup");
+        TEST_ASSERT(ctx.acceptDispatches == 1, "dedup does not re-dispatch");
+    }
+
+    //=================================================================
+    // ACKNACK wire builder with explicit bitmap (DDSI-RTPS §9.4.2.7)
+    //=================================================================
+    {
+        printf("Test: ACKNACK with bitmap - empty bitmap equivalence\n");
+
+        const uint8_t readerEID[4] = {0x00, 0x00, 0x01, 0x07};
+        const uint8_t writerEID[4] = {0x00, 0x00, 0x01, 0x02};
+
+        uint8_t bufA[64] = {0};
+        uint8_t bufB[64] = {0};
+
+        // Existing empty-bitmap builder
+        uint32_t lenA = RTPSMessage::writeAcknack(bufA, sizeof(bufA),
+                                                   readerEID, writerEID,
+                                                   /*baseHigh*/ 0, /*baseLow*/ 6,
+                                                   /*count*/ 99);
+        // New bitmap-capable builder with numBits=0, finalFlag=false
+        uint32_t lenB = RTPSMessage::writeAcknackWithBitmap(bufB, sizeof(bufB),
+                                                             readerEID, writerEID,
+                                                             0, 6,
+                                                             /*numBits*/ 0, nullptr,
+                                                             /*count*/ 99,
+                                                             /*finalFlag*/ false);
+        TEST_ASSERT(lenA == 28, "legacy empty ACKNACK is 28 bytes");
+        TEST_ASSERT(lenB == lenA, "bitmap-capable builder matches legacy length for numBits=0");
+        TEST_ASSERT(memcmp(bufA, bufB, lenA) == 0, "byte-for-byte identical to legacy");
+    }
+
+    {
+        printf("Test: ACKNACK with bitmap - payload contents and word packing\n");
+
+        const uint8_t readerEID[4] = {0x00, 0x00, 0x00, 0x04};
+        const uint8_t writerEID[4] = {0x00, 0x00, 0x00, 0x03};
+
+        // numBits=5 so only one bitmap word is emitted. Pattern 0b10110 => NACK SN base+1,2,4.
+        uint32_t bitmapWords[1] = { 0b10110u };
+
+        uint8_t buf[64] = {0};
+        uint32_t len = RTPSMessage::writeAcknackWithBitmap(buf, sizeof(buf),
+                                                            readerEID, writerEID,
+                                                            /*baseHigh*/ 0, /*baseLow*/ 10,
+                                                            /*numBits*/ 5, bitmapWords,
+                                                            /*count*/ 7,
+                                                            /*finalFlag*/ false);
+        // submsg hdr (4) + reader (4) + writer (4) + base (8) + numBits (4) + 1 word (4) + count (4) = 32
+        TEST_ASSERT(len == 32, "numBits=5 -> one bitmap word -> 32 bytes");
+        TEST_ASSERT(buf[0] == SUBMSG_ACKNACK, "submsg id = ACKNACK");
+        TEST_ASSERT(buf[1] == 0x01, "E=1, F=0");
+        // octetsToNextHeader (LE16) at offset 2..3 = 28
+        TEST_ASSERT(buf[2] == 28 && buf[3] == 0, "octetsToNextHeader = 28");
+        // Base LE64 at offset 12..19: high=0 @12, low=10 @16
+        TEST_ASSERT(buf[12] == 0 && buf[16] == 10, "bitmap base encoded LE");
+        // numBits LE32 at offset 20..23 = 5
+        TEST_ASSERT(buf[20] == 5 && buf[21] == 0 && buf[22] == 0 && buf[23] == 0, "numBits = 5");
+        // bitmap word at offset 24..27 = 0b10110 = 0x16
+        TEST_ASSERT(buf[24] == 0x16 && buf[25] == 0 && buf[26] == 0 && buf[27] == 0,
+                    "bitmap word packed little-endian");
+        // count at offset 28..31 = 7
+        TEST_ASSERT(buf[28] == 7 && buf[29] == 0, "count encoded LE");
+    }
+
+    {
+        printf("Test: ACKNACK with bitmap - FINAL flag + multi-word bitmap\n");
+
+        const uint8_t readerEID[4] = {0x00, 0x00, 0x00, 0x04};
+        const uint8_t writerEID[4] = {0x00, 0x00, 0x00, 0x03};
+
+        // numBits=33 forces two bitmap words.
+        uint32_t bitmapWords[2] = { 0xAABBCCDDu, 0x00000001u };
+
+        uint8_t buf[80] = {0};
+        uint32_t len = RTPSMessage::writeAcknackWithBitmap(buf, sizeof(buf),
+                                                            readerEID, writerEID,
+                                                            0, 100,
+                                                            /*numBits*/ 33, bitmapWords,
+                                                            /*count*/ 1,
+                                                            /*finalFlag*/ true);
+        // 4 hdr + 4+4+8+4 + 2*4 + 4 = 36
+        TEST_ASSERT(len == 36, "numBits=33 -> two bitmap words -> 36 bytes");
+        TEST_ASSERT((buf[1] & 0x02) != 0, "FINAL flag (F=1) set");
+        // First bitmap word at offset 24..27 = 0xAABBCCDD (LE)
+        TEST_ASSERT(buf[24] == 0xDD && buf[25] == 0xCC && buf[26] == 0xBB && buf[27] == 0xAA,
+                    "word 0 LE packing");
+        // Second bitmap word at offset 28..31 = 0x00000001
+        TEST_ASSERT(buf[28] == 0x01 && buf[29] == 0 && buf[30] == 0 && buf[31] == 0,
+                    "word 1 LE packing");
+    }
+
+    {
+        printf("Test: ACKNACK with bitmap - input validation\n");
+
+        const uint8_t readerEID[4] = {0};
+        const uint8_t writerEID[4] = {0};
+        uint32_t word = 0;
+
+        uint8_t small[20] = {0};
+        TEST_ASSERT(RTPSMessage::writeAcknackWithBitmap(small, sizeof(small),
+                                                         readerEID, writerEID,
+                                                         0, 1, 0, nullptr, 1, false) == 0,
+                    "buffer too small -> 0");
+
+        uint8_t buf[64] = {0};
+        TEST_ASSERT(RTPSMessage::writeAcknackWithBitmap(buf, sizeof(buf),
+                                                         readerEID, writerEID,
+                                                         0, 1, /*numBits*/ 257, &word, 1, false) == 0,
+                    "numBits > 256 rejected (RTPS spec cap)");
+        TEST_ASSERT(RTPSMessage::writeAcknackWithBitmap(buf, sizeof(buf),
+                                                         readerEID, writerEID,
+                                                         0, 1, /*numBits*/ 1, /*bitmap*/ nullptr,
+                                                         1, false) == 0,
+                    "null bitmap with numBits>0 rejected");
+    }
+
+    //=================================================================
+    // RX submessage runner: opt-in reader-runner delegation path
+    //=================================================================
+    {
+        printf("Test: RX runner opt-in HEARTBEAT delegates to reader runtime + sends bitmap ACKNACK\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+
+        // Build a complete RTPS packet: header + HEARTBEAT submessage.
+        uint8_t pkt[128] = {0};
+        uint8_t srcPrefix[12];
+        for (int i = 0; i < 12; ++i) srcPrefix[i] = (uint8_t)(0xA0 + i);
+        uint32_t pktLen = RTPSMessage::writeHeader(pkt, sizeof(pkt), srcPrefix);
+
+        // HEARTBEAT: firstSN=1, lastSN=3, count=1, flags=E (0x01), no FINAL.
+        const uint8_t readerEIDbytes[4] = { 0x00, 0x00, 0x00, 0x00 };
+        const uint8_t writerEIDbytes[4] = { 0x00, 0x00, 0x12, 0x02 };
+        uint32_t hbLen = RTPSMessage::writeHeartbeat(
+            pkt + pktLen, sizeof(pkt) - pktLen,
+            readerEIDbytes, writerEIDbytes,
+            /*firstSNHigh*/ 0, /*firstSNLow*/ 1,
+            /*lastSNHigh*/ 0, /*lastSNLow*/ 3,
+            /*count*/ 1);
+        TEST_ASSERT(hbLen == 32, "HEARTBEAT submessage built");
+        pktLen += hbLen;
+
+        struct Ctx {
+            RTPSReaderWriterState state;
+            int resolveCalls = 0;
+            int sendCalls = 0;
+            std::vector<uint8_t> lastAck;
+            uint8_t ourReader[4] = { 0x00, 0x00, 0x12, 0x07 };
+            uint8_t localPrefix[12] = {0};
+        } ctx;
+        ctx.state.reliabilityKind = RTPSReaderReliabilityKind::Reliable;
+        for (int i = 0; i < 12; ++i) ctx.localPrefix[i] = (uint8_t)(0x50 + i);
+
+        RTPSRxSubmessageRunnerCallbacks cb{};
+        cb.getLocalGuidPrefix = [](void* u) -> const uint8_t* {
+            return static_cast<Ctx*>(u)->localPrefix;
+        };
+        cb.resolveReaderEID = [](void* u, RTPSRxChannel, const uint8_t*, const uint8_t*) -> const uint8_t* {
+            return static_cast<Ctx*>(u)->ourReader;
+        };
+        cb.resolveAckDest = [](void*, RTPSRxChannel, const struct sockaddr_in&, struct sockaddr_in& out) -> bool {
+            out = {};
+            out.sin_family = AF_INET;
+            return true;
+        };
+        cb.sendAck = [](void* u, const uint8_t* buf, uint32_t len, const struct sockaddr_in&) -> int {
+            auto* c = static_cast<Ctx*>(u);
+            c->sendCalls++;
+            c->lastAck.assign(buf, buf + len);
+            return (int)len;
+        };
+        cb.resolveReaderWriterState = [](void* u, RTPSRxChannel, const uint8_t*, const uint8_t*)
+            -> RTPSReaderWriterState* {
+            auto* c = static_cast<Ctx*>(u);
+            c->resolveCalls++;
+            return &c->state;
+        };
+
+        struct sockaddr_in from = {};
+        from.sin_family = AF_INET;
+        uint32_t ackCount = 0;
+        bool ok = RTPSRxSubmessageRunner_run(pkt, pktLen, from,
+                                              RTPSRxChannel::UserData,
+                                              ackCount, cb, &ctx);
+        TEST_ASSERT(ok, "packet parsed");
+        TEST_ASSERT(ctx.resolveCalls == 1, "resolveReaderWriterState called once");
+        TEST_ASSERT(ctx.sendCalls == 1, "ACKNACK sent via opt-in path");
+        TEST_ASSERT(ackCount == 1, "acknackCount advanced to 1 from decision");
+        TEST_ASSERT(ctx.state.lastHeartbeatCount == 1, "reader state HB count recorded");
+        TEST_ASSERT(ctx.state.outgoingAckNackCount == 1, "outgoing count incremented in state");
+
+        // Sanity-check the wire layout: opt-in path uses writeAcknackWithBitmap.
+        // Packet = RTPS header (20) + INFO_DST (16) + ACKNACK with 3-bit bitmap.
+        // ACKNACK header is 4 bytes then content; numBits=3 => 1 bitmap word.
+        TEST_ASSERT(ctx.lastAck.size() >= 20 + 16 + 32, "ACK buffer includes hdr+INFO_DST+ACKNACK");
+        const uint8_t* acksubmsg = ctx.lastAck.data() + 20 + 16;
+        TEST_ASSERT(acksubmsg[0] == SUBMSG_ACKNACK, "submsg id = ACKNACK");
+        // numBits at offset 4+4+4+8 = 20 of submsg (4-byte hdr + reader+writer+base)
+        const uint8_t* content = acksubmsg + 4;
+        uint32_t numBits = (uint32_t)content[16] | ((uint32_t)content[17] << 8) |
+                           ((uint32_t)content[18] << 16) | ((uint32_t)content[19] << 24);
+        TEST_ASSERT(numBits == 3, "ACKNACK numBits = 3 (covers [1..3] missing)");
+
+        // Second call with the SAME HEARTBEAT (count=1) and now FINAL (flags bit 1) -> no send.
+        // Re-encode HEARTBEAT flags byte (first byte after submsg id).
+        // pkt + 20 is submsg id, pkt + 21 is flags byte.
+        pkt[20 + 1] = 0x01 | 0x02;  // E | F
+        ctx.sendCalls = 0;
+        ok = RTPSRxSubmessageRunner_run(pkt, pktLen, from,
+                                         RTPSRxChannel::UserData,
+                                         ackCount, cb, &ctx);
+        TEST_ASSERT(ok && ctx.sendCalls == 0,
+                    "duplicate FINAL HB via opt-in path -> no ACKNACK emitted");
+    }
+
+    {
+        printf("Test: RX runner legacy path still used when resolveReaderWriterState is null\n");
+
+        // Build packet as before.
+        uint8_t pkt[128] = {0};
+        uint8_t srcPrefix[12]; for (int i = 0; i < 12; ++i) srcPrefix[i] = (uint8_t)(0x70 + i);
+        uint32_t pktLen = RTPSMessage::writeHeader(pkt, sizeof(pkt), srcPrefix);
+        const uint8_t r[4] = { 0 };
+        const uint8_t w[4] = { 0x00, 0x00, 0x12, 0x02 };
+        pktLen += RTPSMessage::writeHeartbeat(pkt + pktLen, sizeof(pkt) - pktLen,
+                                                r, w, 0, 1, 0, 3, 1);
+
+        struct Ctx {
+            int sendCalls = 0;
+            uint8_t ourReader[4] = { 0x00, 0x00, 0x12, 0x07 };
+            uint8_t localPrefix[12] = {0};
+        } ctx;
+
+        RTPSRxSubmessageRunnerCallbacks cb{};
+        cb.getLocalGuidPrefix = [](void* u) -> const uint8_t* {
+            return static_cast<Ctx*>(u)->localPrefix;
+        };
+        cb.resolveReaderEID = [](void* u, RTPSRxChannel, const uint8_t*, const uint8_t*) -> const uint8_t* {
+            return static_cast<Ctx*>(u)->ourReader;
+        };
+        cb.resolveAckDest = [](void*, RTPSRxChannel, const struct sockaddr_in&, struct sockaddr_in& out) -> bool {
+            out = {};
+            out.sin_family = AF_INET;
+            return true;
+        };
+        cb.sendAck = [](void* u, const uint8_t*, uint32_t len, const struct sockaddr_in&) -> int {
+            static_cast<Ctx*>(u)->sendCalls++;
+            return (int)len;
+        };
+        // resolveReaderWriterState intentionally left null.
+
+        struct sockaddr_in from = {};
+        from.sin_family = AF_INET;
+        uint32_t ackCount = 5;
+        bool ok = RTPSRxSubmessageRunner_run(pkt, pktLen, from,
+                                              RTPSRxChannel::UserData,
+                                              ackCount, cb, &ctx);
+        TEST_ASSERT(ok && ctx.sendCalls == 1, "legacy path emits ACKNACK as before");
+        TEST_ASSERT(ackCount == 6, "legacy path post-increments acknackCount (was 5 -> 6)");
+    }
+
+    //=================================================================
+    // RTPSReaderStateMap get-or-create and lookup semantics
+    //=================================================================
+    {
+        printf("Test: RTPSReaderStateMap getOrCreate / find\n");
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+        RTPSReaderStateMap map;
+        TEST_ASSERT(map.size() == 0, "map is empty on construction");
+
+        uint8_t gpA[12] = { 1,2,3,4,5,6,7,8,9,10,11,12 };
+        uint8_t gpB[12] = { 9,9,9,9,9,9,9,9,9,9,9,9 };
+        uint8_t eidA[4] = { 0, 0, 0x12, 0x02 };
+        uint8_t eidB[4] = { 0, 0, 0x34, 0x02 };
+
+        TEST_ASSERT(map.find(gpA, eidA) == nullptr, "find returns null on miss");
+
+        auto* s1 = map.getOrCreate(gpA, eidA);
+        TEST_ASSERT(s1 != nullptr, "getOrCreate returns non-null");
+        TEST_ASSERT(map.size() == 1, "size increments after create");
+        s1->highestContiguousSeq = 42;
+
+        auto* s1b = map.getOrCreate(gpA, eidA);
+        TEST_ASSERT(s1b == s1, "getOrCreate returns same pointer for same key");
+        TEST_ASSERT(s1b->highestContiguousSeq == 42, "existing state preserved on re-lookup");
+        TEST_ASSERT(map.size() == 1, "size unchanged on re-lookup");
+
+        auto* s2 = map.getOrCreate(gpA, eidB);
+        TEST_ASSERT(s2 != s1 && map.size() == 2, "different writerEID creates new entry");
+
+        auto* s3 = map.getOrCreate(gpB, eidA);
+        TEST_ASSERT(s3 != s1 && s3 != s2 && map.size() == 3, "different guidPrefix creates new entry");
+
+        TEST_ASSERT(map.find(gpA, eidA) == s1, "find returns inserted pointer");
+        TEST_ASSERT(map.getOrCreate(nullptr, eidA) == nullptr, "null guidPrefix returns null");
+        TEST_ASSERT(map.getOrCreate(gpA, nullptr) == nullptr, "null writerEID returns null");
+    }
+
+    //=================================================================
+    // RTPSInitialAnnouncePlan - ChatterReader SEDP subscription announce
+    //=================================================================
+    {
+        printf("Test: RTPSInitialAnnouncePlan SedpChatterReader plumbing\n");
+
+        // Default plan does NOT include ChatterReader - opt-in only.
+        {
+            RTPSInitialAnnouncePlan plan = RTPSInitialAnnouncePlan_default();
+            TEST_ASSERT(!plan.sendSedpChatterReader, "default plan does not announce chatter reader");
+            auto seq = RTPSInitialAnnouncePlan_buildSequence(
+                plan, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle);
+            bool seenReader = false;
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+                if (seq.steps[i].action == RTPSInitialAnnounceAction::SedpChatterReader)
+                    seenReader = true;
+            TEST_ASSERT(!seenReader, "default sequence has no SedpChatterReader step");
+        }
+
+        // Opt-in: sequence includes ChatterReader step after ChatterWriter.
+        {
+            RTPSInitialAnnouncePlan plan = RTPSInitialAnnouncePlan_default();
+            plan.sendSedpChatterReader = true;
+            auto seq = RTPSInitialAnnouncePlan_buildSequence(
+                plan, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle);
+            int writerIdx = -1, readerIdx = -1;
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+            {
+                if (seq.steps[i].action == RTPSInitialAnnounceAction::SedpChatterWriter)
+                    writerIdx = i;
+                if (seq.steps[i].action == RTPSInitialAnnounceAction::SedpChatterReader)
+                    readerIdx = i;
+            }
+            TEST_ASSERT(writerIdx >= 0 && readerIdx >= 0, "both chatter writer and reader scheduled");
+            TEST_ASSERT(readerIdx == writerIdx + 1, "ChatterReader step immediately follows ChatterWriter");
+            TEST_ASSERT(seq.steps[readerIdx].incrementHeartbeatBeforeSend,
+                        "ChatterReader increments heartbeat before send on LinuxStyle");
+            TEST_ASSERT(seq.steps[readerIdx].seqCounterHint == RTPSSeqCounterHint::SedpChatterReader,
+                        "ChatterReader uses SedpChatterReader seq counter hint");
+        }
+
+        // Build-spec dispatch: ChatterReader -> SedpSubscription + ChatterReader profile.
+        {
+            auto spec = RTPSInitialAnnouncePlan_getBuildSpec(
+                RTPSInitialAnnounceAction::SedpChatterReader);
+            TEST_ASSERT(spec.buildKind == RTPSInitialAnnounceBuildKind::SedpSubscription,
+                        "ChatterReader build kind is SedpSubscription");
+            TEST_ASSERT(spec.sedpEndpointProfile == RTPSInitialAnnounceSedpEndpointProfile::ChatterReader,
+                        "ChatterReader build spec references ChatterReader profile");
+        }
+
+        // Endpoint-spec dispatch: ChatterReader profile resolves to the correct entity/topic/type.
+        {
+            auto ep = RTPSInitialAnnouncePlan_getSedpEndpointSpec(
+                RTPSInitialAnnounceSedpEndpointProfile::ChatterReader);
+            TEST_ASSERT(ep.entityId != nullptr && memcmp(ep.entityId, ENTITYID_CHATTER_READER, 4) == 0,
+                        "ChatterReader profile entity is ENTITYID_CHATTER_READER");
+            TEST_ASSERT(ep.topicName != nullptr && strcmp(ep.topicName, CHATTER_IN_DDS_TOPIC) == 0,
+                        "ChatterReader profile topic is rt/chatter_in");
+            TEST_ASSERT(ep.typeName != nullptr && strcmp(ep.typeName, CHATTER_IN_DDS_TYPE) == 0,
+                        "ChatterReader profile type is std_msgs::msg::dds_::String_");
+            TEST_ASSERT(ep.reliabilityKind == RELIABILITY_RELIABLE,
+                        "ChatterReader profile is RELIABLE");
+        }
+
+        // Send-target dispatch: ChatterReader uses metatraffic unicast (same as SEDP pub/sub).
+        {
+            auto tgt = RTPSInitialAnnouncePlan_getSendTarget(
+                RTPSInitialAnnounceAction::SedpChatterReader);
+            TEST_ASSERT(tgt.socket == RTPSInitialAnnounceSocket::Metatraffic,
+                        "ChatterReader sends on metatraffic socket");
+            TEST_ASSERT(tgt.addressing == RTPSInitialAnnounceAddressing::RemoteMetatrafficUnicast,
+                        "ChatterReader addresses remote metatraffic unicast");
+        }
+
+        // Seq counter hint: ChatterReader uses its own counter (not chatter writer's).
+        {
+            RTPSInitialAnnounceStep step{};
+            step.seqCounterHint = RTPSSeqCounterHint::SedpChatterReader;
+            RTPSInitialAnnounceCounterState counters{};
+            counters.sedpRosReaderSeqNum = 1;
+            counters.sedpChatterReaderSeqNum = 7;
+            counters.sedpChatterWriterSeqNum = 99;
+            // EspStyle: dedicated chatter-reader counter.
+            uint64_t seqEsp = RTPSInitialAnnouncePlan_applySequencePolicy(
+                step, RTPSInitialAnnounceRuntimeFlavor::EspStyle, counters);
+            TEST_ASSERT(seqEsp == 7, "ChatterReader seq counter returns sedpChatterReaderSeqNum on EspStyle");
+            // LinuxStyle: mirrors chatter-writer policy - sample #(sedpRosReaderSeqNum+1) on SEDP subs writer.
+            uint64_t seqLin = RTPSInitialAnnouncePlan_applySequencePolicy(
+                step, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle, counters);
+            TEST_ASSERT(seqLin == 2, "ChatterReader seq counter returns sedpRosReaderSeqNum+1 on LinuxStyle");
+        }
+
+        // Log-spec: ChatterReader has a distinct label from ChatterWriter.
+        {
+            auto ls = RTPSInitialAnnouncePlan_getLogSpec(
+                RTPSInitialAnnounceAction::SedpChatterReader);
+            TEST_ASSERT(ls.enabled && ls.actionLabel != nullptr, "ChatterReader has log label");
+            TEST_ASSERT(strcmp(ls.actionLabel, "SEDP chatter sub") == 0,
+                        "ChatterReader label is 'SEDP chatter sub'");
+        }
+
+        // Legacy default plan still produces the pre-existing ChatterWriter step (regression guard).
+        {
+            RTPSInitialAnnouncePlan plan = RTPSInitialAnnouncePlan_default();
+            auto seq = RTPSInitialAnnouncePlan_buildSequence(
+                plan, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle);
+            bool seenWriter = false;
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+                if (seq.steps[i].action == RTPSInitialAnnounceAction::SedpChatterWriter)
+                    seenWriter = true;
+            TEST_ASSERT(seenWriter, "default plan still schedules ChatterWriter");
+        }
+    }
+
+    //=================================================================
+    // decodeStdMsgsString: CDR-encapsulated std_msgs/String decode
+    //=================================================================
+    {
+        printf("Test: RTPSUserDispatch::decodeStdMsgsString\n");
+        using namespace RaftRuntime::RTPS::Runtime::UserDispatch;
+
+        // Build a reference CDR-LE std_msgs/String payload: "hello"
+        // Layout: 4-byte encap header (0x00 0x01 0x00 0x00) + uint32 LE length (incl null)
+        //       + string bytes + null + pad to 4.
+        uint8_t pkt[32] = {0};
+        uint32_t pos = 0;
+        pkt[pos++] = 0x00; pkt[pos++] = 0x01; pkt[pos++] = 0x00; pkt[pos++] = 0x00;
+        const char* text = "hello";
+        uint32_t textLenPlusNull = 6;
+        pkt[pos++] = textLenPlusNull & 0xFF;
+        pkt[pos++] = (textLenPlusNull >> 8) & 0xFF;
+        pkt[pos++] = 0; pkt[pos++] = 0;
+        memcpy(pkt + pos, text, 5); pos += 5;
+        pkt[pos++] = 0x00; // null terminator
+
+        char out[16] = {0};
+        auto r = decodeStdMsgsString(pkt, pos, out, sizeof(out));
+        TEST_ASSERT(r.success, "decode succeeds on well-formed payload");
+        TEST_ASSERT(r.textLen == 5, "textLen excludes null terminator");
+        TEST_ASSERT(strcmp(out, "hello") == 0, "decoded string matches input");
+
+        // Null outBuf
+        char* nullOut = nullptr;
+        auto r2 = decodeStdMsgsString(pkt, pos, nullOut, 16);
+        TEST_ASSERT(!r2.success, "null outBuf returns failure");
+
+        // Truncated buffer: encap header only, no string follows
+        auto r3 = decodeStdMsgsString(pkt, 4, out, sizeof(out));
+        TEST_ASSERT(!r3.success, "truncated payload (no string length) returns failure");
+
+        // Truncated buffer: string length says 6 bytes but only 3 present
+        uint8_t truncated[10] = { 0x00, 0x01, 0x00, 0x00, 0x06, 0x00, 0x00, 0x00, 'h', 'i' };
+        auto r4 = decodeStdMsgsString(truncated, sizeof(truncated), out, sizeof(out));
+        TEST_ASSERT(!r4.success, "string length exceeding buffer returns failure");
+
+        // Output buffer smaller than text: truncates but succeeds and null-terminates.
+        char tiny[3] = {'x', 'x', 'x'};
+        auto r5 = decodeStdMsgsString(pkt, pos, tiny, sizeof(tiny));
+        TEST_ASSERT(r5.success, "small outBuf still succeeds");
+        TEST_ASSERT(tiny[2] == '\0', "small outBuf is null-terminated");
+        TEST_ASSERT(strncmp(tiny, "he", 2) == 0, "small outBuf holds truncated prefix");
+        TEST_ASSERT(r5.textLen == 5, "textLen still reports full source string length");
+
+        // Empty string ("") = length 1 (just null), textLen 0.
+        uint8_t emptyPkt[12] = { 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 };
+        char out2[4] = {0};
+        auto r6 = decodeStdMsgsString(emptyPkt, 9, out2, sizeof(out2));
+        TEST_ASSERT(r6.success && r6.textLen == 0 && out2[0] == '\0',
+                    "empty string decodes to textLen=0 + null-terminated buf");
+
+        // Null payload
+        auto r7 = decodeStdMsgsString(nullptr, 10, out, sizeof(out));
+        TEST_ASSERT(!r7.success, "null payload returns failure");
+    }
+
+    //=================================================================
+    // RTPSWriterHeartbeatRunner: SedpChatterSubscription retransmit
+    //=================================================================
+    {
+        printf("Test: RTPSWriterHeartbeatRunner SedpChatterSubscription step\n");
+
+        // Sequence includes the new sub action right after ChatterPublication,
+        // on both Linux and Esp flavors.
+        for (auto flavor : { RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle,
+                              RTPSWriterHeartbeatRuntimeFlavor::EspStyle })
+        {
+            auto seq = RTPSWriterHeartbeatRunner_buildSequence(flavor);
+            int pubIdx = -1, subIdx = -1;
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+            {
+                if (seq.steps[i].action == RTPSWriterHeartbeatAction::SedpChatterPublication)
+                    pubIdx = i;
+                if (seq.steps[i].action == RTPSWriterHeartbeatAction::SedpChatterSubscription)
+                    subIdx = i;
+            }
+            TEST_ASSERT(pubIdx >= 0 && subIdx >= 0,
+                        "both chatter pub and sub scheduled in heartbeat sequence");
+            TEST_ASSERT(subIdx == pubIdx + 1,
+                        "SedpChatterSubscription immediately follows SedpChatterPublication");
+        }
+
+        // Send target: Metatraffic (SEDP endpoint).
+        TEST_ASSERT(RTPSWriterHeartbeatRunner_sendTargetForAction(
+                        RTPSWriterHeartbeatAction::SedpChatterSubscription)
+                        == RTPSWriterHeartbeatSendTarget::Metatraffic,
+                    "SedpChatterSubscription sends on metatraffic");
+
+        // Sequence number selection:
+        // - EspStyle -> chatterSedpSubSeqNum
+        // - LinuxStyle -> sedpSubSeqNum + 1
+        RTPSWriterHeartbeatCounterState counters{};
+        counters.sedpSubSeqNum = 10;
+        counters.chatterSedpSubSeqNum = 77;
+        uint64_t seqEsp = RTPSWriterHeartbeatRunner_sequenceForAction(
+            RTPSWriterHeartbeatAction::SedpChatterSubscription,
+            RTPSWriterHeartbeatRuntimeFlavor::EspStyle, counters);
+        TEST_ASSERT(seqEsp == 77, "ESP uses chatterSedpSubSeqNum for chatter subscription HB");
+        uint64_t seqLin = RTPSWriterHeartbeatRunner_sequenceForAction(
+            RTPSWriterHeartbeatAction::SedpChatterSubscription,
+            RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle, counters);
+        TEST_ASSERT(seqLin == 11, "Linux derives chatter sub SN = sedpSubSeqNum+1");
+
+        // End-to-end: RTPSWriterHeartbeatRunner_run invokes buildPayload for the
+        // SedpChatterSubscription step and routes it to sendPayload on metatraffic.
+        struct Ctx {
+            int subBuildCalls = 0;
+            uint64_t lastSubSeq = 0;
+            int subSendCalls = 0;
+            RTPSWriterHeartbeatSendTarget lastTarget = RTPSWriterHeartbeatSendTarget::UserData;
+        } ctx;
+
+        RTPSWriterHeartbeatRunnerCallbacks cb;
+        cb.buildPayload = [](void* u, RTPSWriterHeartbeatAction action,
+                              uint64_t seq, uint32_t) -> uint32_t {
+            if (action != RTPSWriterHeartbeatAction::SedpChatterSubscription)
+                return 0;
+            auto* c = static_cast<Ctx*>(u);
+            c->subBuildCalls++;
+            c->lastSubSeq = seq;
+            return 42;
+        };
+        cb.sendPayload = [](void* u, RTPSWriterHeartbeatSendTarget tgt, uint32_t) -> int {
+            auto* c = static_cast<Ctx*>(u);
+            c->subSendCalls++;
+            c->lastTarget = tgt;
+            return 42;
+        };
+
+        RTPSWriterHeartbeatCounterState runCounters{};
+        runCounters.sedpSubSeqNum = 4;
+        runCounters.chatterSedpSubSeqNum = 5;
+        RTPSWriterHeartbeatRunner_run(
+            RTPSWriterHeartbeatRuntimeFlavor::EspStyle, runCounters, cb, &ctx);
+        TEST_ASSERT(ctx.subBuildCalls == 1, "buildPayload called once for chatter sub on ESP");
+        TEST_ASSERT(ctx.lastSubSeq == 5, "ESP SN for chatter sub = chatterSedpSubSeqNum");
+        TEST_ASSERT(ctx.subSendCalls == 1, "sendPayload invoked for chatter sub");
+        TEST_ASSERT(ctx.lastTarget == RTPSWriterHeartbeatSendTarget::Metatraffic,
+                    "chatter sub routed to metatraffic");
+
+        // LinuxStyle path picks sedpSubSeqNum + 1.
+        ctx.subBuildCalls = 0; ctx.subSendCalls = 0; ctx.lastSubSeq = 0;
+        RTPSWriterHeartbeatRunner_run(
+            RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle, runCounters, cb, &ctx);
+        TEST_ASSERT(ctx.subBuildCalls == 1 && ctx.lastSubSeq == 5,
+                    "Linux run uses sedpSubSeqNum+1 (=4+1=5) for chatter sub SN");
     }
 
     //=================================================================

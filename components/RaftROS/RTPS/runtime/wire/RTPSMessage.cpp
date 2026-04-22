@@ -231,3 +231,65 @@ uint32_t RTPSMessage::writeAcknack(uint8_t* pBuf, uint32_t bufLen,
 
     return pos;
 }
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Write ACKNACK submessage with explicit SequenceNumberSet bitmap (DDSI-RTPS §9.4.2.7).
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t RTPSMessage::writeAcknackWithBitmap(uint8_t* pBuf, uint32_t bufLen,
+                                              const uint8_t* readerEntityId,
+                                              const uint8_t* writerEntityId,
+                                              int32_t bitmapBaseHigh, uint32_t bitmapBaseLow,
+                                              uint32_t numBits,
+                                              const uint32_t* bitmapWords,
+                                              uint32_t count,
+                                              bool finalFlag)
+{
+    // Per RTPS 2.2 §9.4.2.7, numBits must be in [0, 256].
+    if (numBits > 256)
+        return 0;
+
+    const uint32_t numWords = (numBits + 31u) / 32u;
+    const uint32_t contentSize = 4 + 4 + 8 + 4 + (numWords * 4) + 4;
+    const uint32_t totalSize = 4 + contentSize;
+    if (bufLen < totalSize)
+        return 0;
+    if (numWords > 0 && !bitmapWords)
+        return 0;
+
+    uint32_t pos = 0;
+
+    // Submessage header
+    pBuf[pos++] = SUBMSG_ACKNACK;
+    // flags: E=1 (LE); F flag (bit 1) set means reader does not require further HEARTBEATs.
+    pBuf[pos++] = (uint8_t)(0x01 | (finalFlag ? 0x02 : 0x00));
+    writeLE16(pBuf + pos, (uint16_t)contentSize);
+    pos += 2;
+
+    // Reader Entity ID
+    memcpy(pBuf + pos, readerEntityId, 4);
+    pos += 4;
+
+    // Writer Entity ID
+    memcpy(pBuf + pos, writerEntityId, 4);
+    pos += 4;
+
+    // SequenceNumberSet: bitmapBase(8) + numBits(4) + bitmap words
+    writeLE32(pBuf + pos, (uint32_t)bitmapBaseHigh);
+    pos += 4;
+    writeLE32(pBuf + pos, bitmapBaseLow);
+    pos += 4;
+    writeLE32(pBuf + pos, numBits);
+    pos += 4;
+    for (uint32_t i = 0; i < numWords; ++i)
+    {
+        writeLE32(pBuf + pos, bitmapWords[i]);
+        pos += 4;
+    }
+
+    // Count
+    writeLE32(pBuf + pos, count);
+    pos += 4;
+
+    return pos;
+}

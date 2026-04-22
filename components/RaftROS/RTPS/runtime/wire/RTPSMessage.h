@@ -69,6 +69,20 @@ public:
                                   int32_t bitmapBaseHigh, uint32_t bitmapBaseLow,
                                   uint32_t count);
 
+    // Build ACKNACK submessage with an explicit SequenceNumberSet bitmap (DDSI-RTPS §9.4.2.7).
+    // `numBits` may be 0 (pure confirmation ACKNACK) or up to 256 per RTPS spec. The bitmap is
+    // packed into ceil(numBits/32) little-endian 32-bit words. Bit i of `bitmapWords` corresponds
+    // to SN (base + i); a set bit means NACK (missing), clear means ACK.
+    // Returns bytes written or 0 on error (buf too small, numBits>256).
+    static uint32_t writeAcknackWithBitmap(uint8_t* pBuf, uint32_t bufLen,
+                                            const uint8_t* readerEntityId,
+                                            const uint8_t* writerEntityId,
+                                            int32_t bitmapBaseHigh, uint32_t bitmapBaseLow,
+                                            uint32_t numBits,
+                                            const uint32_t* bitmapWords,
+                                            uint32_t count,
+                                            bool finalFlag = false);
+
     // Parse RTPS message header, returns offset to first submessage or 0 on error
     static uint32_t parseHeader(const uint8_t* pBuf, uint32_t bufLen, uint8_t* guidPrefixOut);
 

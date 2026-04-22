@@ -33,6 +33,10 @@ static const uint8_t ENTITYID_ROS_DISC_INFO_READER[4] = {0x00, 0x00, 0x02, 0x04}
 // User-defined writer/reader for /chatter topic (std_msgs/String, NO_KEY)
 static const uint8_t ENTITYID_CHATTER_WRITER[4] = {0x00, 0x01, 0x01, 0x03};
 
+// User-defined reader for /chatter_in topic (std_msgs/String, NO_KEY).
+// Mirrors the chatter writer entityKey but with the reader entityKind (0x04 = no-key).
+static const uint8_t ENTITYID_CHATTER_READER[4] = {0x00, 0x01, 0x02, 0x04};
+
 // Participant Message Data (liveliness)
 static const uint8_t ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER[4] = {0x00, 0x02, 0x00, 0xC2};
 static const uint8_t ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER[4] = {0x00, 0x02, 0x00, 0xC7};
@@ -121,3 +125,7 @@ inline const char* ROS_DISCOVERY_INFO_TYPE = "rmw_dds_common::msg::dds_::Partici
 // === ROS 2 /chatter Topic (Phase 2) ===
 inline const char* CHATTER_DDS_TOPIC = "rt/chatter";
 inline const char* CHATTER_DDS_TYPE = "std_msgs::msg::dds_::String_";
+
+// Inbound user-data topic subscribed by this participant.
+inline const char* CHATTER_IN_DDS_TOPIC = "rt/chatter_in";
+inline const char* CHATTER_IN_DDS_TYPE = "std_msgs::msg::dds_::String_";

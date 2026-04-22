@@ -13,6 +13,7 @@ enum class RTPSWriterHeartbeatAction : uint8_t
     SedpRosDiscoveryPublication,
     SedpRosDiscoverySubscription,
     SedpChatterPublication,
+    SedpChatterSubscription,
     ParticipantMessageData,
     RosDiscoveryInfoData,
 };
@@ -32,7 +33,7 @@ struct RTPSWriterHeartbeatStep
 
 struct RTPSWriterHeartbeatSequence
 {
-    RTPSWriterHeartbeatStep steps[5];
+    RTPSWriterHeartbeatStep steps[6];
     uint8_t numSteps = 0;
 };
 
@@ -41,6 +42,7 @@ struct RTPSWriterHeartbeatCounterState
     uint64_t sedpSeqNum = 0;
     uint64_t sedpSubSeqNum = 0;
     uint64_t chatterSedpSeqNum = 0;
+    uint64_t chatterSedpSubSeqNum = 0;
     uint64_t livelinessSeqNum = 0;
     uint64_t rosDiscSeqNum = 0;
     uint32_t heartbeatCount = 0;
