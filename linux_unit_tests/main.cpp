@@ -29,6 +29,8 @@
 #include "runtime/announce/RTPSWriterHeartbeatRunner.h"
 #include "runtime/dispatch/RTPSUserDispatch.h"
 #include "runtime/dispatch/RTPSSubscriptionRegistry.h"
+#include "runtime/dispatch/RTPSRemotePublicationMap.h"
+#include "runtime/dispatch/RTPSSEDPPublicationParser.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -685,7 +687,7 @@ int main()
         TEST_ASSERT(d.sendAckNack, "HB announces gap, reader must ACKNACK");
         TEST_ASSERT(d.ackNackBase == 1, "ACKNACK base = 1 (first missing)");
         TEST_ASSERT(d.ackNackNumBits == 5, "ACKNACK numBits covers [1..5]");
-        TEST_ASSERT(d.ackNackBitmap == 0, "no SNs received -> all NACK bits clear");
+        TEST_ASSERT(d.ackNackBitmap == 0x1F, "no SNs received -> all NACK bits set (5 missing)");
         TEST_ASSERT(d.ackNackCount == 1, "outgoing count starts at 1");
 
         // Apply and record SN=1,2,3 received.
@@ -701,7 +703,7 @@ int main()
         TEST_ASSERT(d.sendAckNack, "HB without FINAL still requires ACKNACK");
         TEST_ASSERT(d.ackNackBase == 4, "ACKNACK base = 4 (next missing)");
         TEST_ASSERT(d.ackNackNumBits == 2, "numBits covers [4..5]");
-        TEST_ASSERT(d.ackNackBitmap == 0, "no SNs in [4..5] received");
+        TEST_ASSERT(d.ackNackBitmap == 0x3, "SNs 4,5 missing -> both NACK bits set");
 
         // HB with FINAL and same count -> no reply (writer already knows our state).
         hb.finalFlag = true;
@@ -1827,6 +1829,119 @@ int main()
                     "setTopic rejects out-of-range slot");
         TEST_ASSERT(!reg.setTopic(0, nullptr, "y"),
                     "setTopic rejects null topic");
+    }
+
+    //=================================================================
+    // RTPSSEDPPublicationParser: extract writerGuid + topic from an
+    // SEDP BuiltinPublications DATA payload.
+    //=================================================================
+    {
+        printf("Test: RTPSSEDPPublicationParser parse (clean build)\n");
+        using namespace RaftRuntime::RTPS::Runtime::Dispatch;
+
+        // Clean, exact-byte payload.
+        uint8_t buf[80] = {0};
+        uint32_t off = 0;
+        buf[off++] = 0x00; buf[off++] = 0x03; buf[off++] = 0x00; buf[off++] = 0x00; // encap
+        // PID_ENDPOINT_GUID (pid=0x005A, len=16)
+        buf[off++] = 0x5A; buf[off++] = 0x00; buf[off++] = 0x10; buf[off++] = 0x00;
+        const uint8_t refGuid[16] = {
+            0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5, 0xA6, 0xA7,
+            0xA8, 0xA9, 0xAA, 0xAB,       // 12 prefix
+            0x00, 0x00, 0x02, 0x04        // 4 entityId (user-defined reader w/ key)
+        };
+        memcpy(buf + off, refGuid, 16); off += 16;
+        // PID_TOPIC_NAME (pid=0x0005, len=16: 4 strLen + 7 str ("rt/foo\0") + 5 pad = 16)
+        buf[off++] = 0x05; buf[off++] = 0x00; buf[off++] = 0x10; buf[off++] = 0x00;
+        buf[off++] = 0x07; buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00; // strLen=7 (incl null)
+        const char* topicStr = "rt/foo";
+        memcpy(buf + off, topicStr, 6); off += 6;
+        buf[off++] = 0x00;                                // null
+        buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00; // 5 pad
+        // PID_SENTINEL (pid=0x0001, len=0)
+        buf[off++] = 0x01; buf[off++] = 0x00; buf[off++] = 0x00; buf[off++] = 0x00;
+
+        RTPSParsedPublicationAnnounce parsed;
+        const bool ok = RTPSSEDPPublicationParser_parse(buf, off, parsed);
+        TEST_ASSERT(ok, "parser returns true on well-formed payload");
+        TEST_ASSERT(parsed.hasWriterGuid, "parser extracts endpoint GUID");
+        TEST_ASSERT(memcmp(parsed.writerGuid, refGuid, 16) == 0,
+                    "parsed writerGuid matches source bytes");
+        TEST_ASSERT(parsed.topic != nullptr, "topic pointer set");
+        TEST_ASSERT(parsed.topicLen == 6, "topicLen excludes trailing null");
+        TEST_ASSERT(memcmp(parsed.topic, "rt/foo", 6) == 0,
+                    "topic contents match source");
+
+        // Null + short buffer rejection.
+        RTPSParsedPublicationAnnounce p2;
+        TEST_ASSERT(!RTPSSEDPPublicationParser_parse(nullptr, 16, p2),
+                    "null buffer returns false");
+        TEST_ASSERT(!RTPSSEDPPublicationParser_parse(buf, 4, p2),
+                    "payload smaller than a single PID entry returns false");
+
+        // Missing PID_ENDPOINT_GUID returns false.
+        uint8_t onlyTopic[24] = {
+            0x00, 0x03, 0x00, 0x00,           // encap
+            0x05, 0x00, 0x10, 0x00,           // PID_TOPIC_NAME, len=16
+            0x07, 0x00, 0x00, 0x00,           // strLen
+            'r','t','/','f','o','o',0x00, 0x00, 0x00, 0x00, 0x00, // str+null+pad (12)
+        };
+        RTPSParsedPublicationAnnounce p3;
+        const bool ok3 = RTPSSEDPPublicationParser_parse(onlyTopic, sizeof(onlyTopic), p3);
+        TEST_ASSERT(!ok3, "payload without PID_ENDPOINT_GUID returns false");
+    }
+
+    //=================================================================
+    // RTPSRemotePublicationMap: upsert + findSlot
+    //=================================================================
+    {
+        printf("Test: RTPSRemotePublicationMap upsert/findSlot\n");
+        using namespace RaftRuntime::RTPS::Runtime::Dispatch;
+
+        RTPSRemotePublicationMap map;
+        const uint8_t g1[16] = {1,1,1,1,1,1,1,1,1,1,1,1, 0,0,0x02,0x03};
+        const uint8_t g2[16] = {2,2,2,2,2,2,2,2,2,2,2,2, 0,0,0x03,0x03};
+
+        TEST_ASSERT(map.findSlot(g1) == -1, "initial findSlot returns -1");
+
+        TEST_ASSERT(map.upsert(g1, 0), "first upsert reports new entry");
+        TEST_ASSERT(map.count == 1, "count incremented");
+        TEST_ASSERT(map.findSlot(g1) == 0, "findSlot returns assigned slot");
+
+        TEST_ASSERT(!map.upsert(g1, 3), "upsert existing guid returns false (update)");
+        TEST_ASSERT(map.count == 1, "count unchanged on update");
+        TEST_ASSERT(map.findSlot(g1) == 3, "slot updated in place");
+
+        TEST_ASSERT(map.upsert(g2, 5), "second distinct guid is new");
+        TEST_ASSERT(map.count == 2, "count incremented again");
+
+        // Split-key lookup.
+        TEST_ASSERT(map.findSlot(g1, g1 + 12) == 3,
+                    "split-key findSlot matches full-key findSlot");
+
+        // Reject invalid inputs.
+        TEST_ASSERT(!map.upsert(nullptr, 0), "null guid rejected");
+        TEST_ASSERT(!map.upsert(g1, -1),     "negative slot rejected");
+
+        // Fill to capacity + overflow wraps via writeCursor.
+        RTPSRemotePublicationMap full;
+        uint8_t seed[16] = {0};
+        for (uint8_t i = 0; i < RTPS_REMOTE_PUBLICATION_MAP_CAPACITY; i++)
+        {
+            seed[0] = i + 1;
+            TEST_ASSERT(full.upsert(seed, (int8_t)(i % 8)),
+                        "fill registry to capacity");
+        }
+        TEST_ASSERT(full.count == RTPS_REMOTE_PUBLICATION_MAP_CAPACITY,
+                    "map at capacity");
+        // One more upsert: overwrites oldest (index 0) via round-robin cursor.
+        seed[0] = 0xFF;
+        TEST_ASSERT(full.upsert(seed, 7),
+                    "overflow upsert returns true (treated as new entry)");
+        TEST_ASSERT(full.count == RTPS_REMOTE_PUBLICATION_MAP_CAPACITY,
+                    "count clamped at capacity");
+        TEST_ASSERT(full.findSlot(seed) == 7,
+                    "overflow entry findable post-upsert");
     }
 
     //=================================================================

@@ -17,6 +17,8 @@
 #include "runtime/announce/RTPSWriterHeartbeatRunner.h"
 #include "runtime/reliability/RTPSReaderStateMap.h"
 #include "runtime/dispatch/RTPSSubscriptionRegistry.h"
+#include "runtime/dispatch/RTPSRemotePublicationMap.h"
+#include "runtime/dispatch/RTPSSEDPPublicationParser.h"
 #include <functional>
 #include <vector>
 #include <sys/socket.h>
@@ -66,13 +68,27 @@ public:
     // NOTE: The string/type pointers must remain valid for the lifetime of this RaftROS
     // instance (they are typically string literals).  The registry does not copy strings.
     //
-    // NOTE (follow-up): `handler` is stored but is not yet routed per-topic.  The current
-    // single-handler dispatch (see `setStringMessageHandler` / `setStringSubscription`)
-    // fires for DATA on any of the advertised readers.  Per-topic handler routing requires
-    // correlating remote SEDP publication records (remote writerGUID -> topicName) with our
-    // registry; that correlation is the remaining Phase 3 follow-up.
+    // Per-topic dispatch: when a matching remote SEDP publication is observed, the
+    // (remote writerGuid -> slot) correlation is recorded in `_remotePubMap` and
+    // subsequent user-data DATA on that writer is routed to the slot's `handler`.
+    // Messages arriving before the SEDP pub has been parsed fall through to the legacy
+    // `_stringMessageHandler` so single-subscription applications keep working.
     int addStringSubscription(const char* topic, const char* type, StringMessageHandler handler = {})
     {
+        // Check for an existing registry entry with this topic (e.g. the slot-0 entry
+        // pre-populated by RaftROS::setup() for the default subscription).  Reuse it
+        // rather than appending a duplicate, so the entity-ID and SEDP announce remain
+        // consistent and the handler lands in the correct slot.
+        for (uint8_t i = 0; i < _subscriptionRegistry.count; i++)
+        {
+            if (_subscriptionRegistry.entries[i].topic &&
+                strcmp(_subscriptionRegistry.entries[i].topic, topic) == 0)
+            {
+                if (handler)
+                    _extraSubscriptionHandlers[i] = std::move(handler);
+                return i;
+            }
+        }
         const int slot = _subscriptionRegistry.add(topic, type);
         if (slot < 0)
             return -1;
@@ -144,14 +160,23 @@ private:
     // buildRosDiscInfoWithGids() to include every reader's GID.
     RaftRuntime::RTPS::Runtime::Dispatch::RTPSSubscriptionRegistry _subscriptionRegistry;
 
-    // Per-extra-slot handlers (slot 0 uses _stringMessageHandler).  Currently unused
-    // because dispatch does not yet route per-topic; stored for the upcoming SEDP-pub
-    // correlation follow-up.
+    // Per-remote-writer -> subscription-slot mapping.  Populated lazily when an SEDP
+    // BuiltinPublications DATA message is received whose advertised topic matches one
+    // of our registry entries.  Consulted by recvUserData() to route incoming user-data
+    // DATA submessages to the correct per-slot handler.
+    RaftRuntime::RTPS::Runtime::Dispatch::RTPSRemotePublicationMap _remotePubMap;
+
+    // Per-extra-slot handlers (slot 0 uses _stringMessageHandler).  Invoked by
+    // recvUserData() when the remote writer was previously correlated to this slot
+    // via _remotePubMap.
     StringMessageHandler _extraSubscriptionHandlers[8];
 
-    // Per-extra-slot SEDP subscription sequence number (slot 0 uses chatterSedpSubSeqNum).
-    // Stays at 1 for the lifetime of the slot (subscription announces are idempotent).
-    uint64_t _extraSubscriptionSeqNums[8] = {1,1,1,1,1,1,1,1};
+    // Per-extra-slot SEDP subscription sequence number.
+    // All SEDP subscription DATA shares the same writer (000004C2) so the sequence
+    // numbers must be strictly monotonically increasing across all slots.
+    // Slot 0 (chatter_in) is announced via the main sequence at seq _sedpSubSeqNum+1 = 2.
+    // Slot N uses seq _sedpSubSeqNum+1+N so that slot 1 = 3, slot 2 = 4, etc.
+    uint64_t _extraSubscriptionSeqNums[8] = {2, 3, 4, 5, 6, 7, 8, 9};
 
     // Configurable subscription topic/type (used for SEDP advertisement + dispatch).
     // Defaults to the ROS 2 /chatter_in topic; replaced by setStringSubscription().

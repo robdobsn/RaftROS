@@ -11,6 +11,40 @@
 #include "runtime/wire/RTPSMessage.h"
 #include "runtime/reliability/RTPSReaderRuntime.h"
 
+// Given the content of a DATA submessage (pointer/length starting after the 4-byte
+// submessage header) and the DATA flags byte (bit 1 Q = inlineQoS present), return
+// the pointer/length of the serialized payload (skipping the 20-byte fixed prefix
+// and, when present, the inline-QoS ParameterList terminated by PID_SENTINEL).
+// On malformed input, returns {nullptr, 0}.
+static inline void RTPSData_getSerializedPayload(
+    const uint8_t* pContent, uint32_t contentLen, uint8_t flags,
+    const uint8_t*& payloadOut, uint32_t& payloadLenOut)
+{
+    payloadOut = nullptr;
+    payloadLenOut = 0;
+    if (!pContent || contentLen < 20)
+        return;
+    uint32_t off = 20;
+    if (flags & 0x02) // Q: inline QoS ParameterList present
+    {
+        while (off + 4 <= contentLen)
+        {
+            const uint16_t pid  = (uint16_t)(pContent[off] | (pContent[off + 1] << 8));
+            const uint16_t plen = (uint16_t)(pContent[off + 2] | (pContent[off + 3] << 8));
+            off += 4;
+            if (pid == 0x0001) // PID_SENTINEL
+                break;
+            if ((uint32_t)off + plen > contentLen)
+                return;
+            off += plen;
+        }
+    }
+    if (off > contentLen)
+        return;
+    payloadOut = pContent + off;
+    payloadLenOut = contentLen - off;
+}
+
 enum class RTPSRxChannel
 {
     Metatraffic = 0,
@@ -47,7 +81,8 @@ struct RTPSRxSubmessageRunnerCallbacks
                    const uint8_t* srcGuidPrefix,
                    const struct sockaddr_in& fromAddr,
                    const uint8_t* pContent,
-                   uint32_t contentLen) = nullptr;
+                   uint32_t contentLen,
+                   uint8_t flags) = nullptr;
     void (*onAckNack)(void* userCtx,
                       RTPSRxChannel channel,
                       const uint8_t* srcGuidPrefix,

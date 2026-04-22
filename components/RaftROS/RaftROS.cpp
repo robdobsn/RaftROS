@@ -38,7 +38,7 @@
 // which accumulates to tens of ms of stalled loop() time when the ESP32-S3 is handling
 // multiple DDS peers.  Comment out RAFTROS_VERBOSE_LOGGING for production / when
 // profiling loop() latency.
-// #define RAFTROS_VERBOSE_LOGGING
+#define RAFTROS_VERBOSE_LOGGING
 #ifdef RAFTROS_VERBOSE_LOGGING
     #define DEBUG_SDSP_SEND
     #define DEBUG_SDSP_RECEIVE
@@ -555,7 +555,8 @@ void RaftROS::recvMetatraffic()
                           const uint8_t*,
                           const struct sockaddr_in& from,
                           const uint8_t* pContent,
-                          uint32_t contentLen)
+                          uint32_t contentLen,
+                          uint8_t dataFlags)
     {
         RaftROS* self = static_cast<RxCtx*>(userCtx)->self;
         const uint8_t* writerEID = pContent + 8;
@@ -569,6 +570,51 @@ void RaftROS::recvMetatraffic()
             {
                 if (memcmp(remote.guidPrefix, self->_participant.getGuidPrefix(), 12) != 0)
                     self->processDiscoveredParticipant(remote, from);
+            }
+        }
+        else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0)
+        {
+            // SEDP publication announce from remote.  Parse the advertised topic/writerGuid
+            // and, if the topic matches one of our registered subscriptions, record the
+            // (remote writerGuid -> local slot) mapping so recvUserData() can route
+            // per-topic to the correct handler.
+            if (contentLen < 24)
+                return;
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(pContent, contentLen, dataFlags, pPayload, payloadLen);
+            if (!pPayload || payloadLen < 4)
+            {
+                // Either malformed, or an inline-QoS-only DATA submessage
+                // (e.g. publication disposal/unregister: D=0, Q=1, K=1) with
+                // no serialized payload. Nothing to parse.
+                return;
+            }
+            RaftRuntime::RTPS::Runtime::Dispatch::RTPSParsedPublicationAnnounce parsed;
+            if (!RaftRuntime::RTPS::Runtime::Dispatch::RTPSSEDPPublicationParser_parse(
+                    pPayload, payloadLen, parsed))
+                return;
+            if (!parsed.topic || parsed.topicLen == 0)
+                return;
+            for (uint8_t slot = 0; slot < self->_subscriptionRegistry.count; slot++)
+            {
+                const char* regTopic = self->_subscriptionRegistry.entries[slot].topic;
+                if (!regTopic) continue;
+                const size_t regLen = strlen(regTopic);
+                if (regLen == parsed.topicLen &&
+                    memcmp(regTopic, parsed.topic, regLen) == 0)
+                {
+                    const bool wasNew = self->_remotePubMap.upsert(parsed.writerGuid, (int8_t)slot);
+#ifdef DEBUG_SDSP_DATA
+                    LOG_I(MODULE_PREFIX,
+                          "  SEDP pub matched topic='%.*s' -> slot=%u (%s)",
+                          (int)parsed.topicLen, parsed.topic, (unsigned)slot,
+                          wasNew ? "new" : "updated");
+#else
+                    (void)wasNew;
+#endif
+                    break;
+                }
             }
         }
         else
@@ -676,15 +722,19 @@ void RaftROS::recvUserData()
                           const uint8_t* srcGuidPrefix,
                           const struct sockaddr_in&,
                           const uint8_t* pContent,
-                          uint32_t contentLen)
+                          uint32_t contentLen,
+                          uint8_t dataFlags)
     {
         const uint8_t* writerEID = pContent + 8;
         if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
             return;
         if (contentLen < 24)
             return;
-        const uint8_t* payload = pContent + 20;
-        uint32_t payloadLen = contentLen - 20;
+        const uint8_t* payload = nullptr;
+        uint32_t payloadLen = 0;
+        RTPSData_getSerializedPayload(pContent, contentLen, dataFlags, payload, payloadLen);
+        if (!payload || payloadLen < 4)
+            return;
         char text[128] = {0};
         auto dec = RaftRuntime::RTPS::Runtime::UserDispatch::decodeStdMsgsString(
             payload, payloadLen, text, sizeof(text));
@@ -698,8 +748,35 @@ void RaftROS::recvUserData()
               srcGuidPrefix[0], srcGuidPrefix[1], srcGuidPrefix[2], srcGuidPrefix[3],
               text, (unsigned)dec.textLen);
 #endif
+        // Per-topic dispatch: look up (remote guidPrefix + writerEID) -> slot.
+        // Route via _remotePubMap: if the remote writer has been correlated to a
+        // local subscription slot (via SEDP pub parsing), dispatch to the per-slot
+        // handler stored by addStringSubscription().  For any slot where no
+        // per-slot handler was registered, fall back to the legacy single
+        // _stringMessageHandler.  Also falls back when no mapping exists yet
+        // (slot == -1), so applications that never call addStringSubscription()
+        // keep working.
+        const int8_t slot = self->_remotePubMap.findSlot(srcGuidPrefix, writerEID);
+        static constexpr int8_t kMaxSlot =
+            (int8_t)(sizeof(self->_extraSubscriptionHandlers) /
+                     sizeof(self->_extraSubscriptionHandlers[0]));
+        if (slot >= 0 && slot < kMaxSlot && self->_extraSubscriptionHandlers[slot])
+        {
+            self->_extraSubscriptionHandlers[slot](writerEID, srcGuidPrefix,
+                                                   text, dec.textLen);
+            return;
+        }
+        // Fallback: SEDP pub not yet parsed (slot == -1) or no per-slot handler.
+        // Try the legacy _stringMessageHandler first, then slot-0 handler so that
+        // applications using addStringSubscription() still receive messages that
+        // arrive before the SEDP publication correlation is complete.
         if (self->_stringMessageHandler)
+        {
             self->_stringMessageHandler(writerEID, srcGuidPrefix, text, dec.textLen);
+            return;
+        }
+        if (self->_extraSubscriptionHandlers[0])
+            self->_extraSubscriptionHandlers[0](writerEID, srcGuidPrefix, text, dec.textLen);
     };
     callbacks.onAckNack = [](void* userCtx,
                              RTPSRxChannel,
@@ -1110,6 +1187,7 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
 
     RTPSInitialAnnouncePlan announcePlan = RTPSInitialAnnouncePlan_default();
     announcePlan.sendSedpChatterReader = true;
+    announcePlan.sendInitialRosDiscoveryUserData = true;
     entry.sequence = RTPSInitialAnnouncePlan_buildSequence(
         announcePlan, RTPSInitialAnnounceRuntimeFlavor::EspStyle);
 

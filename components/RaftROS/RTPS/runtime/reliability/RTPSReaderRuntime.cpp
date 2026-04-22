@@ -127,19 +127,22 @@ RTPSReaderHeartbeatDecision evaluateIncomingHeartbeatDecision(
             : base + RTPS_READER_MAX_BITMAP_BITS - 1;
     const uint32_t numBits = (uint32_t)(windowEnd - base + 1);
 
-    // Bit i is set when SN (base + i) is present in reader state.
-    // reader bitmap stores received flags for SNs > highestContiguousSeq; we need
-    // to project it onto [base, windowEnd].
+    // RTPS §9.4.5.2: bit i in the readerSNState bitmap = 1 means "reader has NOT yet
+    // received SN (base + i) — please retransmit".  Bit = 0 means "already received".
+    // reader state stores received flags for SNs > highestContiguousSeq; project onto
+    // [base, windowEnd] as the logical NOT of those flags.
     uint64_t bitmap = 0;
     for (uint32_t i = 0; i < numBits; ++i)
     {
         const uint64_t sn = base + i;
         const uint64_t offset = sn - state.highestContiguousSeq - 1;
+        bool received = false;
         if (offset < RTPS_READER_MAX_BITMAP_BITS)
         {
-            if ((state.receivedBitmap & ((uint64_t)1 << offset)) != 0)
-                bitmap |= ((uint64_t)1 << i);
+            received = (state.receivedBitmap & ((uint64_t)1 << offset)) != 0;
         }
+        if (!received)
+            bitmap |= ((uint64_t)1 << i);
     }
 
     decision.sendAckNack = true;

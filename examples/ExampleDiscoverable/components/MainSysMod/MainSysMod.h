@@ -35,4 +35,11 @@ private:
 
     // Example of how to control loop rate
     uint32_t _lastLoopMs = 0;
+
+    // Receive counter — incremented on every chatter_in message so dropped
+    // messages (gaps in the sequence) can be spotted in the serial log.
+    uint32_t _rxCount = 0;
+
+    // Separate receive counter for the second subscription (rt/chatter_in2).
+    uint32_t _rxCount2 = 0;
 };
