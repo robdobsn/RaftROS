@@ -49,3 +49,16 @@ void RTPSInitialAnnounceRunner_run(
     RTPSInitialAnnounceRunnerContext& runCtx,
     const RTPSInitialAnnounceRunnerCallbacks& callbacks,
     void* userCtx);
+
+// Execute a single step of the announce sequence.  Returns true if the step index was
+// within range (regardless of whether the step was skipped by pre/post-build evaluation),
+// false if stepIdx >= sequence.numSteps.  Updates runCtx.heartbeatCount and
+// runCtx.previousPayloadLen as appropriate so consecutive calls with incrementing stepIdx
+// reproduce the behaviour of RTPSInitialAnnounceRunner_run.  Used by wrappers that want
+// to spread the initial-announce burst across multiple scheduler ticks.
+bool RTPSInitialAnnounceRunner_runStep(
+    const RTPSInitialAnnounceSequence& sequence,
+    uint8_t stepIdx,
+    RTPSInitialAnnounceRunnerContext& runCtx,
+    const RTPSInitialAnnounceRunnerCallbacks& callbacks,
+    void* userCtx);

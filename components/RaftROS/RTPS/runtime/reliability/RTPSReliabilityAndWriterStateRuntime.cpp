@@ -147,6 +147,10 @@ RTPSAckNackWriterKind classifyWriter(const uint8_t* writerEID)
         return RTPSAckNackWriterKind::RosDiscoveryInfo;
     if (std::memcmp(writerEID, ENTITYID_CHATTER_WRITER, 4) == 0)
         return RTPSAckNackWriterKind::Chatter;
+    if (std::memcmp(writerEID, ENTITYID_CHATTER_READER, 4) == 0)
+        return RTPSAckNackWriterKind::ChatterReader;
+    if (std::memcmp(writerEID, ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER, 4) == 0)
+        return RTPSAckNackWriterKind::ParticipantMessage;
     return RTPSAckNackWriterKind::Unknown;
 }
 
@@ -162,6 +166,10 @@ const char* writerKindToStr(RTPSAckNackWriterKind writerKind)
             return "ros_discovery_info";
         case RTPSAckNackWriterKind::Chatter:
             return "chatter";
+        case RTPSAckNackWriterKind::ChatterReader:
+            return "chatter_in_reader";
+        case RTPSAckNackWriterKind::ParticipantMessage:
+            return "participant_msg";
         default:
             return "unknown";
     }

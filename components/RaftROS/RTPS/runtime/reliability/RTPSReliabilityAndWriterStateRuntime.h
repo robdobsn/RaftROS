@@ -12,6 +12,8 @@ enum class RTPSAckNackWriterKind
     SedpSubscriptions,
     RosDiscoveryInfo,
     Chatter,
+    ChatterReader,
+    ParticipantMessage,
 };
 
 struct RTPSAckNackFields

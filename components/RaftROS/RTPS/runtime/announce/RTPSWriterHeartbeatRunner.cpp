@@ -83,33 +83,51 @@ void RTPSWriterHeartbeatRunner_run(
     const RTPSWriterHeartbeatSequence seq = RTPSWriterHeartbeatRunner_buildSequence(runtimeFlavor);
     for (uint8_t i = 0; i < seq.numSteps; i++)
     {
-        const RTPSWriterHeartbeatStep& step = seq.steps[i];
-        if (step.incrementHeartbeatBeforeBuild)
-            counters.heartbeatCount++;
-        if (step.incrementLivelinessSeqBeforeBuild)
-            counters.livelinessSeqNum++;
-
-        const uint64_t seqNum = RTPSWriterHeartbeatRunner_sequenceForAction(
-            step.action, runtimeFlavor, counters);
-
-        const uint32_t payloadLen = callbacks.buildPayload(
-            userCtx, step.action, seqNum, counters.heartbeatCount);
-        if (payloadLen == 0)
-            continue;
-
-        if ((runtimeFlavor == RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle) &&
-            (step.action == RTPSWriterHeartbeatAction::RosDiscoveryInfoData) &&
-            !counters.rosDiscDebugDumped && callbacks.debugPayload)
-        {
-            callbacks.debugPayload(userCtx, step.action, payloadLen);
-            counters.rosDiscDebugDumped = true;
-        }
-
-        const RTPSWriterHeartbeatSendTarget sendTarget =
-            RTPSWriterHeartbeatRunner_sendTargetForAction(step.action);
-        const int sent = callbacks.sendPayload(userCtx, sendTarget, payloadLen);
-
-        if (callbacks.logSend)
-            callbacks.logSend(userCtx, step.action, sent, payloadLen, sendTarget);
+        RTPSWriterHeartbeatRunner_runStep(runtimeFlavor, seq, i, counters, callbacks, userCtx);
     }
+}
+
+bool RTPSWriterHeartbeatRunner_runStep(
+    RTPSWriterHeartbeatRuntimeFlavor runtimeFlavor,
+    const RTPSWriterHeartbeatSequence& sequence,
+    uint8_t stepIdx,
+    RTPSWriterHeartbeatCounterState& counters,
+    const RTPSWriterHeartbeatRunnerCallbacks& callbacks,
+    void* userCtx)
+{
+    if (stepIdx >= sequence.numSteps)
+        return false;
+    if (!callbacks.buildPayload || !callbacks.sendPayload)
+        return false;
+
+    const RTPSWriterHeartbeatStep& step = sequence.steps[stepIdx];
+    if (step.incrementHeartbeatBeforeBuild)
+        counters.heartbeatCount++;
+    if (step.incrementLivelinessSeqBeforeBuild)
+        counters.livelinessSeqNum++;
+
+    const uint64_t seqNum = RTPSWriterHeartbeatRunner_sequenceForAction(
+        step.action, runtimeFlavor, counters);
+
+    const uint32_t payloadLen = callbacks.buildPayload(
+        userCtx, step.action, seqNum, counters.heartbeatCount);
+    if (payloadLen == 0)
+        return true;
+
+    if ((runtimeFlavor == RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle) &&
+        (step.action == RTPSWriterHeartbeatAction::RosDiscoveryInfoData) &&
+        !counters.rosDiscDebugDumped && callbacks.debugPayload)
+    {
+        callbacks.debugPayload(userCtx, step.action, payloadLen);
+        counters.rosDiscDebugDumped = true;
+    }
+
+    const RTPSWriterHeartbeatSendTarget sendTarget =
+        RTPSWriterHeartbeatRunner_sendTargetForAction(step.action);
+    const int sent = callbacks.sendPayload(userCtx, sendTarget, payloadLen);
+
+    if (callbacks.logSend)
+        callbacks.logSend(userCtx, step.action, sent, payloadLen, sendTarget);
+
+    return true;
 }

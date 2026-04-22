@@ -25,8 +25,10 @@
 #include "runtime/reliability/RTPSReaderStateMap.h"
 #include "runtime/receive/RTPSRxSubmessageRunner.h"
 #include "runtime/announce/RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSInitialAnnounceRunner.h"
 #include "runtime/announce/RTPSWriterHeartbeatRunner.h"
 #include "runtime/dispatch/RTPSUserDispatch.h"
+#include "runtime/dispatch/RTPSSubscriptionRegistry.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -1350,6 +1352,207 @@ int main()
     }
 
     //=================================================================
+    // RTPSInitialAnnounceRunner_runStep - per-step execution (for spreading
+    // the initial-announce burst across multiple scheduler ticks).
+    //=================================================================
+    {
+        printf("Test: RTPSInitialAnnounceRunner_runStep per-step execution\n");
+
+        // Build a non-trivial sequence (default plan, LinuxStyle for deterministic counters).
+        RTPSInitialAnnouncePlan plan = RTPSInitialAnnouncePlan_default();
+        plan.sendSedpChatterReader = true;
+        auto seq = RTPSInitialAnnouncePlan_buildSequence(
+            plan, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle);
+        TEST_ASSERT(seq.numSteps > 1, "sequence has multiple steps to iterate");
+
+        struct TestCtx
+        {
+            int sendCount = 0;
+            int buildCount = 0;
+            uint32_t lastPayloadLen = 0;
+            uint8_t lastStepIdxSeen = 0xFF;
+        };
+
+        auto makeCallbacks = []()
+        {
+            RTPSInitialAnnounceRunnerCallbacks cb;
+            cb.buildPayload = [](void* userCtx, const RTPSInitialAnnounceStep&,
+                                 uint64_t, uint32_t, uint32_t) -> uint32_t
+            {
+                static_cast<TestCtx*>(userCtx)->buildCount++;
+                return 64; // non-zero so send fires
+            };
+            cb.sendPayload = [](void* userCtx, RTPSInitialAnnounceAction, uint32_t payloadLen) -> int
+            {
+                auto* c = static_cast<TestCtx*>(userCtx);
+                c->sendCount++;
+                c->lastPayloadLen = payloadLen;
+                return (int)payloadLen;
+            };
+            return cb;
+        };
+
+        // (a) runStep returns false when stepIdx >= numSteps.
+        {
+            TestCtx ctx;
+            RTPSInitialAnnounceRunnerContext runCtx;
+            runCtx.runtimeFlavor = RTPSInitialAnnounceRuntimeFlavor::LinuxStyle;
+            auto cb = makeCallbacks();
+            bool inRange = RTPSInitialAnnounceRunner_runStep(seq, seq.numSteps, runCtx, cb, &ctx);
+            TEST_ASSERT(!inRange, "runStep returns false when stepIdx out of range");
+            TEST_ASSERT(ctx.sendCount == 0, "out-of-range runStep does not send");
+        }
+
+        // (b) runStep iterated over all indices produces the same send count as _run.
+        int refSendCount = 0;
+        {
+            TestCtx ctx;
+            RTPSInitialAnnounceRunnerContext runCtx;
+            runCtx.runtimeFlavor = RTPSInitialAnnounceRuntimeFlavor::LinuxStyle;
+            auto cb = makeCallbacks();
+            RTPSInitialAnnounceRunner_run(seq, runCtx, cb, &ctx);
+            refSendCount = ctx.sendCount;
+            TEST_ASSERT(refSendCount > 0, "reference _run sent at least one payload");
+        }
+        {
+            TestCtx ctx;
+            RTPSInitialAnnounceRunnerContext runCtx;
+            runCtx.runtimeFlavor = RTPSInitialAnnounceRuntimeFlavor::LinuxStyle;
+            auto cb = makeCallbacks();
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+                TEST_ASSERT(RTPSInitialAnnounceRunner_runStep(seq, i, runCtx, cb, &ctx),
+                            "runStep returns true for in-range index");
+            TEST_ASSERT(ctx.sendCount == refSendCount,
+                        "runStep iteration sends same total as _run");
+        }
+
+        // (c) runCtx.previousPayloadLen is updated between runStep calls
+        //     (important for ReusePrevious-kind steps in the sequence).
+        {
+            TestCtx ctx;
+            RTPSInitialAnnounceRunnerContext runCtx;
+            runCtx.runtimeFlavor = RTPSInitialAnnounceRuntimeFlavor::LinuxStyle;
+            auto cb = makeCallbacks();
+            TEST_ASSERT(runCtx.previousPayloadLen == 0, "previousPayloadLen starts at 0");
+            RTPSInitialAnnounceRunner_runStep(seq, 0, runCtx, cb, &ctx);
+            TEST_ASSERT(runCtx.previousPayloadLen == 64,
+                        "previousPayloadLen reflects last buildPayload return across runStep calls");
+        }
+    }
+
+    //=================================================================
+    // RTPSWriterHeartbeatRunner_runStep - per-step execution for spreading
+    // the periodic writer-heartbeat pass across multiple scheduler ticks.
+    //=================================================================
+    {
+        printf("Test: RTPSWriterHeartbeatRunner_runStep per-step execution\n");
+
+        const auto seq = RTPSWriterHeartbeatRunner_buildSequence(
+            RTPSWriterHeartbeatRuntimeFlavor::EspStyle);
+        TEST_ASSERT(seq.numSteps > 1, "HB sequence has multiple steps to iterate");
+
+        struct HbCtx
+        {
+            int buildCount = 0;
+            int sendCount = 0;
+            uint32_t lastHeartbeatCount = 0;
+        };
+
+        auto makeCallbacks = []()
+        {
+            RTPSWriterHeartbeatRunnerCallbacks cb;
+            cb.buildPayload = [](void* userCtx, RTPSWriterHeartbeatAction,
+                                 uint64_t, uint32_t heartbeatCount) -> uint32_t
+            {
+                auto* c = static_cast<HbCtx*>(userCtx);
+                c->buildCount++;
+                c->lastHeartbeatCount = heartbeatCount;
+                return 48;
+            };
+            cb.sendPayload = [](void* userCtx, RTPSWriterHeartbeatSendTarget, uint32_t payloadLen) -> int
+            {
+                static_cast<HbCtx*>(userCtx)->sendCount++;
+                return (int)payloadLen;
+            };
+            return cb;
+        };
+
+        // (a) Out-of-range returns false and does not call buildPayload/sendPayload.
+        {
+            HbCtx ctx;
+            RTPSWriterHeartbeatCounterState counters;
+            auto cb = makeCallbacks();
+            bool inRange = RTPSWriterHeartbeatRunner_runStep(
+                RTPSWriterHeartbeatRuntimeFlavor::EspStyle,
+                seq, seq.numSteps, counters, cb, &ctx);
+            TEST_ASSERT(!inRange, "runStep returns false when stepIdx out of range");
+            TEST_ASSERT(ctx.buildCount == 0 && ctx.sendCount == 0,
+                        "out-of-range runStep does not invoke callbacks");
+        }
+
+        // (b) Iterated runStep matches _run send/build totals.
+        int refBuild = 0, refSend = 0;
+        uint32_t refHb = 0, refLive = 0;
+        {
+            HbCtx ctx;
+            RTPSWriterHeartbeatCounterState counters;
+            auto cb = makeCallbacks();
+            RTPSWriterHeartbeatRunner_run(
+                RTPSWriterHeartbeatRuntimeFlavor::EspStyle, counters, cb, &ctx);
+            refBuild = ctx.buildCount;
+            refSend = ctx.sendCount;
+            refHb = counters.heartbeatCount;
+            refLive = (uint32_t)counters.livelinessSeqNum;
+            TEST_ASSERT(refSend > 0, "reference _run sent at least one payload");
+        }
+        {
+            HbCtx ctx;
+            RTPSWriterHeartbeatCounterState counters;
+            auto cb = makeCallbacks();
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+                TEST_ASSERT(RTPSWriterHeartbeatRunner_runStep(
+                                RTPSWriterHeartbeatRuntimeFlavor::EspStyle,
+                                seq, i, counters, cb, &ctx),
+                            "runStep returns true for in-range index");
+            TEST_ASSERT(ctx.buildCount == refBuild,
+                        "iterated runStep build count matches _run");
+            TEST_ASSERT(ctx.sendCount == refSend,
+                        "iterated runStep send count matches _run");
+            TEST_ASSERT(counters.heartbeatCount == refHb,
+                        "iterated runStep heartbeatCount matches _run");
+            TEST_ASSERT((uint32_t)counters.livelinessSeqNum == refLive,
+                        "iterated runStep livelinessSeqNum matches _run");
+        }
+
+        // (c) Counter mutations (heartbeatCount, livelinessSeqNum) are per-step:
+        //     only steps that request the increment actually bump the counters.
+        {
+            HbCtx ctx;
+            RTPSWriterHeartbeatCounterState counters;
+            auto cb = makeCallbacks();
+            uint32_t prevHb = counters.heartbeatCount;
+            uint64_t prevLive = counters.livelinessSeqNum;
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+            {
+                const auto& step = seq.steps[i];
+                const uint32_t expectedHb =
+                    prevHb + (step.incrementHeartbeatBeforeBuild ? 1 : 0);
+                const uint64_t expectedLive =
+                    prevLive + (step.incrementLivelinessSeqBeforeBuild ? 1 : 0);
+                RTPSWriterHeartbeatRunner_runStep(
+                    RTPSWriterHeartbeatRuntimeFlavor::EspStyle,
+                    seq, i, counters, cb, &ctx);
+                TEST_ASSERT(counters.heartbeatCount == expectedHb,
+                            "heartbeatCount bumped only for steps that request it");
+                TEST_ASSERT(counters.livelinessSeqNum == expectedLive,
+                            "livelinessSeqNum bumped only for steps that request it");
+                prevHb = counters.heartbeatCount;
+                prevLive = counters.livelinessSeqNum;
+            }
+        }
+    }
+
+    //=================================================================
     // decodeStdMsgsString: CDR-encapsulated std_msgs/String decode
     //=================================================================
     {
@@ -1500,6 +1703,130 @@ int main()
             RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle, runCounters, cb, &ctx);
         TEST_ASSERT(ctx.subBuildCalls == 1 && ctx.lastSubSeq == 5,
                     "Linux run uses sedpSubSeqNum+1 (=4+1=5) for chatter sub SN");
+    }
+
+    //=================================================================
+    // RTPSReliabilityAndWriterState: ACKNACK writerEID label map
+    //=================================================================
+    {
+        printf("Test: classifyWriter / writerKindToStr label map\n");
+        using namespace RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState;
+
+        TEST_ASSERT(classifyWriter(ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER)
+                        == RTPSAckNackWriterKind::SedpPublications,
+                    "SEDP publications writer classified");
+        TEST_ASSERT(classifyWriter(ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER)
+                        == RTPSAckNackWriterKind::SedpSubscriptions,
+                    "SEDP subscriptions writer classified");
+        TEST_ASSERT(classifyWriter(ENTITYID_ROS_DISC_INFO_WRITER)
+                        == RTPSAckNackWriterKind::RosDiscoveryInfo,
+                    "ros_discovery_info writer classified");
+        TEST_ASSERT(classifyWriter(ENTITYID_CHATTER_WRITER)
+                        == RTPSAckNackWriterKind::Chatter,
+                    "chatter writer classified");
+        TEST_ASSERT(classifyWriter(ENTITYID_CHATTER_READER)
+                        == RTPSAckNackWriterKind::ChatterReader,
+                    "chatter_in reader (as ACK target) classified");
+        TEST_ASSERT(classifyWriter(ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER)
+                        == RTPSAckNackWriterKind::ParticipantMessage,
+                    "liveliness/participant-message writer classified (fixes '(unknown)')");
+
+        TEST_ASSERT(strcmp(writerKindToStr(RTPSAckNackWriterKind::ParticipantMessage),
+                            "participant_msg") == 0,
+                    "participant_msg label present");
+        TEST_ASSERT(strcmp(writerKindToStr(RTPSAckNackWriterKind::ChatterReader),
+                            "chatter_in_reader") == 0,
+                    "chatter_in_reader label present");
+    }
+
+    //=================================================================
+    // RTPSSubscriptionRegistry: N-ary string subscription table
+    //=================================================================
+    {
+        printf("Test: RTPSSubscriptionRegistry add/lookup/iterate\n");
+        using namespace RaftRuntime::RTPS::Runtime::Dispatch;
+
+        // Deterministic entity ID allocator.
+        uint8_t eid[4];
+        TEST_ASSERT(RTPSSubscriptionRegistry_allocateNextEntityId(0, eid)
+                    && eid[0] == 0x00 && eid[1] == 0x01 && eid[2] == 0x02 && eid[3] == 0x04,
+                    "slot 0 allocates ENTITYID_CHATTER_READER");
+        TEST_ASSERT(RTPSSubscriptionRegistry_allocateNextEntityId(1, eid)
+                    && eid[0] == 0x00 && eid[1] == 0x01 && eid[2] == 0x03 && eid[3] == 0x04,
+                    "slot 1 increments the key byte");
+        TEST_ASSERT(RTPSSubscriptionRegistry_allocateNextEntityId(7, eid)
+                    && eid[2] == 0x09,
+                    "slot 7 (last) is 0x00 0x01 0x09 0x04");
+        TEST_ASSERT(!RTPSSubscriptionRegistry_allocateNextEntityId(RTPS_SUBSCRIPTION_REGISTRY_CAPACITY, eid),
+                    "slot >= capacity fails");
+
+        // Empty registry.
+        RTPSSubscriptionRegistry reg;
+        TEST_ASSERT(reg.count == 0, "registry starts empty");
+
+        // Add returns slot index; capacity guard.
+        TEST_ASSERT(reg.add("rt/chatter_in", "std_msgs::msg::dds_::String_") == 0,
+                    "first add returns slot 0");
+        TEST_ASSERT(reg.add("rt/cmd", "std_msgs::msg::dds_::String_") == 1,
+                    "second add returns slot 1");
+        TEST_ASSERT(reg.count == 2, "count tracks additions");
+
+        // Null / empty guards.
+        TEST_ASSERT(reg.add(nullptr, "x") == -1, "null topic rejected");
+        TEST_ASSERT(reg.add("x", nullptr) == -1, "null type rejected");
+        TEST_ASSERT(reg.add("", "x") == -1, "empty topic rejected");
+        TEST_ASSERT(reg.count == 2, "failed adds do not bump count");
+
+        // Entity IDs match the allocator policy.
+        TEST_ASSERT(reg.entries[0].entityId[2] == 0x02
+                    && reg.entries[1].entityId[2] == 0x03,
+                    "per-slot entity ID follows allocator");
+        TEST_ASSERT(strcmp(reg.entries[1].topic, "rt/cmd") == 0,
+                    "topic stored non-owning");
+
+        // Lookup by entity ID.
+        const uint8_t chatterIn[4]  = {0x00, 0x01, 0x02, 0x04};
+        const uint8_t cmd[4]        = {0x00, 0x01, 0x03, 0x04};
+        const uint8_t unknown[4]    = {0x00, 0x01, 0x09, 0x04};
+        const RTPSSubscriptionEntry* e0 = reg.findByEntityId(chatterIn);
+        const RTPSSubscriptionEntry* e1 = reg.findByEntityId(cmd);
+        const RTPSSubscriptionEntry* eN = reg.findByEntityId(unknown);
+        TEST_ASSERT(e0 && strcmp(e0->topic, "rt/chatter_in") == 0,
+                    "findByEntityId resolves slot 0");
+        TEST_ASSERT(e1 && strcmp(e1->topic, "rt/cmd") == 0,
+                    "findByEntityId resolves slot 1");
+        TEST_ASSERT(eN == nullptr, "findByEntityId returns null for unknown EID");
+        TEST_ASSERT(reg.findByEntityId(nullptr) == nullptr, "null EID safe");
+
+        // readerEntityIds fills pointer array.
+        const uint8_t* ids[RTPS_SUBSCRIPTION_REGISTRY_CAPACITY] = {nullptr};
+        uint32_t n = reg.readerEntityIds(ids, RTPS_SUBSCRIPTION_REGISTRY_CAPACITY);
+        TEST_ASSERT(n == 2, "readerEntityIds returns count");
+        TEST_ASSERT(ids[0] == reg.entries[0].entityId
+                    && ids[1] == reg.entries[1].entityId,
+                    "readerEntityIds populates in slot order");
+        // maxOut cap honoured.
+        n = reg.readerEntityIds(ids, 1);
+        TEST_ASSERT(n == 1, "readerEntityIds honours maxOut cap");
+
+        // Capacity guard: add up to 8 then fail.
+        RTPSSubscriptionRegistry full;
+        for (int i = 0; i < RTPS_SUBSCRIPTION_REGISTRY_CAPACITY; i++)
+            TEST_ASSERT(full.add("t", "y") == i, "filling registry in order");
+        TEST_ASSERT(full.count == RTPS_SUBSCRIPTION_REGISTRY_CAPACITY,
+                    "registry at capacity");
+        TEST_ASSERT(full.add("overflow", "y") == -1,
+                    "add past capacity fails");
+
+        // setTopic on existing slot.
+        TEST_ASSERT(reg.setTopic(0, "rt/new_topic", "new_type"),
+                    "setTopic updates existing slot");
+        TEST_ASSERT(strcmp(reg.entries[0].topic, "rt/new_topic") == 0,
+                    "setTopic reflected in entry");
+        TEST_ASSERT(!reg.setTopic(99, "x", "y"),
+                    "setTopic rejects out-of-range slot");
+        TEST_ASSERT(!reg.setTopic(0, nullptr, "y"),
+                    "setTopic rejects null topic");
     }
 
     //=================================================================
