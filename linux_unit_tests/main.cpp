@@ -19,6 +19,7 @@
 #include "runtime/core/RTPSParticipant.h"
 #include "runtime/discovery/SPDPHandler.h"
 #include "runtime/announce/SEDPHandler.h"
+#include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -474,6 +475,136 @@ int main()
         }
         TEST_ASSERT(foundDATA == 1, "User DATA msg has 1 DATA submessage");
         TEST_ASSERT(foundHB == 1, "User DATA msg has 1 HEARTBEAT submessage");
+    }
+
+    //=================================================================
+    // ACKNACK action plan: VOLATILE /chatter HEARTBEAT firstSN must equal
+    // the current sequence number (Fix 15 regression guard).
+    // This ensures newly-matched VOLATILE subscribers do not NACK historical
+    // samples after an ACKNACK-driven chatter retransmit.
+    //=================================================================
+    {
+        printf("Test: ACKNACK chatter retransmit firstSN == currentSeq (VOLATILE invariant)\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState;
+
+        // ESP flavor: factory must opt in to chatterFirstSNMatchesSequence
+        const auto espUserCtx = makeAckUserDataSequenceContextForFlavor(
+            RTPSAckNackRuntimeFlavor::EspStyle,
+            /*rosDiscoveryInfoSeqNum*/ 7,
+            /*chatterDataSeqNum*/ 42);
+        TEST_ASSERT(espUserCtx.chatterFirstSNMatchesSequence,
+                    "ESP flavor sets chatterFirstSNMatchesSequence");
+
+        // Linux flavor: factory must also opt in (VOLATILE invariant is flavor-agnostic)
+        const auto linuxUserCtx = makeAckUserDataSequenceContextForFlavor(
+            RTPSAckNackRuntimeFlavor::LinuxStandalone,
+            /*rosDiscoveryInfoSeqNum*/ 9,
+            /*chatterDataSeqNum*/ 100);
+        TEST_ASSERT(linuxUserCtx.chatterFirstSNMatchesSequence,
+                    "Linux flavor sets chatterFirstSNMatchesSequence");
+
+        // Chatter retransmit plan must report firstSN override == sequenceNumber
+        RTPSAckActionUserDataPlan chatterPlan = {};
+        TEST_ASSERT(getAckActionUserDataPlan(
+                        RTPSAckNackDecisionAction::RetransmitChatterData,
+                        espUserCtx,
+                        chatterPlan),
+                    "Chatter retransmit plan produced");
+        TEST_ASSERT(chatterPlan.sequenceNumber == 42,
+                    "Chatter plan sequenceNumber == chatterDataSeqNum");
+        TEST_ASSERT(chatterPlan.hasFirstSNOverride,
+                    "Chatter plan hasFirstSNOverride=true for VOLATILE");
+        TEST_ASSERT(chatterPlan.firstSN == chatterPlan.sequenceNumber,
+                    "Chatter plan firstSN == sequenceNumber (VOLATILE invariant)");
+
+        // ros_discovery_info is TRANSIENT_LOCAL: firstSN override must NOT be set
+        RTPSAckActionUserDataPlan rosDiscPlan = {};
+        TEST_ASSERT(getAckActionUserDataPlan(
+                        RTPSAckNackDecisionAction::RetransmitRosDiscoveryInfo,
+                        espUserCtx,
+                        rosDiscPlan),
+                    "ros_discovery_info retransmit plan produced");
+        TEST_ASSERT(!rosDiscPlan.hasFirstSNOverride,
+                    "ros_discovery_info plan does not override firstSN (TRANSIENT_LOCAL)");
+        TEST_ASSERT(rosDiscPlan.sequenceNumber == 7,
+                    "ros_discovery_info plan sequenceNumber == rosDiscoveryInfoSeqNum");
+    }
+
+    //=================================================================
+    // ACKNACK SEDP plan: two DataWriter announcements on the same
+    // SEDP publications writer must use distinct sequence numbers
+    // (Fix 16 regression guard).
+    //=================================================================
+    {
+        printf("Test: ACKNACK SEDP publication retransmit uses distinct sequence numbers\n");
+
+        using namespace RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState;
+
+        // ESP flavor: ros_discovery_info SEDP pub at seq=1, chatter SEDP pub at seq=2.
+        // The ESP path uses distinct chatterPublicationSeqNum (not derived).
+        const auto espSedpCtx = makeAckSedpSequenceContextForFlavor(
+            RTPSAckNackRuntimeFlavor::EspStyle,
+            /*rosDiscoveryPublicationSeqNum*/ 1,
+            /*rosDiscoverySubscriptionSeqNum*/ 1,
+            /*chatterPublicationSeqNum*/ 2);
+        TEST_ASSERT(!espSedpCtx.deriveChatterPublicationFromRosDiscoveryPublication,
+                    "ESP flavor uses explicit chatterPublicationSeqNum");
+
+        RTPSAckActionSedpPlan rosDiscSedpPlan = {};
+        RTPSAckActionSedpPlan chatterSedpPlan = {};
+        TEST_ASSERT(getAckActionSedpPlan(
+                        RTPSAckNackDecisionAction::RetransmitSedpRosDiscoveryPublication,
+                        espSedpCtx,
+                        rosDiscSedpPlan),
+                    "ESP ros_discovery_info SEDP pub plan produced");
+        TEST_ASSERT(getAckActionSedpPlan(
+                        RTPSAckNackDecisionAction::RetransmitSedpChatterPublication,
+                        espSedpCtx,
+                        chatterSedpPlan),
+                    "ESP chatter SEDP pub plan produced");
+
+        TEST_ASSERT(rosDiscSedpPlan.sequenceNumber == 1,
+                    "ESP ros_discovery_info SEDP pub seq=1");
+        TEST_ASSERT(chatterSedpPlan.sequenceNumber == 2,
+                    "ESP chatter SEDP pub seq=2");
+        TEST_ASSERT(rosDiscSedpPlan.sequenceNumber != chatterSedpPlan.sequenceNumber,
+                    "ESP two SEDP publications on same writer have distinct seq");
+
+        // Endpoints must also be distinct (different entity IDs, topics, durability)
+        TEST_ASSERT(rosDiscSedpPlan.endpoint.entityId != chatterSedpPlan.endpoint.entityId,
+                    "ESP SEDP pub plans target distinct entity IDs");
+        TEST_ASSERT(rosDiscSedpPlan.endpoint.durabilityKind == DURABILITY_TRANSIENT_LOCAL,
+                    "ros_discovery_info SEDP pub is TRANSIENT_LOCAL");
+        TEST_ASSERT(chatterSedpPlan.endpoint.durabilityKind == DURABILITY_VOLATILE,
+                    "chatter SEDP pub is VOLATILE");
+
+        // Linux flavor: derives chatter SEDP pub seq = rosDiscovery SEDP pub seq + 1.
+        // Regardless of derivation strategy, the two seq numbers MUST differ.
+        const auto linuxSedpCtx = makeAckSedpSequenceContextForFlavor(
+            RTPSAckNackRuntimeFlavor::LinuxStandalone,
+            /*rosDiscoveryPublicationSeqNum*/ 1,
+            /*rosDiscoverySubscriptionSeqNum*/ 1,
+            /*chatterPublicationSeqNum*/ 0);
+        TEST_ASSERT(linuxSedpCtx.deriveChatterPublicationFromRosDiscoveryPublication,
+                    "Linux flavor derives chatter SEDP pub from ros_discovery SEDP pub");
+
+        RTPSAckActionSedpPlan linuxRosDiscPlan = {};
+        RTPSAckActionSedpPlan linuxChatterPlan = {};
+        TEST_ASSERT(getAckActionSedpPlan(
+                        RTPSAckNackDecisionAction::RetransmitSedpRosDiscoveryPublication,
+                        linuxSedpCtx,
+                        linuxRosDiscPlan),
+                    "Linux ros_discovery_info SEDP pub plan produced");
+        TEST_ASSERT(getAckActionSedpPlan(
+                        RTPSAckNackDecisionAction::RetransmitSedpChatterPublication,
+                        linuxSedpCtx,
+                        linuxChatterPlan),
+                    "Linux chatter SEDP pub plan produced");
+        TEST_ASSERT(linuxRosDiscPlan.sequenceNumber != linuxChatterPlan.sequenceNumber,
+                    "Linux two SEDP publications on same writer have distinct seq");
+        TEST_ASSERT(linuxChatterPlan.sequenceNumber == linuxRosDiscPlan.sequenceNumber + 1,
+                    "Linux derives chatter SEDP pub seq = rosDiscovery seq + 1");
     }
 
     //=================================================================

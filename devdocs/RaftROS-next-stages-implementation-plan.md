@@ -150,9 +150,9 @@
 
 ## Recommended Immediate Implementation Order
 
-1. Finish moving remaining wrapper-side writer-state/action-execution policy behind `RTPSReliabilityAndWriterStateRuntime`.
-2. Add a focused unit test for VOLATILE `firstSN == currentSeq` HEARTBEAT invariant (regression guard for Stage 3 Fix 15).
-3. Add a focused unit test for "two DataWriter announcements on the same SEDP publications writer must use distinct sequence numbers" (regression guard for Stage 3 Fix 16).
+1. ~~Finish moving remaining wrapper-side writer-state/action-execution policy behind `RTPSReliabilityAndWriterStateRuntime`.~~ **DONE 2026-04-21** — shared `RTPSAckActionStandardCtx` + `_initStandardAckActionCtx`/`_standardExecuteAction`/`_standardGetChatterSeq` helpers in `RTPSRunnerAdapterHelpers`; both wrappers converted; Linux validated (108 passed). ESP on-device smoke test still pending.
+2. ~~Add a focused unit test for VOLATILE `firstSN == currentSeq` HEARTBEAT invariant (regression guard for Stage 3 Fix 15).~~ **DONE 2026-04-21** — guard in `linux_unit_tests/main.cpp`.
+3. ~~Add a focused unit test for "two DataWriter announcements on the same SEDP publications writer must use distinct sequence numbers" (regression guard for Stage 3 Fix 16).~~ **DONE 2026-04-21** — guard in `linux_unit_tests/main.cpp`.
 4. Start Stage 6 (Phase 3 — subscribing) with a skeleton reader runtime behind new runner callbacks, mirroring the writer runner structure.
 5. Re-run `make -j$(nproc) all standalone && ./linux_unit_tests` after each extraction batch.
 
