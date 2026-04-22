@@ -377,11 +377,19 @@ uint32_t SEDPHandler::buildParticipantMessageData(
         payload, pp);
 
     // HEARTBEAT
+    // Advertise only the current sample as available (firstSN == lastSN == sequenceNumber).
+    // The liveliness topic is a keep-alive; older samples have no semantic value and we do
+    // not cache them for retransmit.  Advertising the full history (firstSN = 1) caused
+    // ROS 2 peers to NACK every missed sample (numBits growing to 166 / 256), flooding the
+    // metatraffic socket.  firstSN = lastSN tells the peer those samples are GAP'd and it
+    // should just advance its base past the current SN.
+    const uint32_t liveSnLow = (uint32_t)(sequenceNumber & 0xFFFFFFFF);
+    const uint32_t liveSnHigh = (uint32_t)((sequenceNumber >> 32) & 0xFFFFFFFF);
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
         ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_READER,
         ENTITYID_P2P_BUILTIN_PARTICIPANT_MESSAGE_WRITER,
-        0, 1,
-        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        liveSnHigh, liveSnLow,
+        liveSnHigh, liveSnLow,
         heartbeatCount);
 
     return pos;

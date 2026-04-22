@@ -96,3 +96,16 @@ void RTPSWriterHeartbeatRunner_run(
     RTPSWriterHeartbeatCounterState& counters,
     const RTPSWriterHeartbeatRunnerCallbacks& callbacks,
     void* userCtx);
+
+// Execute a single step of the writer-heartbeat sequence.  Returns false if stepIdx is
+// out of range (allowing callers to treat the returned value as "done").  All counter
+// mutations (heartbeatCount / livelinessSeqNum) happen inside this call for the given
+// step only, so a scheduler can spread the full sequence across many loop() ticks by
+// invoking this once per tick and persisting `counters` and `stepIdx` between calls.
+bool RTPSWriterHeartbeatRunner_runStep(
+    RTPSWriterHeartbeatRuntimeFlavor runtimeFlavor,
+    const RTPSWriterHeartbeatSequence& sequence,
+    uint8_t stepIdx,
+    RTPSWriterHeartbeatCounterState& counters,
+    const RTPSWriterHeartbeatRunnerCallbacks& callbacks,
+    void* userCtx);

@@ -12,9 +12,15 @@
 #include "runtime/core/RTPSParticipant.h"
 #include "runtime/discovery/SPDPHandler.h"
 #include "runtime/announce/SEDPHandler.h"
+#include "runtime/announce/RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSInitialAnnounceRunner.h"
+#include "runtime/announce/RTPSWriterHeartbeatRunner.h"
 #include "runtime/reliability/RTPSReaderStateMap.h"
+#include "runtime/dispatch/RTPSSubscriptionRegistry.h"
 #include <functional>
 #include <vector>
+#include <sys/socket.h>
+#include <netinet/in.h>
 
 class APISourceInfo;
 
@@ -33,8 +39,50 @@ public:
     // Signature: (writerEID[4], srcGuidPrefix[12], text, textLen)
     using StringMessageHandler = std::function<void(const uint8_t*, const uint8_t*, const char*, uint32_t)>;
 
-    // Register a handler invoked when a std_msgs/String arrives on any user-topic writer
-    // (except built-in ros_discovery_info). Pass an empty std::function to clear.
+    // Register the subscription topic + type + handler for the DEFAULT std_msgs/String
+    // subscription slot (slot 0 - the `rt/chatter_in` reader on ENTITYID_CHATTER_READER).
+    // The topic / type name are sent in the SEDP subscription advertisement so ROS 2 publishers
+    // will route matching traffic to our reader.  Pass an empty std::function to clear.
+    void setStringSubscription(const char* topic, const char* type, StringMessageHandler handler)
+    {
+        if (topic && *topic)
+            _subscriptionTopic = topic;
+        if (type && *type)
+            _subscriptionType = type;
+        // Mirror slot 0 in the registry so N-ary announce/HB loops see a consistent view.
+        if (_subscriptionRegistry.count > 0)
+            _subscriptionRegistry.setTopic(0, _subscriptionTopic.c_str(), _subscriptionType.c_str());
+        _stringMessageHandler = std::move(handler);
+    }
+
+    // Register an ADDITIONAL std_msgs/String subscription.  Returns the slot index assigned
+    // (>= 1), or -1 if the registry is full (capacity = RTPS_SUBSCRIPTION_REGISTRY_CAPACITY).
+    //
+    // The slot gets a fresh RTPS reader entity ID (deterministic per slot) and is advertised
+    // via SEDP on the next initial announce to any discovered participant, and on every
+    // periodic heartbeat retransmit thereafter.  Reader GIDs for all slots are also included
+    // in the `ros_discovery_info` payload.
+    //
+    // NOTE: The string/type pointers must remain valid for the lifetime of this RaftROS
+    // instance (they are typically string literals).  The registry does not copy strings.
+    //
+    // NOTE (follow-up): `handler` is stored but is not yet routed per-topic.  The current
+    // single-handler dispatch (see `setStringMessageHandler` / `setStringSubscription`)
+    // fires for DATA on any of the advertised readers.  Per-topic handler routing requires
+    // correlating remote SEDP publication records (remote writerGUID -> topicName) with our
+    // registry; that correlation is the remaining Phase 3 follow-up.
+    int addStringSubscription(const char* topic, const char* type, StringMessageHandler handler = {})
+    {
+        const int slot = _subscriptionRegistry.add(topic, type);
+        if (slot < 0)
+            return -1;
+        if (handler)
+            _extraSubscriptionHandlers[slot] = std::move(handler);
+        return slot;
+    }
+
+    // Register a handler invoked when a std_msgs/String arrives on the default /chatter_in topic
+    // ("rt/chatter_in", std_msgs::msg::dds_::String_).  Pass an empty std::function to clear.
     void setStringMessageHandler(StringMessageHandler handler)
     {
         _stringMessageHandler = std::move(handler);
@@ -90,6 +138,26 @@ private:
     // Optional user-topic std_msgs/String dispatch handler; invoked by recvUserData.
     StringMessageHandler _stringMessageHandler;
 
+    // N-ary subscription registry.  Slot 0 is pre-populated at construction with the
+    // default ENTITYID_CHATTER_READER / rt/chatter_in entry.  Slots 1..N are appended
+    // via addStringSubscription().  Iterated by the announce/HB paths and by
+    // buildRosDiscInfoWithGids() to include every reader's GID.
+    RaftRuntime::RTPS::Runtime::Dispatch::RTPSSubscriptionRegistry _subscriptionRegistry;
+
+    // Per-extra-slot handlers (slot 0 uses _stringMessageHandler).  Currently unused
+    // because dispatch does not yet route per-topic; stored for the upcoming SEDP-pub
+    // correlation follow-up.
+    StringMessageHandler _extraSubscriptionHandlers[8];
+
+    // Per-extra-slot SEDP subscription sequence number (slot 0 uses chatterSedpSubSeqNum).
+    // Stays at 1 for the lifetime of the slot (subscription announces are idempotent).
+    uint64_t _extraSubscriptionSeqNums[8] = {1,1,1,1,1,1,1,1};
+
+    // Configurable subscription topic/type (used for SEDP advertisement + dispatch).
+    // Defaults to the ROS 2 /chatter_in topic; replaced by setStringSubscription().
+    String _subscriptionTopic = "rt/chatter_in";
+    String _subscriptionType  = "std_msgs::msg::dds_::String_";
+
     // Chatter topic (Phase 2) - sequence numbers and timing
     uint64_t _chatterSeqNum = 0;       // increments each publish
     uint64_t _chatterSedpSeqNum = 2;   // seq 2 on SEDP pubs writer = chatter publication
@@ -100,6 +168,40 @@ private:
     // Discovered remote participants
     std::vector<DiscoveredParticipant> _discovered;
     static const uint32_t MAX_DISCOVERED = 8;
+
+    // Pending initial-announce entries.  When a new participant is discovered, instead
+    // of firing the whole SEDP/liveliness/ros_discovery burst synchronously (which has
+    // been observed to consume ~30 ms in a single loop() tick on ESP32-S3), we enqueue
+    // a PendingAnnounce and emit one step per loop() iteration from drainPendingAnnounces().
+    // Once the main sequence is exhausted we iterate the extra-subscription slots 1..N
+    // one per tick.  The entry is removed when both phases complete.
+    struct PendingAnnounce
+    {
+        DiscoveredParticipant remote;               // snapshot (value, not pointer)
+        struct sockaddr_in senderAddr = {};         // snapshot of sender for initial unicast
+        RTPSInitialAnnounceSequence sequence;       // built once at enqueue time
+        RTPSInitialAnnounceRunnerContext runCtx;    // carries seq counters + previousPayloadLen
+        uint8_t stepIdx = 0;                        // next main-sequence step to emit
+        uint8_t extraSubSlot = 1;                   // next extra-sub registry slot to announce
+        bool mainPhaseDone = false;                 // true once stepIdx reached numSteps
+    };
+    static const uint32_t MAX_PENDING_ANNOUNCES = 8;
+    std::vector<PendingAnnounce> _pendingAnnounces;
+
+    // Periodic writer-heartbeat pass state.  Instead of bursting ~14 sendto()'s in a
+    // single loop() tick (2 peers x ~7 actions), a pass is kicked off once per
+    // WRITER_HB_INTERVAL_MS and then drained one (peer, step) per loop() iteration.
+    struct WriterHbPassState
+    {
+        bool active = false;
+        RTPSWriterHeartbeatCounterState counters;   // live across the pass
+        RTPSWriterHeartbeatSequence sequence;       // built once at pass start
+        uint32_t peerIdx = 0;                       // index into _discovered
+        uint8_t stepIdx = 0;                        // within main sequence for current peer
+        uint8_t extraSubSlot = 1;                   // extra-sub slot (1..N) for current peer
+        bool mainPhaseDoneForPeer = false;          // true once stepIdx reached numSteps
+    };
+    WriterHbPassState _hbPass;
 
     // Diagnostic tracking (for detecting silent list/state transitions)
     std::size_t _lastLoggedDiscoveredCount = 0;
@@ -118,8 +220,10 @@ private:
     void recvSPDP();
     void recvMetatraffic();
     void recvUserData();
-    void sendWriterHeartbeats();
+    void startWriterHeartbeatPass();
+    void stepWriterHeartbeatPass();
     void handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr);
+    void drainPendingAnnounces();
     void purgeStaleParticipants();
     void processDiscoveredParticipant(DiscoveredParticipant& remote, const struct sockaddr_in& fromAddr);
     void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
