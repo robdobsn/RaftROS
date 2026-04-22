@@ -24,12 +24,6 @@ MainSysMod::~MainSysMod()
 
 void MainSysMod::setup()
 {
-    // The following code is an example of how to use the config object to
-    // get a parameter from SysType (JSON) file for this system module
-    // Replace this with your own setup code
-    String configValue = config.getString("exampleGroup/exampleKey", "This Should Not Happen!");
-    LOG_I(MODULE_PREFIX, "%s", configValue.c_str());
-
     // Hook the RaftROS /chatter_in handler so application code receives decoded
     // std_msgs/String messages. This runs after SysMods have been created, so
     // the RaftROS instance is available by name lookup.
@@ -39,17 +33,42 @@ void MainSysMod::setup()
         RaftROS* pRaftROS = static_cast<RaftROS*>(pRos);
         if (pRaftROS)
         {
-            pRaftROS->setStringMessageHandler(
-                [](const uint8_t* writerEID, const uint8_t* srcGuid,
-                   const char* text, uint32_t textLen)
+            // Register per-topic subscription for /chatter_in using the new
+            // addStringSubscription API.  The handler is correlated to the
+            // remote writer via the SEDP publication map so that additional
+            // subscriptions (added later) each receive only their own messages.
+            pRaftROS->addStringSubscription(
+                "rt/chatter_in",
+                "std_msgs::msg::dds_::String_",
+                [this](const uint8_t* writerEID, const uint8_t* srcGuid,
+                       const char* text, uint32_t textLen)
                 {
                     LOG_I("MainSysMod",
-                          "chatter_in received writerEID=%02X%02X%02X%02X src=%02X%02X%02X%02X... \"%s\" (%u chars)",
+                          "chatter_in #%u writerEID=%02X%02X%02X%02X src=%02X%02X%02X%02X... \"%s\" (%u chars)",
+                          (unsigned)++_rxCount,
                           writerEID[0], writerEID[1], writerEID[2], writerEID[3],
                           srcGuid[0], srcGuid[1], srcGuid[2], srcGuid[3],
                           text, (unsigned)textLen);
                 });
-            LOG_I(MODULE_PREFIX, "Registered /chatter_in string message handler");
+            LOG_I(MODULE_PREFIX, "Registered /chatter_in string message handler (per-topic slot)");
+
+            // Second subscription on a different topic, routed to its own slot.
+            // Test from ROS 2 host with:
+            //   ros2 topic pub /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"
+            pRaftROS->addStringSubscription(
+                "rt/chatter_in2",
+                "std_msgs::msg::dds_::String_",
+                [this](const uint8_t* writerEID, const uint8_t* srcGuid,
+                       const char* text, uint32_t textLen)
+                {
+                    LOG_I("MainSysMod",
+                          "chatter_in2 #%u writerEID=%02X%02X%02X%02X src=%02X%02X%02X%02X... \"%s\" (%u chars)",
+                          (unsigned)++_rxCount2,
+                          writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+                          srcGuid[0], srcGuid[1], srcGuid[2], srcGuid[3],
+                          text, (unsigned)textLen);
+                });
+            LOG_I(MODULE_PREFIX, "Registered /chatter_in2 string message handler (per-topic slot)");
         }
         else
         {

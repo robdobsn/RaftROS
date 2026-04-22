@@ -188,7 +188,7 @@ bool RTPSRxSubmessageRunner_run(
         else if ((submsgId == SUBMSG_DATA) && (contentLen >= 24))
         {
             if (callbacks.onData)
-                callbacks.onData(userCtx, channel, packet, packetLen, srcGuidPrefix, fromAddr, pContent, contentLen);
+                callbacks.onData(userCtx, channel, packet, packetLen, srcGuidPrefix, fromAddr, pContent, contentLen, flags);
         }
         else if ((submsgId == SUBMSG_ACKNACK) && (contentLen >= 24))
         {

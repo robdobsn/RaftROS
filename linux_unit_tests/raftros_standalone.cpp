@@ -537,7 +537,8 @@ static void recvMetatraffic()
                           const uint8_t*,
                           const struct sockaddr_in& from,
                           const uint8_t* pContent,
-                          uint32_t contentLen)
+                          uint32_t contentLen,
+                          uint8_t /*dataFlags*/)
     {
         const uint8_t* writerEID = pContent + 8;
         if (memcmp(writerEID, ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER, 4) == 0)
@@ -652,7 +653,8 @@ static void recvUserData()
                           const uint8_t* srcGuidPrefix,
                           const struct sockaddr_in&,
                           const uint8_t* pContent,
-                          uint32_t contentLen)
+                          uint32_t contentLen,
+                          uint8_t dataFlags)
     {
         // User-topic DATA on the user-data channel. ros_discovery_info is the only
         // non-application user-data writer we expect here; everything else is treated
@@ -662,8 +664,11 @@ static void recvUserData()
             return;
         if (contentLen < 24)
             return;
-        const uint8_t* payload = pContent + 20;
-        uint32_t payloadLen = contentLen - 20;
+        const uint8_t* payload = nullptr;
+        uint32_t payloadLen = 0;
+        RTPSData_getSerializedPayload(pContent, contentLen, dataFlags, payload, payloadLen);
+        if (!payload || payloadLen < 4)
+            return;
         char text[128] = {0};
         auto dec = RaftRuntime::RTPS::Runtime::UserDispatch::decodeStdMsgsString(
             payload, payloadLen, text, sizeof(text));
