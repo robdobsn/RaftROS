@@ -951,10 +951,32 @@ Key learnings from Phase 2 bring-up (documented in `RaftROS-development-status.m
 - Two DataWriter announcements that share a SEDP publications writer entity must use distinct sequence numbers.
 - The `EspStyle` ACKNACK flavor must enable chatter retransmit on SEDP publications ACKNACK (`publicationsIncludesChatterAnnouncement=true`) because the initial unicast burst from `handleNewParticipant` regularly loses the 3rd+ packet to LWIP ENOMEM on the ESP32.
 
-### Phase 3: Dynamic Auto-Configuration
+### Phase 3: Topic Subscribing — COMPLETE ✅
+
+**Goal:** Subscribe to ROS 2 topics and receive messages with per-topic handler dispatch ✅ verified 2026-04-22 with `/chatter_in` (slot 0) and `/chatter_in2` (slot 1) (`std_msgs/msg/String`).
+
+**Deliverable delivered:** `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` routes to the correct per-slot handler on-device.
+
+What landed:
+
+- Shared `RTPSReaderRuntime` (pure decision logic: DATA Accept/Dedup/Drop, HEARTBEAT → ACKNACK base/numBits/bitmap, FINAL-flag dedup, best-effort suppression) + `RTPSReaderRunner` (submessage parsing + state lookup + dispatch callbacks).
+- `RTPSMessage::writeAcknackWithBitmap` bitmap-capable ACKNACK wire builder (DDSI-RTPS §9.4.2.7).
+- `RTPSSubscriptionRegistry` (8-slot POD with deterministic entity-ID allocator) + `RaftROS::addStringSubscription(topic, type, handler)` public API.
+- Per-topic routing via `RTPSSEDPPublicationParser` (extracts `PID_ENDPOINT_GUID` + `PID_TOPIC_NAME` from inbound SEDP publication DATAs) and `RTPSRemotePublicationMap` (16-entry `writerGuid` → slot map).
+- CDR deserialization via `RTPSUserDispatch::decodeStdMsgsString`.
+
+Key learnings from Phase 3 bring-up (documented in `RaftROS-development-status.md` Phase 3 section):
+
+- RTPS `readerSNState` bitmap is an inverted-sense bitmap: bit=1 means NOT received / please retransmit (not a positive ACK bitmap). Per §9.4.5.2.
+- DATA submessages must honour the Q flag (0x02) before reading the serialized payload; FastDDS routinely sends dispose-style DATAs with `Q=1 D=0 K=1` that contain only an inline-QoS body and no trailing payload.
+- N-ary SEDP subscription announcements on a shared sub writer must use distinct sequence numbers (same pattern as Phase-2 Fix 16 for the publication writer side).
+
+### Phase 4: Dynamic Auto-Configuration — NEXT
 
 **Goal:** Devices are automatically mapped to ROS topics based on DeviceTypeRecords
 
+- Register `RaftROS` as a `CommsChannel` with `CommsCoreIF`
+- Wire `pubSources` → `StatePublisher` → RaftROS channel
 - Implement DeviceTopicMapper using `clas` tags and `resp` format
 - Build-time or runtime CDR encoder generation from DeviceTypeRecords
 - Dynamic SEDP updates when devices appear/disappear
@@ -962,18 +984,17 @@ Key learnings from Phase 2 bring-up (documented in `RaftROS-development-status.m
 
 **Deliverable:** Plugging in a new I2C sensor automatically creates a new ROS topic
 
-### Phase 4: Subscriptions and Services
+### Phase 5: Services and Parameters — FUTURE
 
-**Goal:** Receive commands from ROS and expose device actions as services
+**Goal:** Expose device actions as ROS 2 services and parameters
 
-- Implement DataReader for incoming topic subscription
 - Implement basic ROS 2 service pattern (request/response over RTPS)
 - Map device actions to services
 - Implement parameter server for device configuration
 
 **Deliverable:** `ros2 service call /raft_esp32/set_servo` controls a servo connected via I2C
 
-### Phase 5: Advanced Features
+### Phase 6: Advanced Features
 
 - Zenoh transport as an alternative to RTPS
 - Multi-domain support

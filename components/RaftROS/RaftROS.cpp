@@ -38,7 +38,7 @@
 // which accumulates to tens of ms of stalled loop() time when the ESP32-S3 is handling
 // multiple DDS peers.  Comment out RAFTROS_VERBOSE_LOGGING for production / when
 // profiling loop() latency.
-#define RAFTROS_VERBOSE_LOGGING
+// #define RAFTROS_VERBOSE_LOGGING
 #ifdef RAFTROS_VERBOSE_LOGGING
     #define DEBUG_SDSP_SEND
     #define DEBUG_SDSP_RECEIVE

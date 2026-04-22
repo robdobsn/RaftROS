@@ -1,7 +1,7 @@
 # RaftROS Next Stages Implementation Plan
 
-**Date:** 2026-04-21
-**Scope:** Phase 2 (ESP32 topic publishing) is now complete and verified end-to-end. Remaining work: finish shared-runtime convergence, add Phase 3 topic subscribing, and Phase 4 DeviceManager integration.
+**Date:** 2026-04-22
+**Scope:** Phase 2 (ESP32 topic publishing) and Phase 3 (ESP32 topic subscribing, including N-ary per-topic routing) are now complete and verified end-to-end. Remaining work: reader-side ACKNACK consolidation polish, and Phase 4 DeviceManager integration.
 
 ## Status Summary
 
@@ -10,11 +10,12 @@
 - Stage 3 (ESP32 publishing completion) — **done and verified 2026-04-21**: `/chatter` publishes at 1 Hz, `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints every sample, RELIABLE + VOLATILE QoS honored, ACKNACK-driven retransmit proven to recover from initial LWIP send-queue drops.
 - Stage 4 (Native Linux app path alignment) — **in progress**; most orchestration is shared; `raftros_standalone.cpp` is now mostly callbacks.
 - Stage 5 (Hardening and test expansion) — **ongoing**.
+- Stage 6 (Topic subscribing, Phase 3) — **done and verified 2026-04-22**: ESP32 subscribes to N topics (`/chatter_in`, `/chatter_in2`, …) with per-topic dispatch; `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` routes to `MainSysMod::chatter_in2` handler via remote-writer-GUID → slot mapping populated from SEDP publication DATAs.
 
 ## Objectives (forward)
 
 1. Finish convergence of the remaining writer-state/action-execution policy under `RTPSReliabilityAndWriterStateRuntime`.
-2. Add topic subscribing (Phase 3): SEDP reader announcement, reader-side ACKNACK, CDR deserialization, message dispatch hook.
+2. ~~Add topic subscribing (Phase 3): SEDP reader announcement, reader-side ACKNACK, CDR deserialization, message dispatch hook.~~ **DONE 2026-04-22** (Stage 6).
 3. Start Phase 4: auto-wire publishers from Raft DeviceManager data sources through StatePublisher into RaftROS as a CommsChannel.
 
 ## Guiding Principles
@@ -114,26 +115,34 @@
 - Multiple discovered participants (port/address routing)
 - Initial-burst LWIP ENOMEM recovery: fail the 3rd+ unicast in `handleNewParticipant` in simulation, assert that the reliable path still delivers the chatter announcement.
 
-## Stage 6: Topic Subscribing (Phase 3) — NEXT
+## Stage 6: Topic Subscribing (Phase 3) — DONE ✅
 
-### Deliverables
+### Deliverables (delivered)
 
-- ESP32 can subscribe to a ROS 2 topic (e.g., `/cmd`) and receive `std_msgs/msg/String` (or similar) from a ROS 2 publisher.
-- Reader-side ACKNACK generation for RELIABLE topics.
-- CDR deserialization of standard message types.
-- Dispatch hook: user application SysMod receives a typed callback per incoming message.
+- ESP32 subscribes to N ROS 2 topics (demonstrated with `rt/chatter_in` and `rt/chatter_in2`) and receives `std_msgs/msg/String` from FastDDS 2.6.11 publishers.
+- Reader-side ACKNACK generation for RELIABLE topics via shared `RTPSReaderRuntime` / `RTPSReaderRunner` + bitmap-capable `RTPSMessage::writeAcknackWithBitmap`.
+- CDR deserialization via `RTPSUserDispatch::decodeStdMsgsString`.
+- Dispatch hook: `RaftROS::addStringSubscription(topic, type, handler)` registers a slot in `RTPSSubscriptionRegistry`; incoming user-data DATA is routed via `RTPSRemotePublicationMap` (remote writerGuid → slot) populated from SEDP publication DATAs parsed by `RTPSSEDPPublicationParser`.
 
-### Tasks
+### Phase-3 bugs fixed during bring-up
 
-- Add SEDP subscription announcement for the user topic (mirroring the existing chatter publication path).
-- Update `ros_discovery_info` payload to include the new reader GID.
-- Extend the RX submessage runner to route user-data DATA into a shared reader runtime.
-- Implement reader-side ACKNACK (RELIABLE) with heartbeat-count tracking per remote writer.
-- Add CDR decode path for the initial supported message types.
+1. **Monotonic SEDP-sub sequence numbers** — `_extraSubscriptionSeqNums[8] = {2,3,4,5,6,7,8,9}`. Without per-slot distinct SNs, FastDDS dropped the >=1 slot announcements as duplicates of the main-sub writer's SN space. Regression-guarded by the distinct-SN test landed in Slice 2.
+2. **ACKNACK bitmap inversion** ([RTPSReaderRuntime.cpp](../components/RaftROS/RTPS/runtime/reliability/RTPSReaderRuntime.cpp)) — per RTPS §9.4.5.2, a `1` bit in an ACKNACK `readerSNState` bitmap means **NOT received / please retransmit**. We were inverting the sense, so FastDDS interpreted our ACKNACKs as positive ACKs and never retransmitted missed SEDP publications. Regression-guarded by assertions `d.ackNackBitmap == 0x1F` (5 missing) and `0x3` (2 missing) in `linux_unit_tests/main.cpp`.
+3. **Inline-QoS skipping in DATA payload extraction** ([RTPSRxSubmessageRunner.h](../components/RaftROS/RTPS/runtime/receive/RTPSRxSubmessageRunner.h)) — DATA submessages with Q flag (bit 1 = 0x02) carry an inline-QoS ParameterList before the serialized payload. Propagated the DATA `flags` byte through `onData`, added `RTPSData_getSerializedPayload()` helper that scans past the 20-byte prefix and the inline-QoS list up to `PID_SENTINEL`. Regression-guarded by 9 new assertions covering Q=0, Q=1 sentinel-only, FastDDS dispose-style (`PID_STATUS_INFO` + `PID_KEY_HASH` + sentinel, no trailing payload), malformed parameter runs-off-end, and contentLen<20.
 
-### Exit Criteria
+### Exit Criteria (met)
 
-- `ros2 topic pub /cmd std_msgs/msg/String "{data: hello}"` from the PC is received and logged by the ESP32 within one publisher heartbeat.
+- `ros2 topic pub --once /chatter_in std_msgs/msg/String "{data: 'hello slot1'}"` and `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` both deliver to their distinct `MainSysMod::chatter_in` / `chatter_in2` handlers within one publisher heartbeat.
+- Log evidence (device-side, 2026-04-22):
+  - `SEDP pub DATA received contentLen=468 flags=0x05`
+  - `SEDP pub parsed topic='rt/chatter_in2' (14 chars), subReg.count=2`
+  - `SEDP pub matched topic='rt/chatter_in2' -> slot=1 (new)`
+  - `MainSysMod: chatter_in2 #1 writerEID=00000503 src=010FCCEF... "hello slot2" (11 chars)`
+- Linux unit tests: **388 passed, 0 failed**.
+
+### Remaining (Phase-3 polish)
+
+- Reader-side ACKNACK consolidation: fold the last per-writer-kind bookkeeping (labels, FINAL-flag suppression nuances) fully behind `RTPSReaderRuntime`.
 
 ## Stage 7: DeviceManager Auto-Publishing (Phase 4) — FUTURE
 
@@ -153,7 +162,9 @@
 1. ~~Finish moving remaining wrapper-side writer-state/action-execution policy behind `RTPSReliabilityAndWriterStateRuntime`.~~ **DONE 2026-04-21** — shared `RTPSAckActionStandardCtx` + `_initStandardAckActionCtx`/`_standardExecuteAction`/`_standardGetChatterSeq` helpers in `RTPSRunnerAdapterHelpers`; both wrappers converted; Linux validated (108 passed). ESP on-device smoke test still pending.
 2. ~~Add a focused unit test for VOLATILE `firstSN == currentSeq` HEARTBEAT invariant (regression guard for Stage 3 Fix 15).~~ **DONE 2026-04-21** — guard in `linux_unit_tests/main.cpp`.
 3. ~~Add a focused unit test for "two DataWriter announcements on the same SEDP publications writer must use distinct sequence numbers" (regression guard for Stage 3 Fix 16).~~ **DONE 2026-04-21** — guard in `linux_unit_tests/main.cpp`.
-4. Start Stage 6 (Phase 3 — subscribing) with a skeleton reader runtime behind new runner callbacks, mirroring the writer runner structure. **IN PROGRESS 2026-04-21** — shared `RTPSReaderRuntime` (pure state + `evaluateIncomingDataDecision` / `applyAcceptedDataToReaderState` / `evaluateIncomingHeartbeatDecision` / `applyHeartbeatProcessedToReaderState`) landed with 27 unit-test assertions covering DATA accept/dedup/gap collapse and HEARTBEAT -> ACKNACK bitmap generation incl. FINAL-flag dedup and best-effort suppression. Shared `RTPSReaderRunner` (submessage parsers + `resolveState`/`sendAckNack`/`dispatchData` callbacks) landed with +34 assertions. `RTPSMessage::writeAcknackWithBitmap` bitmap-capable ACKNACK wire builder landed with +18 assertions (empty-bitmap equivalence with legacy builder, multi-word LE packing, FINAL flag, input validation). `RTPSRxSubmessageRunner` extended with opt-in `resolveReaderWriterState` callback that routes HEARTBEATs through the pure reader runtime decision + bitmap ACKNACK builder; when null, preserves legacy path byte-for-byte. Header-only `RTPSReaderStateMap` per-(guidPrefix,writerEID) state container added and wired into both wrappers (`RaftROS.cpp`, `raftros_standalone.cpp`); every incoming HEARTBEAT now consults shared reader runtime on both Linux and ESP build paths. `RTPSInitialAnnouncePlan` extended with opt-in `SedpChatterReader` action (new `ENTITYID_CHATTER_READER` / `CHATTER_IN_DDS_TOPIC`) and dedicated `sedpChatterReaderSeqNum` counter. Wrappers now opt in: both `RaftROS.cpp` and `raftros_standalone.cpp` set `sendSedpChatterReader=true` during initial announce and include the reader GID in `ros_discovery_info`, so ROS 2 peers should see a `rt/chatter_in` subscriber on this participant. Header-only `RTPSUserDispatch::decodeStdMsgsString` added and wired into both wrappers' user-data RX callback: non-ros_discovery_info user-topic DATA is decoded and logged, and `RaftROS::setStringMessageHandler` exposes the decoded message to user code. `RTPSWriterHeartbeatRunner` extended with a `SedpChatterSubscription` retransmit step (dedicated `chatterSedpSubSeqNum` counter on ESP / `sedpSubSeqNum+1` on Linux-flavor) so late joiners also learn the reader via periodic SEDP. **On-device confirmed 2026-04-22** on ESP32-S3 `192.168.1.173` ↔ ROS 2 Humble host `192.168.1.92` (FastDDS 2.6.11): `ros2 topic pub --once /chatter_in std_msgs/msg/String "{data: 'hello esp'}"` decoded to `UD user-topic ... "hello esp" (9 chars)`; chatter pub ACKNACK `base=566 numBits=0`. Slice 8 polish: added `setStringSubscription(topic,type,handler)` (runtime-configurable, slot-0 only), extended ACKNACK writer-kind table with `ParticipantMessage` + `ChatterReader` labels, liveliness HB firstSN=lastSN=seq (stops NACK storm), wired handler in `ExampleDiscoverable/MainSysMod`. Slice 9 (N-ary subscription registry): new shared `RTPSSubscriptionRegistry` (8-slot POD, deterministic per-slot entity ID allocator), wrapper `addStringSubscription(topic,type,handler)` appends extra slots, announce + heartbeat + `ros_discovery_info` all iterate every registered reader. Dispatch still single-handler; per-topic routing (remote SEDP-pub correlation) is the last remaining Phase 3 follow-up ("Phase 3.5: subscriber routing"). **Total 298 passed, 0 failed.** Next: per-topic dispatch via SEDP-pub correlation + reader-side ACKNACK consolidation.
+4. Start Stage 6 (Phase 3 — subscribing) with a skeleton reader runtime behind new runner callbacks, mirroring the writer runner structure. **DONE 2026-04-22** — shared `RTPSReaderRuntime` (pure state + `evaluateIncomingDataDecision` / `applyAcceptedDataToReaderState` / `evaluateIncomingHeartbeatDecision` / `applyHeartbeatProcessedToReaderState`) landed with 27 unit-test assertions covering DATA accept/dedup/gap collapse and HEARTBEAT -> ACKNACK bitmap generation incl. FINAL-flag dedup and best-effort suppression. Shared `RTPSReaderRunner` (submessage parsers + `resolveState`/`sendAckNack`/`dispatchData` callbacks) landed with +34 assertions. `RTPSMessage::writeAcknackWithBitmap` bitmap-capable ACKNACK wire builder landed with +18 assertions (empty-bitmap equivalence with legacy builder, multi-word LE packing, FINAL flag, input validation). `RTPSRxSubmessageRunner` extended with opt-in `resolveReaderWriterState` callback that routes HEARTBEATs through the pure reader runtime decision + bitmap ACKNACK builder; when null, preserves legacy path byte-for-byte. Header-only `RTPSReaderStateMap` per-(guidPrefix,writerEID) state container added and wired into both wrappers (`RaftROS.cpp`, `raftros_standalone.cpp`); every incoming HEARTBEAT now consults shared reader runtime on both Linux and ESP build paths. `RTPSInitialAnnouncePlan` extended with opt-in `SedpChatterReader` action (new `ENTITYID_CHATTER_READER` / `CHATTER_IN_DDS_TOPIC`) and dedicated `sedpChatterReaderSeqNum` counter. Wrappers now opt in: both `RaftROS.cpp` and `raftros_standalone.cpp` set `sendSedpChatterReader=true` during initial announce and include the reader GID in `ros_discovery_info`, so ROS 2 peers should see a `rt/chatter_in` subscriber on this participant. Header-only `RTPSUserDispatch::decodeStdMsgsString` added and wired into both wrappers' user-data RX callback: non-ros_discovery_info user-topic DATA is decoded and logged, and `RaftROS::setStringMessageHandler` exposes the decoded message to user code. `RTPSWriterHeartbeatRunner` extended with a `SedpChatterSubscription` retransmit step (dedicated `chatterSedpSubSeqNum` counter on ESP / `sedpSubSeqNum+1` on Linux-flavor) so late joiners also learn the reader via periodic SEDP. **On-device confirmed 2026-04-22** on ESP32-S3 `192.168.1.173` ↔ ROS 2 Humble host `192.168.1.92` (FastDDS 2.6.11): `ros2 topic pub --once /chatter_in std_msgs/msg/String "{data: 'hello esp'}"` decoded to `UD user-topic ... "hello esp" (9 chars)`; chatter pub ACKNACK `base=566 numBits=0`. Slice 8 polish: added `setStringSubscription(topic,type,handler)` (runtime-configurable, slot-0 only), extended ACKNACK writer-kind table with `ParticipantMessage` + `ChatterReader` labels, liveliness HB firstSN=lastSN=seq (stops NACK storm), wired handler in `ExampleDiscoverable/MainSysMod`. Slice 9 (N-ary subscription registry): new shared `RTPSSubscriptionRegistry` (8-slot POD, deterministic per-slot entity ID allocator), wrapper `addStringSubscription(topic,type,handler)` appends extra slots, announce + heartbeat + `ros_discovery_info` all iterate every registered reader. Dispatch still single-handler; per-topic routing (remote SEDP-pub correlation) is the last remaining Phase 3 follow-up ("Phase 3.5: subscriber routing"). **Total 298 passed, 0 failed.** Next: per-topic dispatch via SEDP-pub correlation + reader-side ACKNACK consolidation.
+
+   **Slice 12 (per-topic routing) DONE 2026-04-22:** `RTPSSEDPPublicationParser` extracts `PID_ENDPOINT_GUID` + `PID_TOPIC_NAME` from remote SEDP publication DATAs; `RTPSRemotePublicationMap` (16-entry fixed map) correlates remote writerGuid -> local slot; user-data DATAs dispatch via `_remotePubMap.findSlot()` to `_extraSubscriptionHandlers[slot]`. Three bugs found and fixed during bring-up: (1) non-monotonic `_extraSubscriptionSeqNums`, (2) ACKNACK bitmap sense inverted vs RTPS §9.4.5.2, (3) `onData` ignored DATA `Q` flag and always read `pContent + 20` as payload — broke FastDDS because dispose-style DATAs put PID_STATUS_INFO + PID_KEY_HASH + PID_SENTINEL inline before any (absent) payload. New helper `RTPSData_getSerializedPayload()` skips fixed prefix + inline-QoS ParameterList; `flags` now propagated through `onData`. On-device validated with both `/chatter_in` (slot 0) and `/chatter_in2` (slot 1). **Total 388 passed, 0 failed.**
 5. Re-run `make -j$(nproc) all standalone && ./linux_unit_tests` after each extraction batch.
 
 ## Risks and Mitigations
