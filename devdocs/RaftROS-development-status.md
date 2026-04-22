@@ -151,10 +151,10 @@ Expected pass indicators:
 - `/chatter` appears in `ros2 topic list`
 - one chatter sample is printed by `ros2 topic echo --once`
 
-Latest run (2026-04-20) passed with:
+Latest run (2026-04-21) passed with:
 - `ros2 node list`: `/raft_linux`
 - `ros2 topic list`: `/chatter`, `/parameter_events`, `/rosout`
-- `ros2 topic echo /chatter --once`: `data: Hello from raft_linux [41]`
+- `ros2 topic echo /chatter --once`: `data: Hello from raft_linux [42]`
 
 ### Root Cause Found for Previous "Not Publishing" Symptom
 
@@ -333,7 +333,18 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 - Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after reliability-wrapper file removal and build-list pruning (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after ACKNACK shim-header removal and runtime-type ownership consolidation (**85 passed, 0 failed**).
 - Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after receive-runtime file relocation and top-level source pruning (**85 passed, 0 failed**).
-- Next: start Phase 3 (topic subscribing). Continue moving remaining writer-state/reliability action-execution policy behind `RTPSReliabilityAndWriterStateRuntime` while preserving wrapper callback APIs; add a reader-side ACKNACK + deserialization path with the same shared-runtime discipline.
+- Continued: added regression-guard unit tests in `linux_unit_tests/main.cpp` for two Phase-2 bring-up fixes that are subtle and easy to regress:
+	- VOLATILE `/chatter` invariant: `makeAckUserDataSequenceContextForFlavor(...)` opts in to `chatterFirstSNMatchesSequence` for both ESP and Linux flavors, and `getAckActionUserDataPlan(RetransmitChatterData, ...)` returns `hasFirstSNOverride=true` with `firstSN == sequenceNumber` (Fix 15 guard). TRANSIENT_LOCAL `ros_discovery_info` retransmit must NOT override firstSN.
+	- Distinct SEDP-pub sequence numbers: `getAckActionSedpPlan(...)` on the shared SEDP publications writer yields distinct sequence numbers for ros_discovery_info vs chatter publication announcements under both flavor policies (ESP uses explicit `chatterPublicationSeqNum`; Linux derives `rosDiscoveryPublicationSeqNum + 1`). Endpoints also differ in entity ID and durability (Fix 16 guard).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after regression-guard test addition (**108 passed, 0 failed** — +23 assertions, still 0 failed).
+- Continued: extracted the ACKNACK action-execution boilerplate (five per-action `buildMessage` lambdas + the `executeAction` lambda, ~200 lines per wrapper) from both wrappers into a shared default context in `RTPSRunnerAdapterHelpers`:
+	- New types `RTPSAckActionStandardCtx`, `RTPSAckActionStandardInitConfig`, policy enum `RTPSAckActionSedpBuildHeartbeatPolicy` (`PassZero`/`PassLiveHeartbeat`), and payload-builder typedef `RTPSAckActionBuildPayloadFn(void*, uint8_t*, uint32_t)`.
+	- New free functions `RTPSRunnerAdapter_initStandardAckActionCtx(...)` / `RTPSRunnerAdapter_standardExecuteAction(...)` / `RTPSRunnerAdapter_standardGetChatterSeq(...)` wire the five `RTPSAckNackRunnerActionExecSpec` channels, the SEDP build-heartbeat policy, the firstSN override for chatter, and the hex-payload debug dump behind a single entry point.
+	- Both wrappers (`components/RaftROS/RaftROS.cpp::handleAcknack` and `linux_unit_tests/raftros_standalone.cpp::handleAcknack`) are now ~70 lines each (down from ~200+) and differ only on genuine wrapper-level policy: flavor, `sedpBuildHeartbeatPolicy` (ESP=`PassZero` matching the prior `heartbeatCount=0` default, Linux=`PassLiveHeartbeat`), `dumpRosDiscoveryPayloadHex`, and wrapper-owned payload builders (passed as plain fn-pointer + `void* payloadCtx`).
+- Validation: `cd linux_unit_tests && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after shared ACKNACK action-execution default-ctx extraction and Linux wrapper conversion (**108 passed, 0 failed**). ESP wrapper conversion completed; ESP-IDF build and on-device `ros2 topic echo /chatter` smoke test pending.
+- Continued: folded the thin `RTPSAckNackRunner.cpp` translation unit into `RTPSReliabilityAndWriterStateRuntime.cpp` so the reliability module now owns the full ACKNACK parse -> classify -> remote-resolve -> evaluate -> dispatch pipeline end-to-end. `RTPSAckNackRunner.h` stays as the public facade (callback typedefs + `RTPSAckNackRunner_run`) so wrapper call sites are unchanged; `RTPSAckNackRunner.cpp` deleted and removed from `CMakeLists.txt` and `linux_unit_tests/Makefile` (both SOURCES and PROTO_SOURCES).
+- Validation: `cd linux_unit_tests && make clean && make -j$(nproc) all standalone && ./linux_unit_tests` remains green after runner-cpp consolidation into reliability runtime (**108 passed, 0 failed**).
+- Next: start Phase 3 (topic subscribing). Fold remaining `RTPSAckNackRunner.cpp` internals behind `RTPSReliabilityAndWriterStateRuntime` and add a reader-side ACKNACK + deserialization path with the same shared-runtime discipline from day one.
 
 ### Practical Rule
 

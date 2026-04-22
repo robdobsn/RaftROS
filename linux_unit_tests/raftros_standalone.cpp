@@ -407,51 +407,54 @@ static void recvSPDP()
 // Handle ACKNACK — retransmit requested data
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+static uint32_t acknackBuildRosDiscInfoPayload(void*, uint8_t* buf, uint32_t bufLen)
+{
+    return buildRosDiscInfoWithGids(buf, bufLen);
+}
+
+static uint32_t acknackBuildChatterPayload(void*, uint8_t* buf, uint32_t bufLen)
+{
+    char msgStr[64];
+    snprintf(msgStr, sizeof(msgStr), "Hello from %s [%lu]",
+             NODE_NAME,
+             (unsigned long)(chatterMsgIndex > 0 ? chatterMsgIndex - 1 : 0));
+    return buildChatterPayload(buf, bufLen, msgStr);
+}
+
 static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
                           const struct sockaddr_in& fromAddr)
 {
     (void)fromAddr;
 
-    struct AckExecCtx
-    {
-        RTPSAckNackRunnerExecAdapterCtx exec;
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpSequenceContext
-            sedpSequenceContext;
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataSequenceContext
-            userDataSequenceContext;
-        RTPSAckNackRunnerActionExecSpec sedpRosDiscoveryPublicationSpec;
-        RTPSAckNackRunnerActionExecSpec sedpChatterPublicationSpec;
-        RTPSAckNackRunnerActionExecSpec sedpRosDiscoverySubscriptionSpec;
-        RTPSAckNackRunnerActionExecSpec rosDiscoveryInfoSpec;
-        RTPSAckNackRunnerActionExecSpec chatterDataSpec;
-        const uint8_t* srcGuidPrefix = nullptr;
-    } ctx;
+    using namespace RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState;
 
+    RTPSAckActionStandardCtx ctx;
     ctx.srcGuidPrefix = srcGuidPrefix;
 
-    RTPSAckNackRunnerExecInitConfig execInit;
-    execInit.discovered = &discovered;
-    execInit.metatrafficSock = metatrafficSock;
-    execInit.userDataSock = userDataSock;
-    execInit.sendBuf = sendBuf;
-    execInit.heartbeatCount = &heartbeatCount;
-    execInit.mutationPolicy =
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackMutationPolicyForFlavor(
-            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone);
-    execInit.dumpRosDiscoveryPayloadHex = true;
-    RTPSRunnerAdapter_initAckExecContext(ctx.exec, execInit);
+    RTPSAckActionStandardInitConfig initConfig;
+    initConfig.discovered = &discovered;
+    initConfig.metatrafficSock = metatrafficSock;
+    initConfig.userDataSock = userDataSock;
+    initConfig.sendBuf = sendBuf;
+    initConfig.sendBufLen = sizeof(sendBuf);
+    initConfig.heartbeatCount = &heartbeatCount;
+    initConfig.dumpRosDiscoveryPayloadHex = true;
+    initConfig.runtimeFlavor = RTPSAckNackRuntimeFlavor::LinuxStandalone;
+    initConfig.rosDiscoveryPublicationSeqNum = sedpSeqNum;
+    initConfig.rosDiscoverySubscriptionSeqNum = sedpSubSeqNum;
+    initConfig.chatterPublicationSeqNum = 0;
+    initConfig.rosDiscoveryInfoSeqNum = rosDiscSeqNum;
+    initConfig.chatterDataSeqNum = chatterSeqNum;
+    initConfig.sedpHandler = &sedpHandler;
+    initConfig.participant = &participant;
+    initConfig.myIpAddr = myIpAddr;
+    initConfig.sedpBuildHeartbeatPolicy =
+        RTPSAckActionSedpBuildHeartbeatPolicy::PassLiveHeartbeat;
+    initConfig.buildRosDiscInfoPayload = &acknackBuildRosDiscInfoPayload;
+    initConfig.buildChatterPayload = &acknackBuildChatterPayload;
+    initConfig.payloadCtx = nullptr;
 
-    ctx.sedpSequenceContext =
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckSedpSequenceContextForFlavor(
-            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
-            sedpSeqNum,
-            sedpSubSeqNum,
-            0);
-    ctx.userDataSequenceContext =
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckUserDataSequenceContextForFlavor(
-            RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackRuntimeFlavor::LinuxStandalone,
-            rosDiscSeqNum,
-            chatterSeqNum);
+    RTPSRunnerAdapter_initStandardAckActionCtx(ctx, initConfig);
 
     RTPSAckNackRunnerCallbackInitConfig callbackInit;
     callbackInit.logParsed = [](void*, const RTPSAckNackFields& fields, RTPSAckNackWriterKind writerKind)
@@ -459,193 +462,15 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
         LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
               fields.readerEID[0], fields.readerEID[1], fields.readerEID[2], fields.readerEID[3],
               fields.writerEID[0], fields.writerEID[1], fields.writerEID[2], fields.writerEID[3],
-              RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::writerKindToStr(writerKind),
+              writerKindToStr(writerKind),
               fields.bitmapBaseLow, fields.numBits);
     };
     callbackInit.unknownRemote = nullptr;
-    callbackInit.getChatterSeq = [](void*) -> uint64_t
-    {
-        return chatterSeqNum;
-    };
+    callbackInit.getChatterSeq = &RTPSRunnerAdapter_standardGetChatterSeq;
+    callbackInit.executeAction = &RTPSRunnerAdapter_standardExecuteAction;
 
-    ctx.sedpRosDiscoveryPublicationSpec.sendChannel = RTPSAckNackRunnerSendChannel::Metatraffic;
-    ctx.sedpRosDiscoveryPublicationSpec.buildMessage = [](void* actionCtx,
-                                                          const uint8_t* srcGuidPrefix,
-                                                          uint64_t) -> uint32_t
-    {
-        AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
-        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
-                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpRosDiscoveryPublication,
-                p->sedpSequenceContext,
-                plan))
-            return 0;
-        return sedpHandler.buildPublicationMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            plan.endpoint.entityId,
-            plan.endpoint.topicName,
-            plan.endpoint.typeName,
-            plan.endpoint.reliabilityKind,
-            plan.endpoint.durabilityKind,
-            plan.sequenceNumber, myIpAddr,
-            heartbeatCount);
-    };
-
-    ctx.sedpChatterPublicationSpec.sendChannel = RTPSAckNackRunnerSendChannel::Metatraffic;
-    ctx.sedpChatterPublicationSpec.buildMessage = [](void* actionCtx,
-                                                     const uint8_t* srcGuidPrefix,
-                                                     uint64_t) -> uint32_t
-    {
-        AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
-        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
-                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpChatterPublication,
-                p->sedpSequenceContext,
-                plan))
-            return 0;
-        return sedpHandler.buildPublicationMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            plan.endpoint.entityId,
-            plan.endpoint.topicName,
-            plan.endpoint.typeName,
-            plan.endpoint.reliabilityKind,
-            plan.endpoint.durabilityKind,
-            plan.sequenceNumber, myIpAddr,
-            heartbeatCount);
-    };
-
-    ctx.sedpRosDiscoverySubscriptionSpec.sendChannel = RTPSAckNackRunnerSendChannel::Metatraffic;
-    ctx.sedpRosDiscoverySubscriptionSpec.buildMessage = [](void* actionCtx,
-                                                           const uint8_t* srcGuidPrefix,
-                                                           uint64_t) -> uint32_t
-    {
-        AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionSedpPlan plan;
-        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionSedpPlan(
-                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitSedpRosDiscoverySubscription,
-                p->sedpSequenceContext,
-                plan))
-            return 0;
-        return sedpHandler.buildSubscriptionMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            plan.endpoint.entityId,
-            plan.endpoint.topicName,
-            plan.endpoint.typeName,
-            plan.endpoint.reliabilityKind,
-            plan.endpoint.durabilityKind,
-            plan.sequenceNumber, myIpAddr,
-            heartbeatCount);
-    };
-
-    ctx.rosDiscoveryInfoSpec.sendChannel = RTPSAckNackRunnerSendChannel::UserData;
-    ctx.rosDiscoveryInfoSpec.buildMessage = [](void* actionCtx,
-                                               const uint8_t* srcGuidPrefix,
-                                               uint64_t) -> uint32_t
-    {
-        AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        uint8_t rosDiscPayload[256];
-        uint32_t rosDiscLen = buildRosDiscInfoWithGids(rosDiscPayload, sizeof(rosDiscPayload));
-        if (rosDiscLen == 0)
-            return 0;
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataPlan plan;
-        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionUserDataPlan(
-                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitRosDiscoveryInfo,
-                p->userDataSequenceContext,
-                plan))
-            return 0;
-        if (RTPSRunnerAdapter_shouldDumpAckPayload(
-                RTPSAckNackRunnerAction::RetransmitRosDiscoveryInfo,
-                p->exec))
-        {
-            RTPSRunnerAdapter_logHexPayload("ROSDISC_PAYLOAD_HEX", rosDiscPayload, rosDiscLen);
-        }
-        if (plan.hasFirstSNOverride)
-        {
-            return sedpHandler.buildUserDataMessage(
-                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-                plan.writerEntityId, rosDiscPayload, rosDiscLen,
-                plan.sequenceNumber, heartbeatCount,
-                plan.firstSN);
-        }
-
-        return sedpHandler.buildUserDataMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            plan.writerEntityId, rosDiscPayload, rosDiscLen,
-            plan.sequenceNumber, heartbeatCount);
-    };
-
-    ctx.chatterDataSpec.sendChannel = RTPSAckNackRunnerSendChannel::UserData;
-    ctx.chatterDataSpec.buildMessage = [](void* actionCtx,
-                                          const uint8_t* srcGuidPrefix,
-                                          uint64_t chatterSeq) -> uint32_t
-    {
-        AckExecCtx* p = static_cast<AckExecCtx*>(actionCtx);
-        p->userDataSequenceContext.chatterDataSeqNum = chatterSeq;
-        char msgStr[64];
-        snprintf(msgStr, sizeof(msgStr), "Hello from %s [%lu]",
-             NODE_NAME, (unsigned long)(chatterMsgIndex > 0 ? chatterMsgIndex - 1 : 0));
-        uint8_t chatterPayload[256];
-        uint32_t payloadLen = buildChatterPayload(chatterPayload, sizeof(chatterPayload), msgStr);
-        if (payloadLen == 0)
-            return 0;
-        RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckActionUserDataPlan plan;
-        if (!RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::getAckActionUserDataPlan(
-                RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionAction::RetransmitChatterData,
-                p->userDataSequenceContext,
-                plan))
-            return 0;
-        if (plan.hasFirstSNOverride)
-        {
-            return sedpHandler.buildUserDataMessage(
-                sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-                plan.writerEntityId, chatterPayload, payloadLen,
-                plan.sequenceNumber, heartbeatCount,
-                plan.firstSN);
-        }
-
-        return sedpHandler.buildUserDataMessage(
-            sendBuf, sizeof(sendBuf), participant, srcGuidPrefix,
-            plan.writerEntityId, chatterPayload, payloadLen,
-            plan.sequenceNumber, heartbeatCount);
-    };
-
-    callbackInit.executeAction = [](void* userCtx,
-                                    RTPSAckNackRunnerAction action,
-                                    const RTPSAckNackFields&,
-                                    RTPSAckNackWriterKind writerKind)
-    {
-        (void)writerKind;
-        AckExecCtx* p = static_cast<AckExecCtx*>(userCtx);
-
-        LOG_I(MODULE_PREFIX, "  ACKNACK -> %s", RTPSRunnerAdapter_ackActionLogLabel(action));
-        if (action == RTPSAckNackRunnerAction::RetransmitChatterData)
-        {
-            LOG_I(MODULE_PREFIX, "  ACKNACK chatter seq=%llu", (unsigned long long)chatterSeqNum);
-        }
-
-        RTPSRunnerAdapter_executeAckAction(
-            p->exec,
-            action,
-            p->srcGuidPrefix,
-            chatterSeqNum,
-            p->sedpRosDiscoveryPublicationSpec,
-            p->sedpChatterPublicationSpec,
-            p->sedpRosDiscoverySubscriptionSpec,
-            p->rosDiscoveryInfoSpec,
-            p->chatterDataSpec,
-            p,
-            [](void*, RTPSAckNackRunnerAction action, int sentBytes, uint32_t msgLen)
-            {
-                LOG_I(MODULE_PREFIX,
-                      "  %s %d/%d bytes",
-                      RTPSRunnerAdapter_ackActionResultLabel(action),
-                      sentBytes,
-                      (int)msgLen);
-            });
-    };
-
-            RTPSAckNackRunnerCallbacks callbacks;
-            RTPSRunnerAdapter_initAckCallbacks(callbacks, callbackInit);
+    RTPSAckNackRunnerCallbacks callbacks;
+    RTPSRunnerAdapter_initAckCallbacks(callbacks, callbackInit);
 
     const auto decisionOptions =
         RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::makeAckNackDecisionOptionsForFlavor(

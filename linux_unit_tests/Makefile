@@ -18,7 +18,6 @@ SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp \
-	../components/RaftROS/RTPS/runtime/reliability/RTPSAckNackRunner.cpp \
 	../components/RaftROS/RTPS/runtime/schedule/RTPSRuntimeSchedule.cpp \
 	../components/RaftROS/RTPS/runtime/announce/RTPSInitialAnnouncePlan.cpp \
 	../components/RaftROS/RTPS/runtime/announce/RTPSInitialAnnounceRunner.cpp \
@@ -52,7 +51,6 @@ PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp \
-	../components/RaftROS/RTPS/runtime/reliability/RTPSAckNackRunner.cpp \
 	../components/RaftROS/RTPS/runtime/schedule/RTPSRuntimeSchedule.cpp \
 	../components/RaftROS/RTPS/runtime/announce/RTPSInitialAnnouncePlan.cpp \
 	../components/RaftROS/RTPS/runtime/announce/RTPSInitialAnnounceRunner.cpp \
