@@ -1945,6 +1945,113 @@ int main()
     }
 
     //=================================================================
+    // RTPSData_getSerializedPayload: skip fixed prefix + inline QoS
+    //
+    // DATA submessage contentLayout (starting right after the 4-byte
+    // submessage header):
+    //   [0..19]    fixed 20-byte prefix (extraFlags, octetsToInlineQos,
+    //              readerId, writerId, writerSN)
+    //   [20..]     if Q flag (0x02) set: inline QoS ParameterList
+    //              terminated by PID_SENTINEL (0x0001, len=0)
+    //   [after]    serializedPayload (if D or K flag set)
+    //
+    // Regression guard for Phase-3 bug where the helper was missing and
+    // `pContent + 20` landed inside inline-QoS on FastDDS dispose DATAs.
+    //=================================================================
+    {
+        printf("Test: RTPSData_getSerializedPayload (inline-QoS skipping)\n");
+
+        // --- Case A: Q=0, payload begins at offset 20 ------------------
+        {
+            uint8_t buf[32] = {0};
+            // Fixed 20 bytes stay zero; payload = 12 bytes of 0xAB.
+            memset(buf + 20, 0xAB, 12);
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(buf, sizeof(buf), /*flags=*/0x05,
+                                          pPayload, payloadLen);
+            TEST_ASSERT(pPayload == buf + 20,
+                        "Q=0: payload begins after 20-byte prefix");
+            TEST_ASSERT(payloadLen == 12,
+                        "Q=0: payload length = contentLen - 20");
+        }
+
+        // --- Case B: Q=1 with sentinel-only inline QoS -----------------
+        // Layout: [20] PID_SENTINEL (0x0001) [22] len=0x0000, then payload.
+        {
+            uint8_t buf[32] = {0};
+            buf[20] = 0x01; buf[21] = 0x00; // PID_SENTINEL (LE)
+            buf[22] = 0x00; buf[23] = 0x00; // length = 0
+            memset(buf + 24, 0xCD, 8);
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(buf, sizeof(buf), /*flags=*/0x07,
+                                          pPayload, payloadLen);
+            TEST_ASSERT(pPayload == buf + 24,
+                        "Q=1 sentinel-only: payload starts at offset 24");
+            TEST_ASSERT(payloadLen == 8,
+                        "Q=1 sentinel-only: payloadLen = contentLen - 24");
+        }
+
+        // --- Case C: Q=1, dispose-style (PID_STATUS_INFO + PID_KEY_HASH
+        //     + PID_SENTINEL) with no trailing payload. This mirrors the
+        //     52-byte DATAs FastDDS sends on pub disposal.
+        {
+            uint8_t buf[52] = {0};
+            uint32_t o = 20;
+            // PID_STATUS_INFO (0x0071) len=4
+            buf[o++] = 0x71; buf[o++] = 0x00;
+            buf[o++] = 0x04; buf[o++] = 0x00;
+            o += 4; // four bytes of status payload
+            // PID_KEY_HASH (0x0070) len=16
+            buf[o++] = 0x70; buf[o++] = 0x00;
+            buf[o++] = 0x10; buf[o++] = 0x00;
+            o += 16;
+            // PID_SENTINEL (0x0001) len=0
+            buf[o++] = 0x01; buf[o++] = 0x00;
+            buf[o++] = 0x00; buf[o++] = 0x00;
+            TEST_ASSERT(o == 52, "dispose layout = 52 bytes");
+
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(buf, sizeof(buf), /*flags=*/0x03,
+                                          pPayload, payloadLen);
+            // Helper succeeds, but there's nothing past the sentinel.
+            TEST_ASSERT(pPayload == buf + 52,
+                        "dispose-style: payload pointer past sentinel");
+            TEST_ASSERT(payloadLen == 0,
+                        "dispose-style: zero-length serialized payload");
+        }
+
+        // --- Case D: Q=1, malformed (no sentinel, parameter runs off
+        //     end of buffer) -> helper returns {nullptr, 0}.
+        {
+            uint8_t buf[28] = {0};
+            // Parameter PID=0x0050 len=0x0020 (32 bytes) but only 4 bytes
+            // remain in the buffer -> must be rejected.
+            buf[20] = 0x50; buf[21] = 0x00;
+            buf[22] = 0x20; buf[23] = 0x00;
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(buf, sizeof(buf), /*flags=*/0x03,
+                                          pPayload, payloadLen);
+            TEST_ASSERT(pPayload == nullptr && payloadLen == 0,
+                        "malformed inline-QoS: returns {nullptr, 0}");
+        }
+
+        // --- Case E: contentLen < 20 -> refuse ------------------------
+        {
+            uint8_t buf[16] = {0};
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(buf, sizeof(buf), /*flags=*/0x05,
+                                          pPayload, payloadLen);
+            TEST_ASSERT(pPayload == nullptr && payloadLen == 0,
+                        "contentLen<20: rejected");
+        }
+    }
+
+    //=================================================================
     // Summary
     //=================================================================
     printf("\n--- Results: %d passed, %d failed ---\n", passCount, failCount);

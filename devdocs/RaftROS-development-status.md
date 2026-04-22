@@ -1,17 +1,18 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-21
+**Last Updated:** 2026-04-22
 
 ## Goal
 
 Make an ESP32-S3 (running Raft firmware) appear as a native ROS 2 node — without micro-ROS or any agent process — using a clean-room RTPS 2.2 implementation as a Raft SysMod.
 
-**Phase 1 (Discovery) and Phase 2 (Topic Publishing) are COMPLETE.**
+**Phase 1 (Discovery), Phase 2 (Topic Publishing), and Phase 3 (Topic Subscribing with per-topic routing) are COMPLETE.**
 - `ros2 node list` shows `/raft_esp32`.
-- `ros2 topic list` shows `/chatter`.
+- `ros2 topic list` shows `/chatter` (published) and the subscribed topics (`/chatter_in`, `/chatter_in2`, …).
 - `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints a sample per second.
+- `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` routes to the correct per-slot handler on-device.
 
-Verified end-to-end on 2026-04-21 against ROS 2 Humble + FastDDS 2.6.11, ESP32-S3 on real WiFi (PC `192.168.1.92`, ESP32 `192.168.1.173`).
+Verified end-to-end on 2026-04-22 against ROS 2 Humble + FastDDS 2.6.11, ESP32-S3 on real WiFi (PC `192.168.1.92`, ESP32 `192.168.1.173`).
 
 ## Architecture
 
@@ -164,8 +165,8 @@ Latest run (2026-04-21) passed with:
 
 ### Remaining Gap
 
-- Phase 2 (ESP32 `/chatter` publishing) is complete and verified end-to-end against ROS 2 Humble + FastDDS.
-- Phases 3 (subscribing) and 4 (auto-wiring from DeviceManager) are still TODO.
+- Phase 2 (ESP32 `/chatter` publishing) and Phase 3 (ESP32 topic subscribing with per-topic routing) are complete and verified end-to-end against ROS 2 Humble + FastDDS 2.6.11.
+- Phase 4 (auto-wiring from DeviceManager) is next.
 - Linux and ESP32 orchestration code continues to converge on a shared runtime; remaining drift lives in the thin wrappers only (`components/RaftROS/RaftROS.cpp` vs `linux_unit_tests/raftros_standalone.cpp`).
 
 ## Phase 2: Topic Publishing — See "Phase 2: Topic Publishing — COMPLETE ✅" above
@@ -387,11 +388,46 @@ To keep ESP32 and native Linux behavior consistent, new protocol/runtime logic s
 	- local network identity
 	- logging hooks
 
-## Phase 3: Topic Subscribing — TODO
+## Phase 3: Topic Subscribing — COMPLETE ✅
 
-- Announce a new DataReader endpoint via SEDP subscription
-- Receive and deserialize incoming ROS 2 messages
-- Handle ACKNACK (reader side) for reliable subscriptions
+ESP32 subscribes to N ROS 2 topics and receives `std_msgs/msg/String` with per-topic handler dispatch. Verified on 2026-04-22 with `/chatter_in` (slot 0) and `/chatter_in2` (slot 1) against FastDDS 2.6.11.
+
+### What Works
+
+- SEDP subscription announces for N reader slots via shared `RTPSSubscriptionRegistry` (8-slot POD with deterministic entity-ID allocator: slot 0 = `ENTITYID_CHATTER_READER {0x00,0x01,0x02,0x04}`, slot N = `{0x00,0x01,0x02+N,0x04}`).
+- Reader-side reliable ACKNACK via shared `RTPSReaderRuntime` (pure decision logic: DATA accept/dedup/gap-collapse, HEARTBEAT → ACKNACK base/numBits/bitmap, FINAL-flag dedup, best-effort suppression) + `RTPSReaderRunner` (submessage parse + state lookup + dispatch) + `RTPSMessage::writeAcknackWithBitmap` (bitmap wire builder).
+- CDR deserialization via `RTPSUserDispatch::decodeStdMsgsString`.
+- Per-topic routing via `RTPSRemotePublicationMap` (16-entry fixed map correlating remote `writerGuid` → local slot), populated from inbound SEDP publication DATAs parsed by `RTPSSEDPPublicationParser` (extracts `PID_ENDPOINT_GUID` and `PID_TOPIC_NAME`).
+- Handler dispatch via `RaftROS::addStringSubscription(topic, type, handler)`.
+
+### Phase 3 Bring-up Fixes
+
+| # | Fix | Details |
+|---|-----|---------|
+| 18 | Monotonic SEDP-sub sequence numbers | `_extraSubscriptionSeqNums[8] = {2,3,4,5,6,7,8,9}`. Without distinct per-slot SNs, FastDDS dropped slot>=1 announcements as duplicates of the main sub writer's sequence space. |
+| 19 | ACKNACK bitmap inversion | Per RTPS §9.4.5.2, bit=1 in `readerSNState` means **NOT received / please retransmit**. `RTPSReaderRuntime.cpp` was inverting the sense, so FastDDS read our ACKNACKs as positive ACKs and never retransmitted missed SEDP publications. |
+| 20 | DATA inline-QoS skipping | DATA submessages with Q flag (bit 1 = 0x02) carry an inline-QoS `ParameterList` before the serialized payload. `onData` was reading `pContent + 20` unconditionally, which landed inside the inline-QoS for FastDDS dispose-style DATAs (PID_STATUS_INFO + PID_KEY_HASH + PID_SENTINEL = 32 bytes of body, no payload). Fix: propagated DATA `flags` byte through `onData`, added `RTPSData_getSerializedPayload()` helper in `RTPSRxSubmessageRunner.h` that skips the 20-byte fixed prefix and, when Q=1, scans the inline-QoS ParameterList up to `PID_SENTINEL (0x0001)`. |
+
+All three fixes are regression-guarded by unit tests in `linux_unit_tests/main.cpp`.
+
+### Phase 3 Slice Log (post-slice 9)
+
+- **Slice 10 (reader-side ACKNACK bitmap inversion fix)**: inverted the bit sense in `RTPSReaderRuntime::evaluateIncomingHeartbeatDecision` so bit=1 in the emitted bitmap now correctly means NOT-received. Added assertions `d.ackNackBitmap == 0x1F` (5 missing) and `0x3` (2 missing) in `linux_unit_tests/main.cpp`.
+- **Slice 11 (distinct SEDP-sub SNs)**: per-slot sequence-number counters so FastDDS can distinguish the N SEDP subscription announcements issued on the shared sub writer.
+- **Slice 12 (per-topic dispatch)**: `RTPSSEDPPublicationParser` extracts `(writerGuid, topic)` from inbound SEDP publication DATAs; `RTPSRemotePublicationMap::upsert` records the correlation when `topic` matches a registered subscription slot; user-data DATAs look up the slot via `findSlot(guidPrefix, writerEID)` and dispatch to `_extraSubscriptionHandlers[slot]`.
+- **Slice 13 (inline-QoS fix)**: `RTPSData_getSerializedPayload()` helper + DATA `flags` byte plumbed through `onData`. All four `onData` lambdas (metatraffic + user-data in both `RaftROS.cpp` and `raftros_standalone.cpp`) updated. Helper also regression-tested: 5 cases / 9 assertions covering Q=0, Q=1 sentinel-only, FastDDS dispose-style, malformed parameter runs-off-end, contentLen<20.
+- Validation: **388 passed, 0 failed** (up from 298 at end of slice 9 — +90 assertions across reader-runtime, SEDP-pub parser, remote-pub map, inline-QoS helper, and the three Phase-3 regression guards).
+- On-device log evidence (2026-04-22, ESP32-S3 `192.168.1.173` ↔ ROS 2 Humble host `192.168.1.92`):
+  - `SEDP pub DATA received contentLen=468 flags=0x05`
+  - `SEDP pub parsed topic='rt/chatter_in2' (14 chars), subReg.count=2`
+  - `SEDP pub matched topic='rt/chatter_in2' -> slot=1 (new)`
+  - `MainSysMod: chatter_in2 #1 writerEID=00000503 src=010FCCEF... "hello slot2" (11 chars)`
+
+### Phase 3 Key Learnings
+
+- **RTPS `readerSNState` bitmap convention is inverted from intuition**: per §9.4.5.2, a `1` bit means "NOT received / retransmit this". It is not a positive-ACK bitmap. Easy to get wrong, silent-to-diagnose when wrong.
+- **DATA submessages always honour the Q flag before reading the serialized payload**. FastDDS routinely sends dispose/unregister DATAs with `Q=1 D=0 K=1` (endpoint teardown) that contain only an inline-QoS body — there is no serialized payload after it. Code that treats `pContent + 20` as the payload for every DATA will silently misparse every one of these.
+- **N-ary SEDP announcements on one writer must use distinct sequence numbers** (same lesson as Fix 16 for the publication writer side — applies symmetrically to the subscription writer).
 
 ## Phase 4: Integration with Raft — TODO
 
