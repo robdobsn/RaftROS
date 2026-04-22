@@ -26,6 +26,8 @@ SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/RTPS/runtime/receive/RTPSRunnerAdapterHelpers.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/RTPSDiscoveryRuntime.cpp \
 	../components/RaftROS/RTPS/runtime/reliability/RTPSReliabilityAndWriterStateRuntime.cpp \
+	../components/RaftROS/RTPS/runtime/reliability/RTPSReaderRuntime.cpp \
+	../components/RaftROS/RTPS/runtime/reliability/RTPSReaderRunner.cpp \
 	../components/RaftROS/RTPS/runtime/announce/SEDPHandler.cpp
 
 # Map source file path to object file under $(OBJ_DIR)
@@ -59,6 +61,8 @@ PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/RTPS/runtime/receive/RTPSRunnerAdapterHelpers.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/RTPSDiscoveryRuntime.cpp \
 	../components/RaftROS/RTPS/runtime/reliability/RTPSReliabilityAndWriterStateRuntime.cpp \
+	../components/RaftROS/RTPS/runtime/reliability/RTPSReaderRuntime.cpp \
+	../components/RaftROS/RTPS/runtime/reliability/RTPSReaderRunner.cpp \
 	../components/RaftROS/RTPS/runtime/announce/SEDPHandler.cpp
 PROTO_OBJECTS = $(foreach src,$(PROTO_SOURCES),$(call src_to_obj,$(src)))
 

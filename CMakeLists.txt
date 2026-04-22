@@ -15,6 +15,8 @@ idf_component_register(
       "components/RaftROS/RTPS/runtime/receive/RTPSRunnerAdapterHelpers.cpp"
       "components/RaftROS/RTPS/runtime/discovery/RTPSDiscoveryRuntime.cpp"
       "components/RaftROS/RTPS/runtime/reliability/RTPSReliabilityAndWriterStateRuntime.cpp"
+      "components/RaftROS/RTPS/runtime/reliability/RTPSReaderRuntime.cpp"
+      "components/RaftROS/RTPS/runtime/reliability/RTPSReaderRunner.cpp"
       "components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp"
       "components/RaftROS/CDR/CDREncoder.cpp"
       "components/RaftROS/CDR/CDRDecoder.cpp"

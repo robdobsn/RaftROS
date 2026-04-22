@@ -9,6 +9,7 @@ struct RTPSInitialAnnouncePlan
     bool sendSedpRosDiscoveryWriter = true;
     bool sendSedpRosDiscoveryReader = true;
     bool sendSedpChatterWriter = true;
+    bool sendSedpChatterReader = false;
     bool sendParticipantMessageData = true;
     bool sendInitialRosDiscoveryUserData = false;
 };
@@ -26,6 +27,7 @@ enum class RTPSInitialAnnounceAction : uint8_t
     SedpRosDiscoveryWriter,
     SedpRosDiscoveryReader,
     SedpChatterWriter,
+    SedpChatterReader,
     ParticipantMessageData,
     RosDiscoveryUserData
 };
@@ -69,7 +71,8 @@ enum class RTPSInitialAnnounceSedpEndpointProfile : uint8_t
     None,
     RosDiscoveryInfoWriter,
     RosDiscoveryInfoReader,
-    ChatterWriter
+    ChatterWriter,
+    ChatterReader
 };
 
 struct RTPSInitialAnnounceBuildSpec
@@ -135,6 +138,7 @@ enum class RTPSSeqCounterHint : uint8_t
     SedpRosWriter,
     SedpRosReader,
     SedpChatterWriter,
+    SedpChatterReader,
     Liveliness,
     RosDiscoveryUserData
 };
@@ -152,13 +156,14 @@ struct RTPSInitialAnnounceCounterState
     uint64_t sedpRosWriterSeqNum = 0;
     uint64_t sedpRosReaderSeqNum = 0;
     uint64_t sedpChatterWriterSeqNum = 0;
+    uint64_t sedpChatterReaderSeqNum = 0;
     uint64_t livelinessSeqNum = 0;
     uint64_t rosDiscoveryUserDataSeqNum = 0;
 };
 
 struct RTPSInitialAnnounceSequence
 {
-    RTPSInitialAnnounceStep steps[7];
+    RTPSInitialAnnounceStep steps[8];
     uint8_t numSteps = 0;
 };
 

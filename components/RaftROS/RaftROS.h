@@ -12,6 +12,8 @@
 #include "runtime/core/RTPSParticipant.h"
 #include "runtime/discovery/SPDPHandler.h"
 #include "runtime/announce/SEDPHandler.h"
+#include "runtime/reliability/RTPSReaderStateMap.h"
+#include <functional>
 #include <vector>
 
 class APISourceInfo;
@@ -27,6 +29,16 @@ public:
     void loop() override;
     void addRestAPIEndpoints(RestAPIEndpointManager& endpointManager) override;
     String getStatusJSON() const override;
+
+    // Signature: (writerEID[4], srcGuidPrefix[12], text, textLen)
+    using StringMessageHandler = std::function<void(const uint8_t*, const uint8_t*, const char*, uint32_t)>;
+
+    // Register a handler invoked when a std_msgs/String arrives on any user-topic writer
+    // (except built-in ros_discovery_info). Pass an empty std::function to clear.
+    void setStringMessageHandler(StringMessageHandler handler)
+    {
+        _stringMessageHandler = std::move(handler);
+    }
 
     // Factory for SysMod registration
     static RaftSysMod* create(const char* pModuleName, RaftJsonIF& sysConfig)
@@ -72,6 +84,12 @@ private:
     uint32_t _heartbeatCount = 0;
     uint32_t _acknackCount = 0;
 
+    // Per-(remote participant, writer entity id) reader state for reliable delivery bookkeeping.
+    RaftRuntime::RTPS::Runtime::Reader::RTPSReaderStateMap _readerStateMap;
+
+    // Optional user-topic std_msgs/String dispatch handler; invoked by recvUserData.
+    StringMessageHandler _stringMessageHandler;
+
     // Chatter topic (Phase 2) - sequence numbers and timing
     uint64_t _chatterSeqNum = 0;       // increments each publish
     uint64_t _chatterSedpSeqNum = 2;   // seq 2 on SEDP pubs writer = chatter publication
@@ -116,4 +134,7 @@ private:
 
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
+
+    static constexpr const char* MODULE_PREFIX = "RaftROS";
+
 };

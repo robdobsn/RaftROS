@@ -7,6 +7,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "RaftROS.h"
+#include "runtime/dispatch/RTPSUserDispatch.h"
 #include "RestAPIEndpointManager.h"
 #include "RTPSTypes.h"
 #include "runtime/wire/RTPSMessage.h"
@@ -29,7 +30,12 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 
-static const char* MODULE_PREFIX = "RaftROS";
+#define WARN_SDSP_PARSE_FAILURE
+#define WARN_SDSP_SEND_FAILURE
+#define DEBUG_SDSP_SEND
+#define DEBUG_SDSP_RECEIVE
+#define DEBUG_SOCKET_CREATION
+#define DEBUG_HEALTH_COUNTS
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Constructor / Destructor
@@ -51,6 +57,7 @@ RaftROS::~RaftROS()
 
 void RaftROS::setup()
 {
+    // Configure from JSON config (with defaults)
     _isEnabled = configGetBool("enable", false);
     _domainId = configGetLong("domainId", 0);
     _nodeName = configGetString("nodeName", "raft_esp32");
@@ -58,6 +65,7 @@ void RaftROS::setup()
     _leaseDurationSec = configGetLong("leaseDurationSec", 120);
     _spdpIntervalMs = configGetLong("spdpIntervalMs", 30000);
 
+    // Check enabled
     if (!_isEnabled)
     {
         LOG_I(MODULE_PREFIX, "setup DISABLED");
@@ -67,6 +75,7 @@ void RaftROS::setup()
     // Initialize RTPS participant (GUID will be set when MAC is available)
     _participant.init(_domainId, _nodeName.c_str(), 0, nullptr);
 
+    // Debug
     LOG_I(MODULE_PREFIX, "setup domainId %d nodeName %s ns %s lease %ds spdp %dms",
           (int)_domainId, _nodeName.c_str(), _nodeNamespace.c_str(),
           (int)_leaseDurationSec, (int)_spdpIntervalMs);
@@ -78,9 +87,11 @@ void RaftROS::setup()
 
 void RaftROS::loop()
 {
+    // Validate
     if (!_isEnabled)
         return;
 
+    // State machine on connection state
     switch (_connState)
     {
     case ConnState::DISCONNECTED:
@@ -98,9 +109,11 @@ void RaftROS::loop()
 
             if (createSockets())
             {
+#ifdef DEBUG_SOCKET_CREATION
                 LOG_I(MODULE_PREFIX, "loop sockets created, IP %s, SPDP port %d",
                       inet_ntoa(*(struct in_addr*)&_myIpAddr),
                       (int)_participant.getSPDPMulticastPort());
+#endif
                 _connState = ConnState::ANNOUNCING;
                 _lastSpdpSendMs = 0;  // trigger immediate first send
             }
@@ -149,17 +162,21 @@ void RaftROS::loop()
         // Diagnostic: periodic health line + detect size transitions
         if (_discovered.size() != _lastLoggedDiscoveredCount)
         {
+#ifdef DEBUG_HEALTH_COUNTS
             LOG_I(MODULE_PREFIX, "health discoveredCount %u->%u state=%d",
                   (unsigned)_lastLoggedDiscoveredCount,
                   (unsigned)_discovered.size(),
                   (int)_connState);
+#endif
             _lastLoggedDiscoveredCount = _discovered.size();
         }
         if (RTPSRuntimeSchedule_isPeriodicDue(now, _lastDiscoveredHealthLogMs,
                                               DISCOVERED_HEALTH_LOG_INTERVAL_MS, true))
         {
+#ifdef DEBUG_HEALTH_COUNTS
             LOG_I(MODULE_PREFIX, "health periodic discoveredCount=%u state=%d",
                   (unsigned)_discovered.size(), (int)_connState);
+#endif
             _lastDiscoveredHealthLogMs = now;
         }
         break;
@@ -170,6 +187,9 @@ void RaftROS::loop()
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Get local WiFi station IP (network byte order), 0 if not connected
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: the NetworkSystem module should provide this as a service instead of RaftROS directly calling ESP-IDF APIs and this only works for WiFi station interface.
+// ideally there would be an event driven approach here perhaps?
 
 uint32_t RaftROS::getLocalIP()
 {
@@ -185,6 +205,9 @@ uint32_t RaftROS::getLocalIP()
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Create the three UDP sockets
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+// TODO: handle IP changes on the fly (currently we only read the IP at startup and set the GUID prefix from the MAC at startup, but we could potentially support dynamic IP/GUID updates if needed)
+// also consider if any additional error handling is required
 
 bool RaftROS::createSockets()
 {
@@ -261,6 +284,8 @@ bool RaftROS::createSockets()
 // Close all sockets
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+// TODO: see note above about handling IP changes on the fly - we may need to recreate sockets and rejoin multicast group if IP changes
+
 void RaftROS::closeSockets()
 {
     if (_spdpSock >= 0)        { close(_spdpSock);        _spdpSock = -1; }
@@ -274,31 +299,37 @@ void RaftROS::closeSockets()
 
 void RaftROS::sendSPDP()
 {
+    // Build SPDP announcement message with updated sequence number
     _spdpSeqNum++;
     uint32_t msgLen = _spdpHandler.buildAnnouncementMessage(
         _sendBuf, sizeof(_sendBuf),
         _participant, _myIpAddr,
         _leaseDurationSec, _spdpSeqNum);
-
     if (msgLen == 0)
         return;
 
+    // Send SPDP announcement via multicast
     struct sockaddr_in dest = {};
     dest.sin_family = AF_INET;
     dest.sin_port = htons(_participant.getSPDPMulticastPort());
     dest.sin_addr.s_addr = inet_addr(RTPS_DEFAULT_MULTICAST_ADDR);
 
+    // Send with sendto (since multicast) - note that we don't need to specify the outgoing interface here since we set it on the socket with IP_MULTICAST_IF
     int sent = sendto(_spdpSock, _sendBuf, msgLen, 0,
                       (struct sockaddr*)&dest, sizeof(dest));
     if (sent < 0)
     {
-        LOG_E(MODULE_PREFIX, "sendSPDP sendto failed errno %d", errno);
+#ifdef WARN_SDSP_SEND_FAILURE
+        LOG_W(MODULE_PREFIX, "sendSPDP sendto failed errno %d", errno);
+#endif
     }
     else
     {
+#ifdef DEBUG_SDSP_SEND
         LOG_I(MODULE_PREFIX, "sendSPDP sent %d bytes seq %llu to %s:%d",
               sent, (unsigned long long)_spdpSeqNum,
               inet_ntoa(dest.sin_addr), (int)ntohs(dest.sin_port));
+#endif
     }
 }
 
@@ -308,6 +339,7 @@ void RaftROS::sendSPDP()
 
 void RaftROS::recvSPDP()
 {
+    // Receive SPDP announcement via multicast
     struct sockaddr_in fromAddr;
     socklen_t fromLen = sizeof(fromAddr);
     int n = recvfrom(_spdpSock, _recvBuf, sizeof(_recvBuf), 0,
@@ -315,15 +347,20 @@ void RaftROS::recvSPDP()
     if (n <= 0)
         return;
 
+#ifdef DEBUG_SDSP_RECEIVE
+    // Debug log raw message and source (note that the message may be binary and not null-terminated, so we print the first few bytes as chars if available)
     LOG_I(MODULE_PREFIX, "recvSPDP raw %d bytes from %s:%d magic=%c%c%c%c",
           n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port),
           n > 0 ? _recvBuf[0] : '?', n > 1 ? _recvBuf[1] : '?',
           n > 2 ? _recvBuf[2] : '?', n > 3 ? _recvBuf[3] : '?');
+#endif
 
     DiscoveredParticipant remote;
     if (!_spdpHandler.parseAnnouncementMessage(_recvBuf, (uint32_t)n, remote))
     {
+#ifdef WARN_SDSP_PARSE_FAILURE
         LOG_W(MODULE_PREFIX, "recvSPDP parse FAILED (%d bytes)", n);
+#endif
         return;
     }
 
@@ -425,6 +462,13 @@ void RaftROS::recvMetatraffic()
 
     RTPSRxSubmessageRunnerCallbacks callbacks;
     RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
+    callbacks.resolveReaderWriterState = [](void* userCtx, RTPSRxChannel,
+                                            const uint8_t* srcGuidPrefix,
+                                            const uint8_t* writerEID)
+        -> RaftRuntime::RTPS::Runtime::Reader::RTPSReaderWriterState*
+    {
+        return static_cast<RxCtx*>(userCtx)->self->_readerStateMap.getOrCreate(srcGuidPrefix, writerEID);
+    };
     callbacks.onInvalidHeader = [](void*, RTPSRxChannel)
     {
         LOG_W(MODULE_PREFIX, "recvMetatraffic invalid RTPS header");
@@ -533,6 +577,13 @@ void RaftROS::recvUserData()
 
     RTPSRxSubmessageRunnerCallbacks callbacks;
     RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
+    callbacks.resolveReaderWriterState = [](void* userCtx, RTPSRxChannel,
+                                            const uint8_t* srcGuidPrefix,
+                                            const uint8_t* writerEID)
+        -> RaftRuntime::RTPS::Runtime::Reader::RTPSReaderWriterState*
+    {
+        return static_cast<RxCtx*>(userCtx)->self->_readerStateMap.getOrCreate(srcGuidPrefix, writerEID);
+    };
     callbacks.onInvalidHeader = nullptr;
     callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
     {
@@ -543,7 +594,36 @@ void RaftROS::recvUserData()
                   lastSNLow, sentBytes);
         }
     };
-    callbacks.onData = nullptr;
+    callbacks.onData = [](void* userCtx,
+                          RTPSRxChannel,
+                          const uint8_t*,
+                          uint32_t,
+                          const uint8_t* srcGuidPrefix,
+                          const struct sockaddr_in&,
+                          const uint8_t* pContent,
+                          uint32_t contentLen)
+    {
+        const uint8_t* writerEID = pContent + 8;
+        if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
+            return;
+        if (contentLen < 24)
+            return;
+        const uint8_t* payload = pContent + 20;
+        uint32_t payloadLen = contentLen - 20;
+        char text[128] = {0};
+        auto dec = RaftRuntime::RTPS::Runtime::UserDispatch::decodeStdMsgsString(
+            payload, payloadLen, text, sizeof(text));
+        if (!dec.success)
+            return;
+        RaftROS* self = static_cast<RxCtx*>(userCtx)->self;
+        LOG_I(MODULE_PREFIX,
+              "  UD user-topic writerEID=%02X%02X%02X%02X src=%02X%02X%02X%02X... \"%s\" (%u chars)",
+              writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+              srcGuidPrefix[0], srcGuidPrefix[1], srcGuidPrefix[2], srcGuidPrefix[3],
+              text, (unsigned)dec.textLen);
+        if (self->_stringMessageHandler)
+            self->_stringMessageHandler(writerEID, srcGuidPrefix, text, dec.textLen);
+    };
     callbacks.onAckNack = [](void* userCtx,
                              RTPSRxChannel,
                              const uint8_t* srcGuidPrefix,
@@ -701,6 +781,7 @@ void RaftROS::sendWriterHeartbeats()
         _sedpSeqNum,
         _sedpSubSeqNum,
         _chatterSedpSeqNum,
+        _sedpSubSeqNum + 1,
         _livelinessSeqNum,
         _rosDiscSeqNum,
         _heartbeatCount,
@@ -754,6 +835,16 @@ void RaftROS::sendWriterHeartbeats()
                         ENTITYID_CHATTER_WRITER,
                         CHATTER_DDS_TOPIC,
                         CHATTER_DDS_TYPE,
+                        RELIABILITY_RELIABLE,
+                        DURABILITY_VOLATILE,
+                        sequenceNumber, self->_myIpAddr);
+                case RTPSWriterHeartbeatAction::SedpChatterSubscription:
+                    return self->_sedpHandler.buildSubscriptionMessage(
+                        self->_sendBuf, sizeof(self->_sendBuf),
+                        self->_participant, remoteRef.guidPrefix,
+                        ENTITYID_CHATTER_READER,
+                        CHATTER_IN_DDS_TOPIC,
+                        CHATTER_IN_DDS_TYPE,
                         RELIABILITY_RELIABLE,
                         DURABILITY_VOLATILE,
                         sequenceNumber, self->_myIpAddr);
@@ -838,7 +929,8 @@ void RaftROS::sendWriterHeartbeats()
 
 void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr)
 {
-    const RTPSInitialAnnouncePlan announcePlan = RTPSInitialAnnouncePlan_default();
+    RTPSInitialAnnouncePlan announcePlan = RTPSInitialAnnouncePlan_default();
+    announcePlan.sendSedpChatterReader = true;
     const RTPSInitialAnnounceSequence announceSeq = RTPSInitialAnnouncePlan_buildSequence(
         announcePlan, RTPSInitialAnnounceRuntimeFlavor::EspStyle);
 
@@ -1004,6 +1096,7 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
         _sedpSeqNum,
         _sedpSubSeqNum,
         _chatterSedpSeqNum,
+        _sedpSubSeqNum + 1,
         _livelinessSeqNum,
         _rosDiscSeqNum,
     };
@@ -1024,13 +1117,14 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
 uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
 {
     const uint8_t* writerIds[] = { ENTITYID_CHATTER_WRITER };
+    const uint8_t* readerIds[] = { ENTITYID_CHATTER_READER };
     return SPDPHandler::buildRosDiscoveryInfoPayload(
         pBuf, bufLen,
         _participant.getParticipantGuid(),
         _nodeName.c_str(),
         _nodeNamespace.c_str(),
         writerIds, 1,   // 1 writer: chatter
-        nullptr, 0);    // 0 readers
+        readerIds, 1);  // 1 reader: chatter_in
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

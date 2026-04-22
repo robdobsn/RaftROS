@@ -9,6 +9,7 @@
 #endif
 
 #include "runtime/wire/RTPSMessage.h"
+#include "runtime/reliability/RTPSReaderRuntime.h"
 
 enum class RTPSRxChannel
 {
@@ -58,6 +59,20 @@ struct RTPSRxSubmessageRunnerCallbacks
                     RTPSSubmessageId submsgId,
                     uint8_t flags,
                     uint32_t contentLen) = nullptr;
+
+    // Opt-in reader-runtime delegation. When `resolveReaderWriterState` is non-null,
+    // incoming HEARTBEATs for the reader's matched writers are routed through the
+    // shared RTPSReaderRunner decision path (bitmap-capable ACKNACK). When null,
+    // the legacy inline ACKNACK path is used for backwards compatibility.
+    //
+    // `resolveReaderWriterState` returns a pointer to wrapper-owned reader state
+    // for the (srcGuidPrefix, writerEID) pair, or nullptr to fall back to the
+    // legacy path for this HEARTBEAT.
+    RaftRuntime::RTPS::Runtime::Reader::RTPSReaderWriterState*
+        (*resolveReaderWriterState)(void* userCtx,
+                                     RTPSRxChannel channel,
+                                     const uint8_t* srcGuidPrefix,
+                                     const uint8_t* writerEID) = nullptr;
 };
 
 bool RTPSRxSubmessageRunner_run(

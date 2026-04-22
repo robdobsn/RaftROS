@@ -25,6 +25,8 @@ RTPSWriterHeartbeatSequence RTPSWriterHeartbeatRunner_buildSequence(
                linuxLikeHeartbeatOnSedp, false);
     appendStep(seq, RTPSWriterHeartbeatAction::SedpChatterPublication,
                linuxLikeHeartbeatOnSedp, false);
+    appendStep(seq, RTPSWriterHeartbeatAction::SedpChatterSubscription,
+               linuxLikeHeartbeatOnSedp, false);
     appendStep(seq, RTPSWriterHeartbeatAction::ParticipantMessageData,
                true, true);
     appendStep(seq, RTPSWriterHeartbeatAction::RosDiscoveryInfoData,
@@ -56,6 +58,10 @@ uint64_t RTPSWriterHeartbeatRunner_sequenceForAction(
             if (runtimeFlavor == RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle)
                 return counters.sedpSeqNum + 1;
             return counters.chatterSedpSeqNum;
+        case RTPSWriterHeartbeatAction::SedpChatterSubscription:
+            if (runtimeFlavor == RTPSWriterHeartbeatRuntimeFlavor::LinuxStyle)
+                return counters.sedpSubSeqNum + 1;
+            return counters.chatterSedpSubSeqNum;
         case RTPSWriterHeartbeatAction::ParticipantMessageData:
             return counters.livelinessSeqNum;
         case RTPSWriterHeartbeatAction::RosDiscoveryInfoData:

@@ -40,6 +40,8 @@
 #include "runtime/core/RTPSParticipant.h"
 #include "runtime/discovery/SPDPHandler.h"
 #include "runtime/announce/SEDPHandler.h"
+#include "runtime/reliability/RTPSReaderStateMap.h"
+#include "runtime/dispatch/RTPSUserDispatch.h"
 #include "Logger.h"
 
 static const char* MODULE_PREFIX = "RaftROS";
@@ -79,6 +81,8 @@ static uint64_t rosDiscSeqNum = 1;
 static uint64_t livelinessSeqNum = 1;
 static uint32_t heartbeatCount = 0;
 static uint32_t acknackCount = 0;
+
+static RaftRuntime::RTPS::Runtime::Reader::RTPSReaderStateMap readerStateMap;
 
 // Chatter topic (Phase 2)
 static uint64_t chatterSeqNum = 0;
@@ -276,12 +280,13 @@ static void processDiscoveredParticipant(DiscoveredParticipant& remote, const st
 static uint32_t buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
 {
     const uint8_t* writerIds[] = { ENTITYID_CHATTER_WRITER };
+    const uint8_t* readerIds[] = { ENTITYID_CHATTER_READER };
     return SPDPHandler::buildRosDiscoveryInfoPayload(
         pBuf, bufLen,
         participant.getParticipantGuid(),
         NODE_NAME, NODE_NAMESPACE,
         writerIds, 1,
-        nullptr, 0);
+        readerIds, 1);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -505,6 +510,13 @@ static void recvMetatraffic()
 
     RTPSRxSubmessageRunnerCallbacks callbacks;
     RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
+    callbacks.resolveReaderWriterState = [](void*, RTPSRxChannel,
+                                            const uint8_t* srcGuidPrefix,
+                                            const uint8_t* writerEID)
+        -> RaftRuntime::RTPS::Runtime::Reader::RTPSReaderWriterState*
+    {
+        return readerStateMap.getOrCreate(srcGuidPrefix, writerEID);
+    };
     callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
     {
         if (responded)
@@ -618,6 +630,13 @@ static void recvUserData()
 
     RTPSRxSubmessageRunnerCallbacks callbacks;
     RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
+    callbacks.resolveReaderWriterState = [](void*, RTPSRxChannel,
+                                            const uint8_t* srcGuidPrefix,
+                                            const uint8_t* writerEID)
+        -> RaftRuntime::RTPS::Runtime::Reader::RTPSReaderWriterState*
+    {
+        return readerStateMap.getOrCreate(srcGuidPrefix, writerEID);
+    };
     callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
     {
         if (responded)
@@ -626,7 +645,37 @@ static void recvUserData()
                   writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow, sentBytes);
         }
     };
-    callbacks.onData = nullptr;
+    callbacks.onData = [](void*,
+                          RTPSRxChannel,
+                          const uint8_t*,
+                          uint32_t,
+                          const uint8_t* srcGuidPrefix,
+                          const struct sockaddr_in&,
+                          const uint8_t* pContent,
+                          uint32_t contentLen)
+    {
+        // User-topic DATA on the user-data channel. ros_discovery_info is the only
+        // non-application user-data writer we expect here; everything else is treated
+        // as a candidate std_msgs/String for /chatter_in dispatch.
+        const uint8_t* writerEID = pContent + 8;
+        if (memcmp(writerEID, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
+            return;
+        if (contentLen < 24)
+            return;
+        const uint8_t* payload = pContent + 20;
+        uint32_t payloadLen = contentLen - 20;
+        char text[128] = {0};
+        auto dec = RaftRuntime::RTPS::Runtime::UserDispatch::decodeStdMsgsString(
+            payload, payloadLen, text, sizeof(text));
+        if (dec.success)
+        {
+            LOG_I(MODULE_PREFIX,
+                  "  UD user-topic writerEID=%02X%02X%02X%02X src=%02X%02X%02X%02X... \"%s\" (%u chars)",
+                  writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+                  srcGuidPrefix[0], srcGuidPrefix[1], srcGuidPrefix[2], srcGuidPrefix[3],
+                  text, (unsigned)dec.textLen);
+        }
+    };
     callbacks.onAckNack = [](void*,
                              RTPSRxChannel,
                              const uint8_t* srcGuidPrefix,
@@ -691,6 +740,7 @@ static void sendWriterHeartbeats()
         sedpSeqNum,
         sedpSubSeqNum,
         sedpSeqNum + 1,
+        sedpSubSeqNum + 1,
         livelinessSeqNum,
         rosDiscSeqNum,
         heartbeatCount,
@@ -733,6 +783,12 @@ static void sendWriterHeartbeats()
                     return sedpHandler.buildPublicationMessage(
                         sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
                         ENTITYID_CHATTER_WRITER, CHATTER_DDS_TOPIC, CHATTER_DDS_TYPE,
+                        RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sequenceNumber, myIpAddr,
+                        heartbeatCountCb);
+                case RTPSWriterHeartbeatAction::SedpChatterSubscription:
+                    return sedpHandler.buildSubscriptionMessage(
+                        sendBuf, sizeof(sendBuf), participant, remoteRef.guidPrefix,
+                        ENTITYID_CHATTER_READER, CHATTER_IN_DDS_TOPIC, CHATTER_IN_DDS_TYPE,
                         RELIABILITY_RELIABLE, DURABILITY_VOLATILE, sequenceNumber, myIpAddr,
                         heartbeatCountCb);
                 case RTPSWriterHeartbeatAction::ParticipantMessageData:
@@ -820,7 +876,8 @@ static void sendWriterHeartbeats()
 
 static void handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr)
 {
-    const RTPSInitialAnnouncePlan announcePlan = RTPSInitialAnnouncePlan_default();
+    RTPSInitialAnnouncePlan announcePlan = RTPSInitialAnnouncePlan_default();
+    announcePlan.sendSedpChatterReader = true;
     const RTPSInitialAnnounceSequence announceSeq = RTPSInitialAnnouncePlan_buildSequence(
         announcePlan, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle);
 
@@ -984,6 +1041,7 @@ static void handleNewParticipant(const DiscoveredParticipant& remote, const stru
         sedpSeqNum,
         sedpSubSeqNum,
         sedpSeqNum + 1,
+        sedpSubSeqNum + 1,
         livelinessSeqNum,
         rosDiscSeqNum,
     };
