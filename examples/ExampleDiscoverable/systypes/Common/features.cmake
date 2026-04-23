@@ -6,7 +6,7 @@ set(RAFT_COMPONENTS
     RaftCore@main
     RaftSysMods@main
     RaftWebServer@main
-    
+    RaftI2C@main
 )
 
 # RaftROS component (local path - parent directory contains RaftROS CMakeLists.txt)

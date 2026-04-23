@@ -971,18 +971,50 @@ Key learnings from Phase 3 bring-up (documented in `RaftROS-development-status.m
 - DATA submessages must honour the Q flag (0x02) before reading the serialized payload; FastDDS routinely sends dispose-style DATAs with `Q=1 D=0 K=1` that contain only an inline-QoS body and no trailing payload.
 - N-ary SEDP subscription announcements on a shared sub writer must use distinct sequence numbers (same pattern as Phase-2 Fix 16 for the publication writer side).
 
-### Phase 4: Dynamic Auto-Configuration — NEXT
+### Phase 4: Dynamic Auto-Configuration — COMPLETE ✅
 
-**Goal:** Devices are automatically mapped to ROS topics based on DeviceTypeRecords
+**Goal:** Devices are automatically mapped to ROS topics based on DeviceTypeRecords.
 
-- Register `RaftROS` as a `CommsChannel` with `CommsCoreIF`
-- Wire `pubSources` → `StatePublisher` → RaftROS channel
-- Implement DeviceTopicMapper using `clas` tags and `resp` format
-- Build-time or runtime CDR encoder generation from DeviceTypeRecords
-- Dynamic SEDP updates when devices appear/disappear
-- Auto-naming of topics based on bus/address/device-type
+What landed (12 slices 4.1 – 4.12, see `RaftROS-auto-publishing-design.md` §9):
 
-**Deliverable:** Plugging in a new I2C sensor automatically creates a new ROS topic
+- **DeviceManager hook** — `RaftROS::setup()` registers a status-change
+  callback; `ONLINE`/`PENDING_DELETION` transitions drive a 16-slot writer
+  registry (`RTPSDynamicWriterRegistry`, deterministic entityId allocation).
+- **Lifecycle owner** — `RTPSAutoPubLifecycle` owns topic/type string
+  buffers per slot; composite devices consume two slots keyed by
+  `{bus, addr, subIndex}`.
+- **Class → ROS 2 type mapping** — `RTPSAutoPubClassMap.h` with per-device
+  overrides (MCP9808, RoboticalLightSensor), actuator exclusion
+  (SRVO/PUMP/PIX), composite rules (`{ACC,GYRO}` → `Imu`,
+  `{TEMP,RH}` → `Temperature+RelativeHumidity`,
+  `{PRES,TEMP}` → `FluidPressure+Temperature`), single-class rules for
+  every tag in `DeviceTypeRecords.json`, and a `std_msgs/String` JSON
+  fallback.
+- **SEDP auto-announce** — the existing writer-heartbeat pass walks the
+  registry and emits one `PublicationBuiltinTopic` DATA(w) per active slot
+  per tick.
+- **User-data hot path** — on each decoded bus sample the latest record is
+  serialised through `RTPSAutoPubCDRSerializer` (REP-103 unit scaling) into
+  a per-slot 512-byte buffer and unicast to every discovered peer.
+  Composite devices serialise twice (once per kind) from the same decoded
+  struct.
+- **Timestamps** — ROS 2 `Header.stamp` is taken from the poll record's
+  `timeMs` field, not wall-clock.
+- **QoS profiles** — four built-ins (`fast_sensor`, `slow_sensor`, `event`,
+  `fallback_string`); SysTypes override surface is `qosProfiles.<alias>`
+  and `qosProfiles.classDefaults.<CLAS>`. Resolution order:
+  alias → class → built-in default.
+- **Dispose on offline** — `PENDING_DELETION` emits an SEDP dispose
+  (`PID_STATUS_INFO = 0x00000003`, `PID_KEY_HASH` = guid+entityId) on the
+  builtin Publications writer so subscribers drop the topic within a
+  heartbeat. Composite secondary slots are disposed alongside the primary.
+
+**Deliverable met:** plugging in a new I2C sensor automatically creates a
+new ROS 2 topic that `ros2 topic echo` can consume with the correct message
+type, SI units, and QoS profile — zero per-device code.
+
+**Verification:** `linux_unit_tests/main.cpp` = **911 passed, 0 failed**;
+ESP32-S3 firmware 0x1435c0 bytes, 25% free on the `app` partition.
 
 ### Phase 5: Services and Parameters — FUTURE
 

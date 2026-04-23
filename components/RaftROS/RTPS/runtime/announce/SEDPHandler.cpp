@@ -168,6 +168,86 @@ uint32_t SEDPHandler::buildPublicationMessage(
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Build SEDP publication DISPOSE message.  Carries PID_STATUS_INFO with
+// DisposedFlag | UnregisteredFlag set so peers drop the matching writer.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t SEDPHandler::buildPublicationDisposeMessage(
+    uint8_t* pBuf, uint32_t bufLen,
+    const RTPSParticipant& participant,
+    const uint8_t* destGuidPrefix,
+    const uint8_t* writerEntityId,
+    uint64_t sequenceNumber,
+    uint32_t heartbeatCount)
+{
+    if (!pBuf || bufLen < 200)
+        return 0;
+
+    uint32_t pos = 0;
+
+    // RTPS Header + INFO_DST + INFO_TS
+    pos += RTPSMessage::writeHeader(pBuf + pos, bufLen - pos, participant.getGuidPrefix());
+    pos += RTPSMessage::writeInfoDST(pBuf + pos, bufLen - pos, destGuidPrefix);
+    pos += RTPSMessage::writeInfoTS(pBuf + pos, bufLen - pos, 0, 0);
+
+    // Dispose ParameterList payload — minimal: status-info + key identifying
+    // the writer being disposed (PID_KEY_HASH + PID_ENDPOINT_GUID), plus a
+    // sentinel.  FastDDS matches the disposed writer by GUID; topic/type
+    // parameters are not required on a dispose.
+    uint8_t payload[80];
+    uint32_t pp = 0;
+
+    // CDR Encapsulation: PL_CDR_LE
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x03;
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x00;
+
+    // PID_STATUS_INFO (0x0071), len 4.  StatusInfo_t is a 4-octet big-endian
+    // value; the last octet carries bit 0 = DisposedFlag, bit 1 = UnregisteredFlag.
+    putLE16(payload + pp, PID_STATUS_INFO); pp += 2;
+    putLE16(payload + pp, 4); pp += 2;
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x00;
+    payload[pp++] = 0x03;  // Disposed | Unregistered
+
+    // PID_KEY_HASH (0x0070), len 16 — endpoint GUID as the dispose key.
+    putLE16(payload + pp, PID_KEY_HASH); pp += 2;
+    putLE16(payload + pp, 16); pp += 2;
+    memcpy(payload + pp, participant.getGuidPrefix(), 12); pp += 12;
+    memcpy(payload + pp, writerEntityId, 4); pp += 4;
+
+    // PID_ENDPOINT_GUID — same GUID in the documented dispose parameter.
+    putLE16(payload + pp, PID_ENDPOINT_GUID); pp += 2;
+    putLE16(payload + pp, 16); pp += 2;
+    memcpy(payload + pp, participant.getGuidPrefix(), 12); pp += 12;
+    memcpy(payload + pp, writerEntityId, 4); pp += 4;
+
+    // PID_SENTINEL
+    putLE16(payload + pp, PID_SENTINEL); pp += 2;
+    putLE16(payload + pp, 0); pp += 2;
+
+    // DATA submessage on the builtin PublicationsWriter endpoint.
+    pos += RTPSMessage::writeDataSubmessage(pBuf + pos, bufLen - pos,
+        ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER,
+        ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER,
+        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        payload, pp);
+
+    // HEARTBEAT for this built-in writer (same as announce path).
+    uint32_t hbCount = heartbeatCount > 0 ? heartbeatCount : (uint32_t)sequenceNumber;
+    pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
+        ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER,
+        ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER,
+        0, 1,                                          // firstSN
+        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),    // lastSN
+        hbCount);
+
+    return pos;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Build user DATA message (e.g., ros_discovery_info) with HEARTBEAT
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 

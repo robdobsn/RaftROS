@@ -6,15 +6,26 @@ RaftROS enables ESP32 firmware built on the Raft framework to function as a nati
 
 ## Status
 
-**Phase 1 (Discovery), Phase 2 (Topic Publishing), and Phase 3 (Topic Subscribing with per-topic routing) are complete.** Verified end-to-end on 2026-04-22 against ROS 2 Humble + FastDDS 2.6.11 with an ESP32-S3 on WiFi:
+**Phases 1–4 are complete.** Verified end-to-end against ROS 2 Humble +
+FastDDS 2.6.11 with an ESP32-S3 on WiFi:
 
-- `ros2 node list` shows `/raft_esp32`
-- `ros2 topic list` shows `/chatter` (published), `/chatter_in`, `/chatter_in2` (subscribed)
-- `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints a sample per second
-- `ros2 topic info /chatter --no-daemon -v` shows one RELIABLE + VOLATILE publisher from node `raft_esp32`
-- `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` dispatches on-device to the correct per-slot handler
+- **Phase 1 (Discovery)** — `ros2 node list` shows `/raft_esp32`.
+- **Phase 2 (Topic Publishing)** — `ros2 topic echo /chatter` prints a
+  sample per second; RELIABLE + VOLATILE QoS.
+- **Phase 3 (Topic Subscribing)** — `ros2 topic pub --once /chatter_in2 ...`
+  dispatches on-device to the correct per-slot handler.
+- **Phase 4 (DeviceManager auto-publishing)** — every bus device detected
+  by `DeviceManager` automatically becomes a typed ROS 2 topic
+  (`rt/raft/<slug>_<bus>_<addrHex>`) with per-class message type, REP-103
+  unit scaling, per-writer QoS, and clean dispose on detach. No per-device
+  code. Composite devices (AHT20, BMP280, IMUs) publish multiple topics
+  from a single bus sample.
 
-See `devdocs/RaftROS-development-status.md` for the full fix list and `devdocs/RaftROS-next-stages-implementation-plan.md` for what comes next.
+**911 linux unit tests pass.** ESP32-S3 firmware fits in 25% of a
+`0x1b0000` app partition.
+
+See `devdocs/RaftROS-development-status.md` for the full fix list and
+`devdocs/RaftROS-auto-publishing-design.md` for the Phase 4 design.
 
 ## Features
 
@@ -24,7 +35,11 @@ See `devdocs/RaftROS-development-status.md` for the full fix list and `devdocs/R
 - Reliable QoS (HEARTBEAT + ACKNACK with retransmit) for both builtin endpoints and user topics
 - VOLATILE- and TRANSIENT_LOCAL-aware HEARTBEAT `firstSN` semantics
 - Shared runtime core with thin ESP32 and Linux platform wrappers
-- Planned: automatic mapping of Raft device data to ROS 2 topics via DeviceTypeRecords, and automatic generation of ROS 2 services from device actions
+- **Automatic ROS 2 publishing of every `DeviceManager`-detected bus device**
+  — `clas[]`-driven type mapping, REP-103 SI unit scaling, composite
+  multi-topic devices, per-class QoS profiles with SysTypes override.
+- Planned: automatic subscription of actuator classes (SRVO/PUMP/PIX) for
+  command-side wiring, and ROS 2 services from device actions.
 
 ## Quick Start
 
