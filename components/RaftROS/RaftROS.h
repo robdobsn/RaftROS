@@ -19,6 +19,12 @@
 #include "runtime/dispatch/RTPSSubscriptionRegistry.h"
 #include "runtime/dispatch/RTPSRemotePublicationMap.h"
 #include "runtime/dispatch/RTPSSEDPPublicationParser.h"
+#include "runtime/autopub/RTPSAutoPubLifecycle.h"
+#include "runtime/autopub/RTPSAutoPubClassMap.h"
+#include "runtime/autopub/RTPSAutoPubQoSProfile.h"
+#include "RaftDeviceConsts.h"
+#include "DeviceTypeRecord.h"
+#include "RaftBusDevicesIF.h"
 #include <functional>
 #include <vector>
 #include <sys/socket.h>
@@ -208,7 +214,9 @@ private:
         RTPSInitialAnnounceRunnerContext runCtx;    // carries seq counters + previousPayloadLen
         uint8_t stepIdx = 0;                        // next main-sequence step to emit
         uint8_t extraSubSlot = 1;                   // next extra-sub registry slot to announce
+        uint8_t extraPubSlot = 0;                   // next autopub writer-registry slot to announce
         bool mainPhaseDone = false;                 // true once stepIdx reached numSteps
+        bool extraSubPhaseDone = false;             // true once extraSubSlot reached count
     };
     static const uint32_t MAX_PENDING_ANNOUNCES = 8;
     std::vector<PendingAnnounce> _pendingAnnounces;
@@ -224,7 +232,9 @@ private:
         uint32_t peerIdx = 0;                       // index into _discovered
         uint8_t stepIdx = 0;                        // within main sequence for current peer
         uint8_t extraSubSlot = 1;                   // extra-sub slot (1..N) for current peer
+        uint8_t extraPubSlot = 0;                   // autopub-writer slot for current peer
         bool mainPhaseDoneForPeer = false;          // true once stepIdx reached numSteps
+        bool extraSubPhaseDoneForPeer = false;      // true once extraSubSlot reached count
     };
     WriterHbPassState _hbPass;
 
@@ -236,6 +246,14 @@ private:
     // Buffers for UDP I/O
     uint8_t _sendBuf[1024] = {};
     uint8_t _recvBuf[2048] = {};
+
+    // Slice 4.7 — separate send buffer for the autopub hot path, which runs
+    // on bus-poll tasks and must not contend with `_sendBuf` (loop task).
+    // Assumption: device-data callbacks are serialised per-bus by the
+    // DeviceManager, so a single shared scratch buffer is sufficient for
+    // common single-I2C-bus setups.  Multi-bus deployments should replace
+    // this with a per-bus buffer or a mutex.
+    uint8_t _autoPubSendBuf[1024] = {};
 
     // Networking helpers
     uint32_t getLocalIP();
@@ -254,12 +272,130 @@ private:
     void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent, uint32_t contentLen,
                        const struct sockaddr_in& fromAddr);
 
+    // Phase 4 / Slice 4.6 — emit an SEDP PublicationBuiltinTopic DATA(w) for
+    // the dynamic writer in the given autopub registry slot to the specified
+    // peer.  Returns true if a packet was built and sent.  Advances the slot's
+    // `sedpSeqNum` exactly once on success.
+    bool emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8_t slot);
+
     // Chatter topic helpers
     void publishChatter();
     uint32_t buildChatterPayload(uint8_t* pBuf, uint32_t bufLen, const char* message);
 
     // Helper to build ros_discovery_info payload with our writer GIDs
     uint32_t buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen);
+
+    // -----------------------------------------------------------------
+    // Phase 4 / Slice 4.3 — per-bus-device auto-publishing plumbing
+    //
+    // Flow:
+    //   1. setup() subscribes to DeviceManager::registerForDeviceStatusChange.
+    //   2. On a device going online the status callback allocates a slot in
+    //      _autoPubLifecycle, builds a DynamicWriterCtx (decode fn + buffer),
+    //      and installs a per-device data callback via registerForDeviceData.
+    //   3. The data callback decodes the poll record into the cached buffer and,
+    //      for Slice 4.3, just logs the decoded values (no RTPS emission yet;
+    //      that arrives with the CDR serializers + SEDP announce in later slices).
+    //   4. On offline / pending-deletion, the ctx is torn down, the data
+    //      callback is unregistered, and the lifecycle slot is freed so a
+    //      future device attach can reuse it.
+    // -----------------------------------------------------------------
+    struct DynamicWriterCtx
+    {
+        RaftROS* pOwner = nullptr;
+        RaftDeviceID deviceID;
+        uint16_t deviceTypeIndex = DEVICE_TYPE_INDEX_INVALID;
+        uint8_t slot = 0xFF;
+
+        // Cached decode metadata
+        DeviceTypeRecordDecodeFn decodeFn = nullptr;
+        const AttrFieldDesc* pFieldDescs = nullptr;
+        uint16_t fieldCount = 0;
+        uint16_t structSize = 0;
+        uint16_t pollDataSizeBytes = 0;
+        RaftBusDeviceDecodeState decodeState;
+
+        // Pre-allocated decode buffer (heap; bus callback runs on bus task
+        // which has limited stack budget)
+        uint8_t* pDecodeBuf = nullptr;
+        uint32_t decodeBufSize = 0;
+        uint16_t maxDecodeRecords = 0;
+
+        // Slice 4.5: ROS 2 message kind cached at attach time so the hot
+        // path (autoPubOnDeviceData) does not re-run the class-map lookup.
+        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind msgKind =
+            RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind::Unknown;
+
+        // Pre-allocated CDR payload buffer (heap; bus callback path).
+        // Sized once at attach to comfortably hold the largest ROS 2 message
+        // this serializer emits (sensor_msgs/Imu = 320 bytes + header margin).
+        uint8_t* pCDRBuf = nullptr;
+        uint32_t cdrBufSize = 0;
+
+        // Slice 4.10 — composite secondary writer (e.g. AHT20 publishes
+        // Temperature on the primary slot and RelativeHumidity here).
+        // `secondarySlot == 0xFF` means "no secondary".  When present, the
+        // secondary writer shares `pDecodeBuf` and field descs with the
+        // primary but has its own CDR buffer and registry slot (different
+        // entityId + topic).
+        uint8_t secondarySlot = 0xFF;
+        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind secondaryMsgKind =
+            RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind::Unknown;
+        uint8_t* pSecondaryCDRBuf = nullptr;
+        uint32_t secondaryCDRBufSize = 0;
+
+        // Diagnostics: count callbacks received so LOG_I can be rate-limited.
+        uint32_t sampleCount = 0;
+
+        ~DynamicWriterCtx() { delete[] pDecodeBuf; delete[] pCDRBuf; delete[] pSecondaryCDRBuf; }
+    };
+
+    // Owning pointer array — index matches lifecycle slot.  Nullptr entries
+    // indicate a free slot.  Capacity matches the lifecycle registry.
+    DynamicWriterCtx* _autoPubCtxs[
+        RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY] = {};
+
+    // Shared-runtime attach/detach coordinator (slot allocation + owned
+    // topic/type strings).  No RTPS I/O yet in Slice 4.3.
+    RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubLifecycle _autoPubLifecycle;
+
+    // Track whether we registered a status-change callback with DeviceManager.
+    bool _autoPubStatusCBRegistered = false;
+
+    // Slice 4.11 — SysTypes-driven QoS overrides, parsed once at setup().
+    //   `_qosAliasOverrides`   : matched against the per-device topic alias
+    //                            (last path segment, e.g. "imu_1_6a").
+    //   `_qosClassOverrides`   : matched against the device `clas[]` entries
+    //                            (e.g. "ACC", "TEMP").
+    // Resolution order per design §7.2:
+    //   per-device alias → per-class override → built-in default.
+    struct QoSOverride
+    {
+        String key;
+        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId id =
+            RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId::FallbackString;
+    };
+    std::vector<QoSOverride> _qosAliasOverrides;
+    std::vector<QoSOverride> _qosClassOverrides;
+
+    // Parse the SysTypes `qosProfiles` block (called from setup()).
+    void autoPubParseQoSOverrides();
+
+    // Resolve a profile id for a device using (alias, clas[]) — returns the
+    // final profile id after applying overrides.  `pTopicAlias` is the short
+    // per-device suffix (e.g. "imu_1_6a"); `pClasArray` is the device's class
+    // list; `pDeviceTypeName` is optional.
+    RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId
+        autoPubResolveQoSProfileId(
+            const char* pTopicAlias,
+            const char* const* pClasArray, size_t clasCount,
+            const char* pDeviceTypeName) const;
+
+    // Per-device status / data callback handlers (called from bus task).
+    void autoPubOnDeviceStatusChange(RaftDevice& device, const BusAddrStatus& addrStatus);
+    void autoPubOnDeviceData(uint16_t deviceTypeIdx, std::vector<uint8_t> data, const void* pCallbackInfo);
+    bool autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrStatus);
+    void autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& addrStatus);
 
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);

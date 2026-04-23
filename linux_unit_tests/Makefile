@@ -15,6 +15,7 @@ INCLUDES = -I../components/RaftROS -I../components/RaftROS/RTPS -I../components/
 SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/CDR/CDREncoder.cpp \
 	../components/RaftROS/CDR/CDRDecoder.cpp \
+	../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp \
 	../components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp \
@@ -50,6 +51,7 @@ STANDALONE_OUT = raftros_linux
 PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/CDR/CDREncoder.cpp \
 	../components/RaftROS/CDR/CDRDecoder.cpp \
+	../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp \
 	../components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp \

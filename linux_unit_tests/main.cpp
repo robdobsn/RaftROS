@@ -31,6 +31,12 @@
 #include "runtime/dispatch/RTPSSubscriptionRegistry.h"
 #include "runtime/dispatch/RTPSRemotePublicationMap.h"
 #include "runtime/dispatch/RTPSSEDPPublicationParser.h"
+#include "runtime/autopub/RTPSDynamicWriterRegistry.h"
+#include "runtime/autopub/RTPSAutoPubLifecycle.h"
+#include "runtime/autopub/RTPSAutoPubQoSProfile.h"
+#include "runtime/autopub/RTPSAutoPubTopicNaming.h"
+#include "runtime/autopub/RTPSAutoPubClassMap.h"
+#include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -2048,6 +2054,1434 @@ int main()
                                           pPayload, payloadLen);
             TEST_ASSERT(pPayload == nullptr && payloadLen == 0,
                         "contentLen<20: rejected");
+        }
+    }
+
+    //=================================================================
+    // Phase 4 / Slice 4.1 — RTPSDynamicWriterRegistry skeleton
+    //=================================================================
+    {
+        printf("Test: RTPSDynamicWriterRegistry (Phase 4 Slice 4.1)\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+
+        // ---- allocateEntityId policy ---------------------------------
+        {
+            uint8_t eid[4] = {0};
+            TEST_ASSERT(RTPSDynamicWriterRegistry_allocateEntityId(0, eid),
+                        "allocateEntityId(slot=0) succeeds");
+            TEST_ASSERT(eid[0] == 0x00 && eid[1] == 0x01 &&
+                        eid[2] == DYNAMIC_WRITER_ENTITY_KEY_BASE && eid[3] == 0x03,
+                        "slot-0 entityId = {00,01,0x10,03}");
+
+            TEST_ASSERT(RTPSDynamicWriterRegistry_allocateEntityId(15, eid),
+                        "allocateEntityId(slot=15) succeeds");
+            TEST_ASSERT(eid[2] == (uint8_t)(DYNAMIC_WRITER_ENTITY_KEY_BASE + 15) &&
+                        eid[3] == 0x03,
+                        "slot-15 entityId = {00,01,0x1F,03}");
+
+            TEST_ASSERT(!RTPSDynamicWriterRegistry_allocateEntityId(
+                            DYNAMIC_WRITER_REGISTRY_CAPACITY, eid),
+                        "allocateEntityId out-of-range rejected");
+        }
+
+        // ---- Key validity --------------------------------------------
+        {
+            RTPSDynamicWriterKey zero{};
+            RTPSDynamicWriterKey good{1, 0x6A};
+            RTPSDynamicWriterKey good2{1, 0x38};
+            TEST_ASSERT(!zero.isValid(), "zero key is invalid");
+            TEST_ASSERT(good.isValid(), "non-zero key is valid");
+            TEST_ASSERT(good.equals({1, 0x6A}), "key equality");
+            TEST_ASSERT(!good.equals(good2), "key inequality");
+        }
+
+        // ---- allocate / find / release round-trip --------------------
+        {
+            RTPSDynamicWriterRegistry reg;
+            TEST_ASSERT(reg.inUseCount() == 0, "registry starts empty");
+            TEST_ASSERT(reg.capacity() == DYNAMIC_WRITER_REGISTRY_CAPACITY,
+                        "registry capacity reported");
+
+            uint8_t eidA[4] = {0};
+            int slotA = reg.allocate({1, 0x6A}, "rt/imu_1_6a",
+                                     "sensor_msgs::msg::dds_::Imu_", eidA);
+            TEST_ASSERT(slotA == 0, "first allocate returns slot 0");
+            TEST_ASSERT(eidA[2] == DYNAMIC_WRITER_ENTITY_KEY_BASE,
+                        "slot 0 entityId key byte = base");
+            TEST_ASSERT(reg.inUseCount() == 1, "inUseCount=1 after allocate");
+
+            uint8_t eidB[4] = {0};
+            int slotB = reg.allocate({1, 0x38}, "rt/temp_1_38",
+                                     "sensor_msgs::msg::dds_::Temperature_", eidB);
+            TEST_ASSERT(slotB == 1, "second allocate returns slot 1");
+            TEST_ASSERT(eidB[2] == (uint8_t)(DYNAMIC_WRITER_ENTITY_KEY_BASE + 1),
+                        "slot 1 entityId key byte = base+1");
+            TEST_ASSERT(reg.inUseCount() == 2, "inUseCount=2");
+
+            // Find by key
+            TEST_ASSERT(reg.find({1, 0x6A}) == 0, "find returns slot 0");
+            TEST_ASSERT(reg.find({1, 0x38}) == 1, "find returns slot 1");
+            TEST_ASSERT(reg.find({2, 0x6A}) == -1, "find unknown key -> -1");
+            TEST_ASSERT(reg.find({}) == -1, "find invalid key -> -1");
+
+            // Find by entityId
+            TEST_ASSERT(reg.findByEntityId(eidA) == 0, "findByEntityId slot 0");
+            TEST_ASSERT(reg.findByEntityId(eidB) == 1, "findByEntityId slot 1");
+            uint8_t bogus[4] = {0xFF, 0xFF, 0xFF, 0xFF};
+            TEST_ASSERT(reg.findByEntityId(bogus) == -1, "findByEntityId unknown -> -1");
+
+            // Accessor fields
+            const auto* eA = reg.get(0);
+            TEST_ASSERT(eA && eA->inUse && eA->key.busNum == 1 && eA->key.address == 0x6A,
+                        "get(slot 0) has correct key");
+            TEST_ASSERT(eA && strcmp(eA->topic, "rt/imu_1_6a") == 0,
+                        "get(slot 0) has correct topic");
+            TEST_ASSERT(eA && strcmp(eA->type, "sensor_msgs::msg::dds_::Imu_") == 0,
+                        "get(slot 0) has correct type");
+            TEST_ASSERT(eA && eA->seqNum == 0 && eA->sedpSeqNum == 0,
+                        "newly-allocated slot has zeroed seq counters");
+
+            // Mutable accessor -> bump seqNum
+            auto* mA = reg.getMutable(0);
+            TEST_ASSERT(mA != nullptr, "getMutable(0) non-null");
+            mA->seqNum = 7;
+            TEST_ASSERT(reg.get(0)->seqNum == 7, "seqNum bump survives");
+
+            // Release by key + post-release accessors
+            TEST_ASSERT(reg.release({1, 0x6A}), "release slot 0 by key");
+            TEST_ASSERT(reg.inUseCount() == 1, "inUseCount=1 after release");
+            TEST_ASSERT(reg.find({1, 0x6A}) == -1, "find after release -> -1");
+            TEST_ASSERT(reg.get(0) == nullptr, "get(freed slot) -> nullptr");
+            TEST_ASSERT(reg.getMutable(0) == nullptr, "getMutable(freed slot) -> nullptr");
+
+            // Release non-existent key is a no-op
+            TEST_ASSERT(!reg.release({9, 0xAB}), "release unknown key -> false");
+            TEST_ASSERT(!reg.release({}), "release invalid key -> false");
+
+            // Slot reuse: next allocate should reclaim slot 0 (lowest free).
+            uint8_t eidC[4] = {0};
+            int slotC = reg.allocate({1, 0x29}, "rt/range_1_29",
+                                     "sensor_msgs::msg::dds_::Range_", eidC);
+            TEST_ASSERT(slotC == 0, "slot reuse picks lowest free (slot 0)");
+            TEST_ASSERT(eidC[2] == DYNAMIC_WRITER_ENTITY_KEY_BASE,
+                        "reused slot gets the same entityId as before");
+            // The reused slot must have reset its sequence counters.
+            TEST_ASSERT(reg.get(0)->seqNum == 0 && reg.get(0)->sedpSeqNum == 0,
+                        "reused slot has fresh sequence counters");
+        }
+
+        // ---- Reject duplicate / invalid inputs -----------------------
+        {
+            RTPSDynamicWriterRegistry reg;
+            TEST_ASSERT(reg.allocate({}, "t", "T") == -1,
+                        "allocate invalid key -> -1");
+            TEST_ASSERT(reg.allocate({1, 1}, nullptr, "T") == -1,
+                        "allocate null topic -> -1");
+            TEST_ASSERT(reg.allocate({1, 1}, "t", nullptr) == -1,
+                        "allocate null type -> -1");
+            TEST_ASSERT(reg.allocate({1, 1}, "", "T") == -1,
+                        "allocate empty topic -> -1");
+            TEST_ASSERT(reg.allocate({1, 1}, "t", "") == -1,
+                        "allocate empty type -> -1");
+
+            TEST_ASSERT(reg.allocate({1, 1}, "rt/a", "A") >= 0,
+                        "valid allocate succeeds");
+            TEST_ASSERT(reg.allocate({1, 1}, "rt/a2", "A") == -1,
+                        "duplicate key rejected");
+        }
+
+        // ---- Capacity invariants --------------------------------------
+        {
+            RTPSDynamicWriterRegistry reg;
+            // Fill the registry to capacity.
+            for (uint8_t i = 0; i < DYNAMIC_WRITER_REGISTRY_CAPACITY; i++)
+            {
+                int slot = reg.allocate({1, (uint32_t)(0x10 + i)}, "rt/x", "X");
+                TEST_ASSERT(slot == (int)i, "sequential allocate fills slots in order");
+            }
+            TEST_ASSERT(reg.inUseCount() == DYNAMIC_WRITER_REGISTRY_CAPACITY,
+                        "inUseCount == capacity when full");
+
+            // One more must fail.
+            TEST_ASSERT(reg.allocate({2, 1}, "rt/over", "O") == -1,
+                        "allocate beyond capacity -> -1");
+
+            // Release middle slot, next allocate should fill that gap.
+            const uint8_t gap = 5;
+            TEST_ASSERT(reg.releaseSlot(gap), "releaseSlot(5)");
+            TEST_ASSERT(reg.inUseCount() == DYNAMIC_WRITER_REGISTRY_CAPACITY - 1,
+                        "inUseCount = cap-1 after releaseSlot");
+            int slotG = reg.allocate({2, 1}, "rt/refill", "R");
+            TEST_ASSERT(slotG == gap, "allocate fills the released gap");
+
+            // Idempotent release.
+            TEST_ASSERT(!reg.releaseSlot(DYNAMIC_WRITER_REGISTRY_CAPACITY),
+                        "releaseSlot(out-of-range) -> false");
+            // release gap+release gap again = false on second call
+            TEST_ASSERT(reg.releaseSlot(gap), "release same slot once");
+            TEST_ASSERT(!reg.releaseSlot(gap), "release same slot again -> false");
+
+            // clear() wipes everything.
+            reg.clear();
+            TEST_ASSERT(reg.inUseCount() == 0, "clear() empties registry");
+            TEST_ASSERT(reg.get(0) == nullptr, "clear(): get(0) null");
+        }
+
+        // ---- 20 attach/detach cycles, no state bleed -----------------
+        {
+            RTPSDynamicWriterRegistry reg;
+            for (int cycle = 0; cycle < 20; cycle++)
+            {
+                int s = reg.allocate({1, 0x44}, "rt/cycle", "C");
+                TEST_ASSERT(s == 0, "cycle: allocate returns slot 0");
+                TEST_ASSERT(reg.release({1, 0x44}), "cycle: release succeeds");
+                TEST_ASSERT(reg.inUseCount() == 0, "cycle: inUseCount back to 0");
+            }
+        }
+
+        // ---- Slice 4.10: composite subIndex disambiguation ----------
+        // AHT20-like device publishes Temperature (subIndex=0) and
+        // RelativeHumidity (subIndex=1) on the same (bus, addr).  The
+        // registry must treat them as two distinct keys/slots.
+        {
+            RTPSDynamicWriterRegistry reg;
+            RTPSDynamicWriterKey kPrim{1, 0x38, 0};
+            RTPSDynamicWriterKey kSec {1, 0x38, 1};
+            TEST_ASSERT(!kPrim.equals(kSec),
+                        "composite: subIndex differentiates keys");
+            TEST_ASSERT(kPrim.equals({1, 0x38, 0}),
+                        "composite: primary key equality with explicit sub=0");
+            TEST_ASSERT(kPrim.equals({1, 0x38}),
+                        "composite: default sub=0 equals explicit sub=0 (compat)");
+
+            uint8_t eid0[4] = {0};
+            uint8_t eid1[4] = {0};
+            int s0 = reg.allocate(kPrim, "rt/temp_1_38",
+                                  "sensor_msgs::msg::dds_::Temperature_", eid0);
+            int s1 = reg.allocate(kSec,  "rt/rh_1_38",
+                                  "sensor_msgs::msg::dds_::RelativeHumidity_", eid1);
+            TEST_ASSERT(s0 == 0 && s1 == 1,
+                        "composite: dual slots allocated");
+            TEST_ASSERT(eid0[2] != eid1[2],
+                        "composite: distinct entityIds for pri/sec");
+            TEST_ASSERT(reg.find(kPrim) == 0, "composite: find primary");
+            TEST_ASSERT(reg.find(kSec)  == 1, "composite: find secondary");
+            TEST_ASSERT(reg.find({1, 0x38, 2}) == -1,
+                        "composite: unknown subIndex -> -1");
+
+            // Duplicate-key protection still applies per-subIndex.
+            TEST_ASSERT(reg.allocate(kPrim, "rt/dup", "D") == -1,
+                        "composite: duplicate primary rejected");
+            TEST_ASSERT(reg.allocate(kSec,  "rt/dup", "D") == -1,
+                        "composite: duplicate secondary rejected");
+
+            // Releasing primary must leave the secondary intact.
+            TEST_ASSERT(reg.release(kPrim), "composite: release primary");
+            TEST_ASSERT(reg.find(kPrim) == -1, "composite: primary gone");
+            TEST_ASSERT(reg.find(kSec)  == 1,  "composite: secondary still there");
+            TEST_ASSERT(reg.inUseCount() == 1, "composite: one slot still in use");
+            TEST_ASSERT(reg.release(kSec), "composite: release secondary");
+            TEST_ASSERT(reg.inUseCount() == 0, "composite: registry empty");
+        }
+    }
+
+    //=================================================================
+    // Phase 4 / Slice 4.2 — RTPSAutoPubLifecycle attach/detach
+    //=================================================================
+    {
+        printf("Test: RTPSAutoPubLifecycle (Phase 4 Slice 4.2)\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+
+        // ---- attach copies strings into owned storage ----------------
+        {
+            RTPSAutoPubLifecycle life;
+            TEST_ASSERT(life.inUseCount() == 0, "lifecycle starts empty");
+
+            // Build topic/type in volatile local buffers, pass pointers,
+            // then mutate the source to prove storage is owned.
+            char topicSrc[64];
+            char typeSrc[64];
+            std::strcpy(topicSrc, "rt/raft_esp32/imu_1_6a");
+            std::strcpy(typeSrc,  "sensor_msgs::msg::dds_::Imu_");
+
+            uint8_t eid[4] = {0};
+            int slot = life.attach({1, 0x6A}, topicSrc, typeSrc, eid);
+            TEST_ASSERT(slot == 0, "attach returns slot 0");
+            TEST_ASSERT(eid[0] == 0x00 && eid[1] == 0x01 &&
+                        eid[2] == DYNAMIC_WRITER_ENTITY_KEY_BASE && eid[3] == 0x03,
+                        "attach entityId matches registry policy");
+
+            // Clobber the source to verify the lifecycle has its own copy.
+            std::memset(topicSrc, 0, sizeof(topicSrc));
+            std::memset(typeSrc,  0, sizeof(typeSrc));
+
+            const auto* e = life.get(0);
+            TEST_ASSERT(e != nullptr, "get(0) non-null");
+            TEST_ASSERT(e && std::strcmp(e->topic, "rt/raft_esp32/imu_1_6a") == 0,
+                        "attach: owned topic survives source clobber");
+            TEST_ASSERT(e && std::strcmp(e->type, "sensor_msgs::msg::dds_::Imu_") == 0,
+                        "attach: owned type survives source clobber");
+            TEST_ASSERT(e && e->key.busNum == 1 && e->key.address == 0x6A,
+                        "attach: key stored");
+            TEST_ASSERT(std::strcmp(life.topicForSlot(0), "rt/raft_esp32/imu_1_6a") == 0,
+                        "topicForSlot accessor");
+            TEST_ASSERT(std::strcmp(life.typeForSlot(0),  "sensor_msgs::msg::dds_::Imu_") == 0,
+                        "typeForSlot accessor");
+        }
+
+        // ---- reject oversize / invalid inputs ------------------------
+        {
+            RTPSAutoPubLifecycle life;
+            char bigTopic[AUTOPUB_TOPIC_BUF_LEN + 4];
+            std::memset(bigTopic, 'A', sizeof(bigTopic) - 1);
+            bigTopic[sizeof(bigTopic) - 1] = '\0';
+            TEST_ASSERT(life.attach({1, 1}, bigTopic, "T") == -1,
+                        "attach rejects oversize topic");
+
+            char bigType[AUTOPUB_TYPE_BUF_LEN + 4];
+            std::memset(bigType, 'B', sizeof(bigType) - 1);
+            bigType[sizeof(bigType) - 1] = '\0';
+            TEST_ASSERT(life.attach({1, 1}, "rt/x", bigType) == -1,
+                        "attach rejects oversize type");
+
+            TEST_ASSERT(life.attach({}, "rt/x", "X") == -1,
+                        "attach invalid key rejected");
+            TEST_ASSERT(life.attach({1, 1}, nullptr, "X") == -1,
+                        "attach null topic rejected");
+            TEST_ASSERT(life.attach({1, 1}, "rt/x", nullptr) == -1,
+                        "attach null type rejected");
+            TEST_ASSERT(life.attach({1, 1}, "", "X") == -1,
+                        "attach empty topic rejected");
+            TEST_ASSERT(life.attach({1, 1}, "rt/x", "") == -1,
+                        "attach empty type rejected");
+            TEST_ASSERT(life.inUseCount() == 0,
+                        "failed attaches leave registry empty");
+
+            // A duplicate attach must be rejected without clobbering the existing slot.
+            TEST_ASSERT(life.attach({1, 1}, "rt/first", "F") == 0, "attach succeeds");
+            TEST_ASSERT(life.attach({1, 1}, "rt/second", "S") == -1,
+                        "attach duplicate key rejected");
+            TEST_ASSERT(std::strcmp(life.get(0)->topic, "rt/first") == 0,
+                        "duplicate attach leaves original unchanged");
+        }
+
+        // ---- detach clears storage and frees slot --------------------
+        {
+            RTPSAutoPubLifecycle life;
+            TEST_ASSERT(life.attach({1, 0x20}, "rt/a", "A") == 0, "attach slot 0");
+            TEST_ASSERT(life.attach({1, 0x21}, "rt/b", "B") == 1, "attach slot 1");
+            TEST_ASSERT(life.inUseCount() == 2, "inUseCount=2");
+
+            TEST_ASSERT(life.detach({1, 0x20}), "detach slot 0 by key");
+            TEST_ASSERT(life.inUseCount() == 1, "inUseCount=1 after detach");
+            TEST_ASSERT(life.get(0) == nullptr, "get(freed slot) null");
+            TEST_ASSERT(life.topicForSlot(0)[0] == '\0',
+                        "detach zeroes owned topic storage");
+            TEST_ASSERT(life.typeForSlot(0)[0] == '\0',
+                        "detach zeroes owned type storage");
+
+            TEST_ASSERT(!life.detach({1, 0x20}),
+                        "detach already-freed key returns false");
+            TEST_ASSERT(!life.detach({}), "detach invalid key returns false");
+            TEST_ASSERT(!life.detach({9, 9}), "detach unknown key returns false");
+
+            // detachSlot by index
+            TEST_ASSERT(life.detachSlot(1), "detachSlot(1)");
+            TEST_ASSERT(!life.detachSlot(1), "detachSlot idempotent");
+            TEST_ASSERT(!life.detachSlot(DYNAMIC_WRITER_REGISTRY_CAPACITY),
+                        "detachSlot out-of-range rejected");
+            TEST_ASSERT(life.inUseCount() == 0, "all slots freed");
+        }
+
+        // ---- slot reuse after detach: same entityId, fresh counters --
+        {
+            RTPSAutoPubLifecycle life;
+            uint8_t eid1[4] = {0};
+            int s1 = life.attach({1, 0x50}, "rt/first", "F", eid1);
+            TEST_ASSERT(s1 == 0, "first attach -> slot 0");
+            // Bump seq via registry's mutable accessor.
+            life.getMutable(0)->seqNum = 42;
+            TEST_ASSERT(life.detach({1, 0x50}), "detach slot 0");
+
+            uint8_t eid2[4] = {0};
+            int s2 = life.attach({1, 0x51}, "rt/second", "S", eid2);
+            TEST_ASSERT(s2 == 0, "second attach reuses slot 0");
+            TEST_ASSERT(std::memcmp(eid1, eid2, 4) == 0,
+                        "reused slot same entityId");
+            TEST_ASSERT(life.get(0)->seqNum == 0,
+                        "reused slot has fresh seqNum");
+            TEST_ASSERT(std::strcmp(life.get(0)->topic, "rt/second") == 0,
+                        "reused slot has new topic string");
+        }
+
+        // ---- entityId lookup goes via registry -----------------------
+        {
+            RTPSAutoPubLifecycle life;
+            uint8_t eid[4] = {0};
+            int slot = life.attach({1, 0x70}, "rt/t", "T", eid);
+            TEST_ASSERT(slot == 0, "attach");
+            TEST_ASSERT(life.findByEntityId(eid) == slot,
+                        "findByEntityId routes via registry");
+            TEST_ASSERT(life.find({1, 0x70}) == slot,
+                        "find routes via registry");
+        }
+
+        // ---- Fill to capacity, overflow rejected ---------------------
+        {
+            RTPSAutoPubLifecycle life;
+            for (uint8_t i = 0; i < DYNAMIC_WRITER_REGISTRY_CAPACITY; i++)
+            {
+                char tbuf[32];
+                std::snprintf(tbuf, sizeof(tbuf), "rt/fill_%u", (unsigned)i);
+                int s = life.attach({1, (uint32_t)(0x80 + i)}, tbuf, "X");
+                TEST_ASSERT(s == (int)i, "sequential attach fills slots in order");
+            }
+            TEST_ASSERT(life.inUseCount() == DYNAMIC_WRITER_REGISTRY_CAPACITY,
+                        "full capacity reached");
+            TEST_ASSERT(life.attach({2, 1}, "rt/over", "O") == -1,
+                        "attach beyond capacity -> -1");
+
+            life.clear();
+            TEST_ASSERT(life.inUseCount() == 0, "clear() empties lifecycle");
+            TEST_ASSERT(life.topicForSlot(0)[0] == '\0', "clear() wipes topic storage");
+        }
+
+        // ---- 10 attach/detach cycles simulate device churn -----------
+        {
+            RTPSAutoPubLifecycle life;
+            for (int cycle = 0; cycle < 10; cycle++)
+            {
+                int s = life.attach({1, 0x66}, "rt/churn", "C");
+                TEST_ASSERT(s == 0, "churn: attach slot 0");
+                TEST_ASSERT(life.detach({1, 0x66}), "churn: detach");
+                TEST_ASSERT(life.inUseCount() == 0, "churn: back to 0");
+                TEST_ASSERT(life.topicForSlot(0)[0] == '\0',
+                            "churn: storage wiped after detach");
+            }
+        }
+    }
+
+    //=================================================================
+    // Phase 4 / Slice 4.3 — RTPSAutoPubTopicNaming fallback formatting
+    //=================================================================
+    {
+        printf("Test: RTPSAutoPubTopicNaming (Phase 4 Slice 4.3)\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+
+        // ---- topic formatting: basic cases ---------------------------
+        {
+            char buf[64];
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x38),
+                        "topic format bus=1 addr=0x38 succeeds");
+            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_1_38") == 0,
+                        "topic format: I2C addr 0x38 -> 'rt/raft/raw_1_38'");
+
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x6A),
+                        "topic format bus=1 addr=0x6A succeeds");
+            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_1_6a") == 0,
+                        "topic format: LSM6DS @0x6A -> lowercase hex");
+
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 2, 0x08),
+                        "topic format bus=2 addr=0x08 succeeds");
+            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_2_08") == 0,
+                        "topic format: single-digit addr zero-padded to 2 hex");
+
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 0, 0),
+                        "topic format bus=0 addr=0 succeeds");
+            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_0_00") == 0,
+                        "topic format: edge case bus=0 addr=0");
+        }
+
+        // ---- address masked to low 8 bits (I2C 7-bit convention) -----
+        {
+            char buf[64];
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x1138),
+                        "topic format: address masked to 8 bits");
+            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_1_38") == 0,
+                        "topic format: high bits of address stripped");
+        }
+
+        // ---- topic formatting: input validation ----------------------
+        {
+            char buf[64];
+            TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackTopic(nullptr, 64, 1, 1),
+                        "topic format: null buffer rejected");
+            TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackTopic(buf, 0, 1, 1),
+                        "topic format: zero-length buffer rejected");
+        }
+
+        // ---- topic formatting: buffer-too-small leaves empty string --
+        {
+            char tiny[6]; // less than "rt/raft/raw_1_38" + NUL = 17
+            std::memset(tiny, 'X', sizeof(tiny));
+            TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackTopic(tiny, sizeof(tiny), 1, 0x38),
+                        "topic format: short buffer rejected");
+            TEST_ASSERT(tiny[0] == '\0',
+                        "topic format: short buffer cleared to empty string on failure");
+        }
+
+        // ---- type formatting ----------------------------------------
+        {
+            char buf[64];
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackType(buf, sizeof(buf)),
+                        "type format succeeds");
+            TEST_ASSERT(std::strcmp(buf, "std_msgs::msg::dds_::String_") == 0,
+                        "type format: std_msgs/String");
+            TEST_ASSERT(std::strcmp(buf, RTPS_AUTOPUB_FALLBACK_TYPE) == 0,
+                        "type format: matches exported constant");
+
+            TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackType(nullptr, 64),
+                        "type format: null buffer rejected");
+            TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackType(buf, 0),
+                        "type format: zero-length buffer rejected");
+
+            char tiny[8]; // less than full type name
+            std::memset(tiny, 'X', sizeof(tiny));
+            TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackType(tiny, sizeof(tiny)),
+                        "type format: short buffer rejected");
+            TEST_ASSERT(tiny[0] == '\0',
+                        "type format: short buffer cleared to empty string on failure");
+        }
+
+        // ---- end-to-end: fallback pair feeds RTPSAutoPubLifecycle ----
+        {
+            char topic[AUTOPUB_TOPIC_BUF_LEN];
+            char type[AUTOPUB_TYPE_BUF_LEN];
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(topic, sizeof(topic), 1, 0x6A),
+                        "pipe: topic format ok");
+            TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackType(type, sizeof(type)),
+                        "pipe: type format ok");
+
+            RTPSAutoPubLifecycle life;
+            int slot = life.attach({1, 0x6A}, topic, type);
+            TEST_ASSERT(slot == 0,
+                        "pipe: lifecycle accepts formatted fallback pair");
+            TEST_ASSERT(std::strcmp(life.topicForSlot(0), "rt/raft/raw_1_6a") == 0,
+                        "pipe: lifecycle stores formatted fallback topic");
+            TEST_ASSERT(std::strcmp(life.typeForSlot(0),
+                                    "std_msgs::msg::dds_::String_") == 0,
+                        "pipe: lifecycle stores formatted fallback type");
+        }
+    }
+
+    //=================================================================
+    // Phase 4 / Slice 4.4 — RTPSAutoPubClassMap class→message mapping
+    //=================================================================
+    {
+        printf("Test: RTPSAutoPubClassMap (Phase 4 Slice 4.4)\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+
+        // Helper for compact table-driven assertions: all device-type rows
+        // from DeviceTypeRecords.json, validated against §5.2 of the design doc.
+        auto checkPrimary = [&](const char* name,
+                                const char* const* clas, size_t clasCount,
+                                RTPSAutoPubMsgKind expectedKind,
+                                const char* expectedSlug) {
+            const auto m = RTPSAutoPubClassMap_lookup(clas, clasCount, name);
+            char msg[128];
+            std::snprintf(msg, sizeof(msg), "%s: primary kind", name);
+            TEST_ASSERT(m.primaryKind == expectedKind, msg);
+            std::snprintf(msg, sizeof(msg), "%s: primary slug", name);
+            TEST_ASSERT(m.primaryTopicSlug && std::strcmp(m.primaryTopicSlug, expectedSlug) == 0, msg);
+            std::snprintf(msg, sizeof(msg), "%s: not excluded", name);
+            TEST_ASSERT(!m.excluded, msg);
+        };
+
+        // ---- type-name accessor ----------------------------------------
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Imu),
+                                "sensor_msgs::msg::dds_::Imu_") == 0,
+                    "typeName: Imu");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Accel),
+                                "sensor_msgs::msg::dds_::Imu_") == 0,
+                    "typeName: Accel reuses Imu type");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Temperature),
+                                "sensor_msgs::msg::dds_::Temperature_") == 0,
+                    "typeName: Temperature");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::RelativeHumidity),
+                                "sensor_msgs::msg::dds_::RelativeHumidity_") == 0,
+                    "typeName: RelativeHumidity");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::FluidPressure),
+                                "sensor_msgs::msg::dds_::FluidPressure_") == 0,
+                    "typeName: FluidPressure");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Illuminance),
+                                "sensor_msgs::msg::dds_::Illuminance_") == 0,
+                    "typeName: Illuminance");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Range),
+                                "sensor_msgs::msg::dds_::Range_") == 0,
+                    "typeName: Range");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Float32),
+                                "std_msgs::msg::dds_::Float32_") == 0,
+                    "typeName: Float32");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Int32),
+                                "std_msgs::msg::dds_::Int32_") == 0,
+                    "typeName: Int32");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Bool),
+                                "std_msgs::msg::dds_::Bool_") == 0,
+                    "typeName: Bool");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::ByteMultiArray),
+                                "std_msgs::msg::dds_::ByteMultiArray_") == 0,
+                    "typeName: ByteMultiArray");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Wrench),
+                                "geometry_msgs::msg::dds_::Wrench_") == 0,
+                    "typeName: Wrench");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Float32MultiArray),
+                                "std_msgs::msg::dds_::Float32MultiArray_") == 0,
+                    "typeName: Float32MultiArray");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Joy),
+                                "sensor_msgs::msg::dds_::Joy_") == 0,
+                    "typeName: Joy");
+        TEST_ASSERT(std::strcmp(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::String),
+                                "std_msgs::msg::dds_::String_") == 0,
+                    "typeName: String");
+        TEST_ASSERT(RTPSAutoPubClassMap_typeName(RTPSAutoPubMsgKind::Unknown) == nullptr,
+                    "typeName: Unknown returns nullptr");
+
+        // ---- hasClas helper ----------------------------------------
+        {
+            const char* c[] = {"ACC", "GYRO"};
+            TEST_ASSERT(RTPSAutoPubClassMap_hasClas(c, 2, "ACC"), "hasClas: ACC hit");
+            TEST_ASSERT(RTPSAutoPubClassMap_hasClas(c, 2, "GYRO"), "hasClas: GYRO hit");
+            TEST_ASSERT(!RTPSAutoPubClassMap_hasClas(c, 2, "TEMP"), "hasClas: miss");
+            TEST_ASSERT(!RTPSAutoPubClassMap_hasClas(nullptr, 0, "ACC"),
+                        "hasClas: null array safe");
+            TEST_ASSERT(!RTPSAutoPubClassMap_hasClas(c, 2, nullptr),
+                        "hasClas: null code safe");
+            TEST_ASSERT(!RTPSAutoPubClassMap_hasClas(c, 2, "acc"),
+                        "hasClas: case-sensitive");
+        }
+
+        // ---- composite: ACC+GYRO wins over single ACC (LSM6DS) -------
+        {
+            const char* c[] = {"ACC", "GYRO"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 2, "LSM6DS");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Imu,
+                        "LSM6DS: primary = Imu");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "imu") == 0,
+                        "LSM6DS: slug = imu");
+            TEST_ASSERT(!m.hasSecondary(), "LSM6DS: single-writer Imu");
+            // Reverse order still triggers composite rule.
+            const char* cRev[] = {"GYRO", "ACC"};
+            const auto mRev = RTPSAutoPubClassMap_lookup(cRev, 2, "LSM6DS");
+            TEST_ASSERT(mRev.primaryKind == RTPSAutoPubMsgKind::Imu,
+                        "LSM6DS: composite order-independent");
+        }
+
+        // ---- composite: TEMP+RH → Temperature + RelativeHumidity -----
+        {
+            const char* c[] = {"TEMP", "RH"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 2, "AHT20");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Temperature,
+                        "AHT20: primary = Temperature");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "temperature") == 0,
+                        "AHT20: primary slug = temperature");
+            TEST_ASSERT(m.secondaryKind == RTPSAutoPubMsgKind::RelativeHumidity,
+                        "AHT20: secondary = RelativeHumidity");
+            TEST_ASSERT(std::strcmp(m.secondaryTopicSlug, "humidity") == 0,
+                        "AHT20: secondary slug = humidity");
+            TEST_ASSERT(m.hasSecondary(), "AHT20: two-writer composite");
+        }
+
+        // ---- composite: PRES+TEMP → FluidPressure + Temperature ------
+        {
+            const char* c[] = {"PRES", "TEMP"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 2, "LPS25");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::FluidPressure,
+                        "LPS25: primary = FluidPressure");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "pressure") == 0,
+                        "LPS25: primary slug = pressure");
+            TEST_ASSERT(m.secondaryKind == RTPSAutoPubMsgKind::Temperature,
+                        "LPS25: secondary = Temperature");
+            TEST_ASSERT(std::strcmp(m.secondaryTopicSlug, "temperature") == 0,
+                        "LPS25: secondary slug = temperature");
+        }
+
+        // ---- single-class device-type sweep (DeviceTypeRecords.json) --
+        { const char* c[] = {"ACC"};       checkPrimary("ADXL313",   c, 1, RTPSAutoPubMsgKind::Accel, "accel"); }
+        { const char* c[] = {"ACC"};       checkPrimary("MXC400xXC", c, 1, RTPSAutoPubMsgKind::Accel, "accel"); }
+        { const char* c[] = {"ANG"};       checkPrimary("AS5600",    c, 1, RTPSAutoPubMsgKind::Float32, "angle"); }
+        { const char* c[] = {"ANG"};       checkPrimary("MT6701",    c, 1, RTPSAutoPubMsgKind::Float32, "angle"); }
+        { const char* c[] = {"ROT"};       checkPrimary("M5Encoder", c, 1, RTPSAutoPubMsgKind::Int32,   "encoder"); }
+        { const char* c[] = {"DIST"};      checkPrimary("VL6180",    c, 1, RTPSAutoPubMsgKind::Range,   "range"); }
+        { const char* c[] = {"DIST"};      checkPrimary("VL53L4CD",  c, 1, RTPSAutoPubMsgKind::Range,   "range"); }
+        { const char* c[] = {"LGHT"};      checkPrimary("VEML7700",  c, 1, RTPSAutoPubMsgKind::Illuminance, "illuminance"); }
+        { const char* c[] = {"TCH"};       checkPrimary("CAP1203",   c, 1, RTPSAutoPubMsgKind::ByteMultiArray, "touch"); }
+        { const char* c[] = {"BTN"};       checkPrimary("QwiicButton", c, 1, RTPSAutoPubMsgKind::Bool,  "button"); }
+        { const char* c[] = {"FRCE"};      checkPrimary("HX711",     c, 1, RTPSAutoPubMsgKind::Wrench,  "force"); }
+        { const char* c[] = {"HRM"};       checkPrimary("MAX30101",  c, 1, RTPSAutoPubMsgKind::Float32MultiArray, "ppg"); }
+        { const char* c[] = {"SOIL"};      checkPrimary("AdafruitSoilSensor", c, 1, RTPSAutoPubMsgKind::Float32, "soil_moisture"); }
+        { const char* c[] = {"GAME"};      checkPrimary("AdafruitGamepad",    c, 1, RTPSAutoPubMsgKind::Joy,     "joy"); }
+
+        // ---- VCNL4040: [PROX, LGHT] — PROX wins single-class ordering? ----
+        // Design §5.2 splits VCNL4040 into two topics (illuminance + proximity)
+        // via Slice 4.10 composite.  For now the single-class fallthrough
+        // picks LGHT (illuminance) since LGHT is checked before PROX.
+        {
+            const char* c[] = {"PROX", "LGHT"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 2, "VCNL4040");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Illuminance,
+                        "VCNL4040: primary = Illuminance (LGHT ordering)");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "illuminance") == 0,
+                        "VCNL4040: slug = illuminance");
+        }
+
+        // ---- Device-type overrides ---------------------------------------
+        // MCP9808 is mis-tagged LGHT in the JSON; override forces TEMP.
+        {
+            const char* c[] = {"LGHT"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 1, "MCP9808");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Temperature,
+                        "MCP9808: device-name override forces Temperature");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "temperature") == 0,
+                        "MCP9808: slug = temperature");
+            // Without the override, LGHT would map to Illuminance — confirm.
+            const auto mBase = RTPSAutoPubClassMap_lookup(c, 1, nullptr);
+            TEST_ASSERT(mBase.primaryKind == RTPSAutoPubMsgKind::Illuminance,
+                        "MCP9808: without override would be Illuminance");
+        }
+        // RoboticalLightSensor (4-attr array) → Float32MultiArray "light".
+        {
+            const char* c[] = {"LGHT"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 1, "RoboticalLightSensor");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Float32MultiArray,
+                        "RoboticalLightSensor: primary = Float32MultiArray");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "light") == 0,
+                        "RoboticalLightSensor: slug = light");
+        }
+
+        // ---- Actuator exclusions ----------------------------------------
+        {
+            const char* cS[] = {"SRVO"};
+            const auto m = RTPSAutoPubClassMap_lookup(cS, 1, "RoboticalServo");
+            TEST_ASSERT(m.excluded, "RoboticalServo: excluded");
+            TEST_ASSERT(!m.hasPrimary(), "RoboticalServo: no primary writer");
+        }
+        {
+            const char* cP[] = {"PUMP"};
+            const auto m = RTPSAutoPubClassMap_lookup(cP, 1, "RoboticalWaterPump");
+            TEST_ASSERT(m.excluded, "RoboticalWaterPump: excluded");
+        }
+        {
+            const char* cPx[] = {"PIX"};
+            const auto m = RTPSAutoPubClassMap_lookup(cPx, 1, "QwiicLEDStick");
+            TEST_ASSERT(m.excluded, "QwiicLEDStick: excluded");
+        }
+
+        // ---- Fallback / BTHome (pending Slice 4.10) ---------------------
+        {
+            const char* c[] = {"BTHM"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 1, "BLEBTHome");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::String,
+                        "BLEBTHome: falls through to String (pending 4.10)");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "raw") == 0,
+                        "BLEBTHome: slug = raw");
+            TEST_ASSERT(!m.excluded, "BLEBTHome: still published as String");
+        }
+        {
+            const char* c[] = {"ZZZ_UNKNOWN"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 1, "SomeNewDevice");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::String,
+                        "unknown clas: fallback String");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "raw") == 0,
+                        "unknown clas: slug = raw");
+        }
+        {
+            // Empty / null clas array still yields a usable fallback.
+            const auto mEmpty = RTPSAutoPubClassMap_lookup(nullptr, 0, nullptr);
+            TEST_ASSERT(mEmpty.primaryKind == RTPSAutoPubMsgKind::String,
+                        "empty clas: fallback String");
+            const auto mNullArr = RTPSAutoPubClassMap_lookup(nullptr, 5, "X");
+            TEST_ASSERT(mNullArr.primaryKind == RTPSAutoPubMsgKind::String,
+                        "null clasArray: fallback String");
+        }
+
+        // ---- Every returned non-excluded kind has a valid type name -----
+        const RTPSAutoPubMsgKind allKinds[] = {
+            RTPSAutoPubMsgKind::Imu, RTPSAutoPubMsgKind::Accel,
+            RTPSAutoPubMsgKind::Temperature, RTPSAutoPubMsgKind::RelativeHumidity,
+            RTPSAutoPubMsgKind::FluidPressure, RTPSAutoPubMsgKind::Illuminance,
+            RTPSAutoPubMsgKind::Range, RTPSAutoPubMsgKind::Float32,
+            RTPSAutoPubMsgKind::Int32, RTPSAutoPubMsgKind::Bool,
+            RTPSAutoPubMsgKind::ByteMultiArray, RTPSAutoPubMsgKind::Wrench,
+            RTPSAutoPubMsgKind::Float32MultiArray, RTPSAutoPubMsgKind::Joy,
+            RTPSAutoPubMsgKind::String,
+        };
+        for (auto k : allKinds)
+        {
+            const char* tn = RTPSAutoPubClassMap_typeName(k);
+            TEST_ASSERT(tn != nullptr && tn[0] != '\0',
+                        "every message kind has a non-empty type name");
+        }
+    }
+
+    //=================================================================
+    // Phase 4 / Slice 4.5 — RTPSAutoPubCDRSerializer
+    //=================================================================
+    {
+        printf("Test: RTPSAutoPubCDRSerializer (Phase 4 Slice 4.5)\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+
+        // Generated-struct mirrors (layout matches
+        // RaftI2C/linux_unit_tests/DevicePollRecords_generated.h).
+        struct pollAHT20    { uint32_t timeMs; uint8_t status; float humidity; float temperature; };
+        struct pollMCP9808  { uint32_t timeMs; float temperature; };
+        struct pollLPS25   { uint32_t timeMs; uint8_t status; float pressure; float temperature; };
+        struct pollVL6180  { uint32_t timeMs; bool valid; float dist; };
+        struct pollVCNL    { uint32_t timeMs; uint16_t prox; float als; float white; };
+        struct pollADXL    { uint32_t timeMs; float x; float y; float z; };
+        struct pollBtn     { uint32_t timeMs; bool press; };
+        struct pollAS5600  { uint32_t timeMs; float angle; };
+        struct pollM5Enc   { uint32_t timeMs; int32_t rotation; bool press; };
+        struct pollLSM     { uint32_t timeMs; float gx, gy, gz, ax, ay, az; };
+        struct pollHX711   { uint32_t timeMs; bool valid; float force; };
+        struct pollCAP1203 { uint32_t timeMs; bool A; bool B; bool C; uint16_t status; };
+        struct pollGamepad { uint32_t timeMs; float x; float y; int32_t SELECT, B, Y, A, X, START; };
+        struct pollMax30101{ uint32_t timeMs; uint32_t Red; uint32_t IR; };
+
+        // Helper: XCDR1 little-endian decoder for test assertions.
+        auto le32 = [](const uint8_t* p) -> uint32_t {
+            return (uint32_t)p[0] | ((uint32_t)p[1]<<8) | ((uint32_t)p[2]<<16) | ((uint32_t)p[3]<<24);
+        };
+        auto lef32 = [&](const uint8_t* p) -> float {
+            uint32_t bits = le32(p); float f; std::memcpy(&f, &bits, 4); return f;
+        };
+        auto lef64 = [](const uint8_t* p) -> double {
+            uint64_t bits = 0;
+            for (int i = 0; i < 8; i++) bits |= (uint64_t)p[i] << (i*8);
+            double d; std::memcpy(&d, &bits, 8); return d;
+        };
+        auto nearly = [](double a, double b, double eps) { return std::fabs(a-b) <= eps; };
+
+        uint8_t buf[512];
+        uint32_t written = 0;
+
+        // ---- Encapsulation header is always CDR_LE + 0x0000 options ----
+        {
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serializeString("", buf, sizeof(buf), written),
+                        "serializeString: empty ok");
+            TEST_ASSERT(buf[0] == 0x00 && buf[1] == 0x01 && buf[2] == 0x00 && buf[3] == 0x00,
+                        "serializeString: encap header = 00 01 00 00 (CDR_LE)");
+            TEST_ASSERT(written >= 4 + 4 + 1, "serializeString: encap+len+null present");
+        }
+
+        // ---- Field reader helpers ----------------------------------------
+        {
+            pollAHT20 s{12345, 0, 42.5f, 23.1f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",      offsetof(pollAHT20, timeMs),      RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"status",      offsetof(pollAHT20, status),      RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f},
+                {"humidity",    offsetof(pollAHT20, humidity),    RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"temperature", offsetof(pollAHT20, temperature), RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs;
+            ctx.fieldCount  = 4;
+            ctx.pStruct     = reinterpret_cast<const uint8_t*>(&s);
+            ctx.structSize  = sizeof(s);
+            double v = 0.0;
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "temperature", v),
+                        "readFieldDouble: temp found");
+            TEST_ASSERT(nearly(v, 23.1, 1e-4), "readFieldDouble: temp value");
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "humidity", v),
+                        "readFieldDouble: humidity found");
+            TEST_ASSERT(nearly(v, 42.5, 1e-4), "readFieldDouble: humidity value");
+            TEST_ASSERT(!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "nope", v),
+                        "readFieldDouble: missing field returns false");
+            // Divisor / addend applied
+            descs[2].divisor = 10.0f; descs[2].addend = 1.0f;
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "humidity", v, true),
+                        "readFieldDouble: scaled");
+            TEST_ASSERT(nearly(v, 42.5/10.0 + 1.0, 1e-4),
+                        "readFieldDouble: divisor+addend applied");
+        }
+
+        // ---- std_msgs/Bool (QwiicButton) ---------------------------------
+        {
+            pollBtn s{0, true};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollBtn, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"press",  offsetof(pollBtn, press),  RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 2;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Bool, ctx, buf, sizeof(buf), written),
+                        "Bool: serialize ok");
+            TEST_ASSERT(written == 4 + 1, "Bool: 4-byte encap + 1-byte bool = 5");
+            TEST_ASSERT(buf[4] == 1, "Bool: press=true encoded as 1");
+            s.press = false;
+            RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Bool, ctx, buf, sizeof(buf), written);
+            TEST_ASSERT(buf[4] == 0, "Bool: press=false encoded as 0");
+        }
+
+        // ---- std_msgs/Int32 (M5Encoder) ----------------------------------
+        {
+            pollM5Enc s{0, -1234, false};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",   offsetof(pollM5Enc, timeMs),   RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"rotation", offsetof(pollM5Enc, rotation), RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+                {"press",    offsetof(pollM5Enc, press),    RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 3;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Int32, ctx, buf, sizeof(buf), written),
+                        "Int32: serialize ok");
+            TEST_ASSERT(written == 4 + 4, "Int32: encap + int32 = 8");
+            int32_t got = (int32_t)le32(buf + 4);
+            TEST_ASSERT(got == -1234, "Int32: rotation value round-trips");
+        }
+
+        // ---- std_msgs/Float32 (AS5600 ANG) -------------------------------
+        {
+            pollAS5600 s{0, 123.456f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollAS5600, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"angle",  offsetof(pollAS5600, angle),  RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 2;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Float32, ctx, buf, sizeof(buf), written),
+                        "Float32: serialize ok");
+            TEST_ASSERT(written == 4 + 4, "Float32: encap + float32 = 8");
+            TEST_ASSERT(nearly(lef32(buf + 4), 123.456, 1e-3), "Float32: angle value");
+        }
+
+        // ---- sensor_msgs/Temperature (MCP9808) ---------------------------
+        {
+            pollMCP9808 s{7000, 24.75f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",      offsetof(pollMCP9808, timeMs),      RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"temperature", offsetof(pollMCP9808, temperature), RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 2;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 7000;
+            ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Temperature, ctx, buf, sizeof(buf), written),
+                        "Temperature: serialize ok");
+            // Layout: encap(4) + sec(int32) + nanosec(uint32) + frame_id(string) + temp(double) + variance(double)
+            //                  pos 4         pos 8              pos 12
+            //  sec = 7, nanosec = 0, frame "raft" len=5 w/ null → strlen(5)+pad to 8
+            //  After frame_id @ pos 12+4+5=21. Align 8 → 24. temp @24..32. var @32..40.
+            int32_t sec = (int32_t)le32(buf + 4);
+            uint32_t ns = le32(buf + 8);
+            TEST_ASSERT(sec == 7, "Temperature: Header sec = 7");
+            TEST_ASSERT(ns == 0, "Temperature: Header nanosec = 0");
+            uint32_t frameLen = le32(buf + 12);
+            TEST_ASSERT(frameLen == 5, "Temperature: frame_id length = 5 (raft + null)");
+            TEST_ASSERT(std::strncmp((char*)buf + 16, "raft", 4) == 0,
+                        "Temperature: frame_id content = raft");
+            // temp aligned to 8 from encap start → position 24.
+            TEST_ASSERT(nearly(lef64(buf + 24), 24.75, 1e-6),
+                        "Temperature: temperature = 24.75");
+            TEST_ASSERT(nearly(lef64(buf + 32), 0.0, 1e-12),
+                        "Temperature: variance = 0");
+            TEST_ASSERT(written == 40, "Temperature: payload size = 40");
+        }
+
+        // ---- sensor_msgs/RelativeHumidity: % → 0..1 -----------------------
+        {
+            pollAHT20 s{0, 0, 55.0f, 23.0f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",      offsetof(pollAHT20, timeMs),      RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"status",      offsetof(pollAHT20, status),      RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f},
+                {"humidity",    offsetof(pollAHT20, humidity),    RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"temperature", offsetof(pollAHT20, temperature), RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 1000; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::RelativeHumidity, ctx, buf, sizeof(buf), written),
+                        "RelativeHumidity: serialize ok");
+            // Same layout offsets as Temperature.
+            TEST_ASSERT(nearly(lef64(buf + 24), 0.55, 1e-6),
+                        "RelativeHumidity: 55% → 0.55");
+        }
+
+        // ---- sensor_msgs/FluidPressure: hPa → Pa --------------------------
+        {
+            pollLPS25 s{0, 0, 1013.25f, 22.0f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",      offsetof(pollLPS25, timeMs),      RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"status",      offsetof(pollLPS25, status),      RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f},
+                {"pressure",    offsetof(pollLPS25, pressure),    RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"temperature", offsetof(pollLPS25, temperature), RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 0; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::FluidPressure, ctx, buf, sizeof(buf), written),
+                        "FluidPressure: serialize ok");
+            TEST_ASSERT(nearly(lef64(buf + 24), 101325.0, 1.0),
+                        "FluidPressure: 1013.25 hPa → 101325 Pa");
+        }
+
+        // ---- sensor_msgs/Illuminance (VCNL4040 als) ----------------------
+        {
+            pollVCNL s{0, 0, 350.5f, 100.0f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollVCNL, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"prox",   offsetof(pollVCNL, prox),   RTPSAutoPubAttrType::Uint16, "", 1.0f, 0.0f},
+                {"als",    offsetof(pollVCNL, als),    RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"white",  offsetof(pollVCNL, white),  RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 0; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Illuminance, ctx, buf, sizeof(buf), written),
+                        "Illuminance: serialize ok");
+            TEST_ASSERT(nearly(lef64(buf + 24), 350.5, 1e-3),
+                        "Illuminance: als = 350.5 lux");
+        }
+
+        // ---- sensor_msgs/Range (VL6180 dist in mm → m) --------------------
+        {
+            pollVL6180 s{0, true, 250.0f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollVL6180, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"valid",  offsetof(pollVL6180, valid),  RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+                {"dist",   offsetof(pollVL6180, dist),   RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 3;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 0; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Range, ctx, buf, sizeof(buf), written),
+                        "Range: serialize ok");
+            // Layout: encap(4) + hdr(4 sec + 4 ns + strlen(5)+pad to 4 → 4+4+5=17)
+            //         radiation_type(uint8) @ pos 4+8+4+5 = 21
+            //         float32 fov/min/max/range aligned 4 → 24, 28, 32, 36.
+            TEST_ASSERT(buf[21] == 1, "Range: radiation_type = INFRARED (1)");
+            TEST_ASSERT(nearly(lef32(buf + 24), 0.0, 1e-6), "Range: field_of_view = 0");
+            TEST_ASSERT(nearly(lef32(buf + 28), 0.0, 1e-6), "Range: min_range = 0");
+            TEST_ASSERT(nearly(lef32(buf + 32), 2.0, 1e-6), "Range: max_range = 2 m (DIST default)");
+            TEST_ASSERT(nearly(lef32(buf + 36), 0.25, 1e-4), "Range: dist 250mm → 0.25 m");
+        }
+
+        // ---- sensor_msgs/Imu standalone ACC (ADXL313) --------------------
+        {
+            pollADXL s{0, 1.0f, 0.0f, 0.0f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollADXL, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"x",      offsetof(pollADXL, x),      RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"y",      offsetof(pollADXL, y),      RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"z",      offsetof(pollADXL, z),      RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 0; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Accel, ctx, buf, sizeof(buf), written),
+                        "Accel: serialize ok");
+            // Imu layout: encap + header + orientation(4×f64) + orient_cov(9×f64)
+            //          + angular_velocity(3×f64) + ang_cov(9×f64)
+            //          + linear_acceleration(3×f64) + lin_cov(9×f64).
+            // header size: sec(4) + ns(4) + string(len4 + "raft\0" = 5) + pad
+            //              = 4 + 4 + 4 + 5 = 17 → align 8 → 24.  Pos at header end = 4(encap) + 24 = 28? 
+            // Actually encap=4, sec@4, ns@8, strlen@12, bytes@16..20, pad@20..24, orient.x@24 (aligned 8).
+            // orientation: x=0 y=0 z=0 w=1.
+            TEST_ASSERT(nearly(lef64(buf + 24),  0.0, 1e-12), "Accel: orient.x = 0");
+            TEST_ASSERT(nearly(lef64(buf + 24 + 8*3), 1.0, 1e-12), "Accel: orient.w = 1");
+            // orient_covariance[0] = -1 (unknown) at offset 24 + 32 = 56.
+            TEST_ASSERT(nearly(lef64(buf + 56), -1.0, 1e-12), "Accel: orient_cov[0] = -1");
+            // After orient_cov (9×8=72 bytes) → 56+72 = 128. angular_velocity.x at 128.
+            TEST_ASSERT(nearly(lef64(buf + 128), 0.0, 1e-12), "Accel: gx = 0");
+            // ang_cov starts at 128 + 24 = 152. ang_cov[0] = -1 (unknown for accel-only).
+            TEST_ASSERT(nearly(lef64(buf + 152), -1.0, 1e-12),
+                        "Accel: angular_velocity_cov[0] = -1 (unknown)");
+            // lin_accel.x at 152 + 72 = 224. Value: 1.0 g × 9.80665.
+            TEST_ASSERT(nearly(lef64(buf + 224), 9.80665, 1e-6),
+                        "Accel: ax = 1g → 9.80665 m/s²");
+            // lin_cov at 224 + 24 = 248. lin_cov[0] = 0 (valid).
+            TEST_ASSERT(nearly(lef64(buf + 248), 0.0, 1e-12),
+                        "Accel: linear_accel_cov[0] = 0 (valid)");
+            TEST_ASSERT(written == 248 + 72, "Accel: payload size");
+        }
+
+        // ---- sensor_msgs/Imu composite (LSM6DS) --------------------------
+        {
+            pollLSM s{0, 10.0f, -20.0f, 30.0f,     // gx,gy,gz (°/s)
+                          0.5f,  0.0f,  0.0f};    // ax,ay,az (g)
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollLSM, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"gx",     offsetof(pollLSM, gx),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"gy",     offsetof(pollLSM, gy),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"gz",     offsetof(pollLSM, gz),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"ax",     offsetof(pollLSM, ax),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"ay",     offsetof(pollLSM, ay),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"az",     offsetof(pollLSM, az),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 7;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 0; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Imu, ctx, buf, sizeof(buf), written),
+                        "Imu: serialize ok");
+            // ang_cov[0] = 0 (valid) for composite Imu.
+            TEST_ASSERT(nearly(lef64(buf + 152), 0.0, 1e-12),
+                        "Imu: angular_velocity_cov[0] = 0 (valid for composite)");
+            // gx: 10 °/s → 10 × π/180 ≈ 0.1745329
+            TEST_ASSERT(nearly(lef64(buf + 128), 10.0 * 0.017453292519943295, 1e-9),
+                        "Imu: gx = 10°/s → 0.1745 rad/s");
+            // ax: 0.5 g → 0.5 × 9.80665
+            TEST_ASSERT(nearly(lef64(buf + 224), 0.5 * 9.80665, 1e-6),
+                        "Imu: ax = 0.5g → 4.903 m/s²");
+        }
+
+        // ---- geometry_msgs/Wrench (HX711 force on z axis) ----------------
+        {
+            pollHX711 s{0, true, 5.25f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollHX711, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"valid",  offsetof(pollHX711, valid),  RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+                {"force",  offsetof(pollHX711, force),  RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 3;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Wrench, ctx, buf, sizeof(buf), written),
+                        "Wrench: serialize ok");
+            // encap(4) + 6×float64 (aligned 8 → starts pad to 8) = 4+4 pad + 48 = 56.
+            TEST_ASSERT(written == 56, "Wrench: 4 encap + 4 pad + 48 = 56 bytes");
+            // force.z is the 3rd double → offset 8 + 16 = 24.
+            TEST_ASSERT(nearly(lef64(buf + 24), 5.25, 1e-6), "Wrench: force.z = 5.25 N");
+            TEST_ASSERT(nearly(lef64(buf + 8), 0.0, 1e-12), "Wrench: force.x = 0");
+            TEST_ASSERT(nearly(lef64(buf + 16), 0.0, 1e-12), "Wrench: force.y = 0");
+        }
+
+        // ---- std_msgs/ByteMultiArray (CAP1203 touch) ---------------------
+        {
+            pollCAP1203 s{0, true, false, true, 0};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollCAP1203, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"A",      offsetof(pollCAP1203, A),      RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+                {"B",      offsetof(pollCAP1203, B),      RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+                {"C",      offsetof(pollCAP1203, C),      RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+                {"status", offsetof(pollCAP1203, status), RTPSAutoPubAttrType::Uint16, "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 5;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::ByteMultiArray, ctx, buf, sizeof(buf), written),
+                        "ByteMultiArray: serialize ok");
+            // Layout: encap(4) + layout.dim_len(uint32)=0 + layout.data_offset(uint32)=0
+            //                  + data_len(uint32)=3 + data bytes.
+            TEST_ASSERT(le32(buf + 4) == 0, "ByteMultiArray: dim[] length = 0");
+            TEST_ASSERT(le32(buf + 8) == 0, "ByteMultiArray: data_offset = 0");
+            TEST_ASSERT(le32(buf + 12) == 3, "ByteMultiArray: data length = 3 (A/B/C only)");
+            TEST_ASSERT(buf[16] == 1 && buf[17] == 0 && buf[18] == 1,
+                        "ByteMultiArray: A/B/C = 1/0/1");
+        }
+
+        // ---- std_msgs/Float32MultiArray (MAX30101 PPG) --------------------
+        {
+            pollMax30101 s{0, 1234, 5678};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollMax30101, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"Red",    offsetof(pollMax30101, Red),    RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"IR",     offsetof(pollMax30101, IR),     RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 3;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Float32MultiArray, ctx, buf, sizeof(buf), written),
+                        "Float32MultiArray: serialize ok");
+            TEST_ASSERT(le32(buf + 4) == 0, "Float32MultiArray: dim[] length = 0");
+            TEST_ASSERT(le32(buf + 8) == 0, "Float32MultiArray: data_offset = 0");
+            TEST_ASSERT(le32(buf + 12) == 2, "Float32MultiArray: data length = 2 (Red, IR)");
+            TEST_ASSERT(nearly(lef32(buf + 16), 1234.0f, 1.0), "Float32MultiArray: Red value");
+            TEST_ASSERT(nearly(lef32(buf + 20), 5678.0f, 1.0), "Float32MultiArray: IR value");
+        }
+
+        // ---- sensor_msgs/Joy (AdafruitGamepad) ---------------------------
+        {
+            pollGamepad s{0, 0.5f, -0.5f, 0, 1, 0, 1, 0, 0};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollGamepad, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"x",      offsetof(pollGamepad, x),      RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"y",      offsetof(pollGamepad, y),      RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"SELECT", offsetof(pollGamepad, SELECT), RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+                {"B",      offsetof(pollGamepad, B),      RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+                {"Y",      offsetof(pollGamepad, Y),      RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+                {"A",      offsetof(pollGamepad, A),      RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+                {"X",      offsetof(pollGamepad, X),      RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+                {"START",  offsetof(pollGamepad, START),  RTPSAutoPubAttrType::Int32,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 9;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 0; ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Joy, ctx, buf, sizeof(buf), written),
+                        "Joy: serialize ok");
+            // Header ends at pos 21 ("raft\0" after 4-byte string-length).
+            // axes_seq_len (uint32, align 4) → pad to 24.
+            TEST_ASSERT(le32(buf + 24) == 2, "Joy: axes length = 2");
+            TEST_ASSERT(nearly(lef32(buf + 28),  0.5, 1e-4), "Joy: axes[0] = x = 0.5");
+            TEST_ASSERT(nearly(lef32(buf + 32), -0.5, 1e-4), "Joy: axes[1] = y = -0.5");
+            // buttons_seq_len at 36 = 6.
+            TEST_ASSERT(le32(buf + 36) == 6, "Joy: buttons length = 6");
+        }
+
+        // ---- std_msgs/String fallback (Slice 4.9) ------------------------
+        {
+            // Use an AHT20-like struct with three typed fields — exercises
+            // float, bool, and uint16 paths of the JSON body writer.
+            struct pollFallback {
+                uint32_t timeMs;
+                float    temp;      // scaled via divisor
+                uint16_t count;     // int path
+                uint8_t  press;     // bool path (type Bool)
+            } __attribute__((packed));
+            pollFallback s{100, 21.5f, 7, 1};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollFallback, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"temp",   offsetof(pollFallback, temp),   RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"count",  offsetof(pollFallback, count),  RTPSAutoPubAttrType::Uint16, "", 1.0f, 0.0f},
+                {"press",  offsetof(pollFallback, press),  RTPSAutoPubAttrType::Bool,   "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.timestampMs = 42;
+            ctx.frameId = "raft";
+
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::String, ctx, buf, sizeof(buf), written),
+                        "String: serialize ok");
+            uint32_t slen = le32(buf + 4);
+            TEST_ASSERT(slen > 0 && slen < 200, "String: length bounded");
+            TEST_ASSERT(buf[4 + 4 + slen - 1] == 0, "String: null-terminated");
+            const char* body = reinterpret_cast<const char*>(buf + 8);
+            TEST_ASSERT(body[0] == '{', "String: JSON starts with {");
+            TEST_ASSERT(body[slen - 2] == '}', "String: JSON ends with }");
+            TEST_ASSERT(std::strstr(body, "\"ts\":42") != nullptr,
+                        "String: includes ts=42");
+            TEST_ASSERT(std::strstr(body, "\"temp\":21.5") != nullptr,
+                        "String: includes temp=21.5");
+            TEST_ASSERT(std::strstr(body, "\"count\":7") != nullptr,
+                        "String: includes count=7");
+            TEST_ASSERT(std::strstr(body, "\"press\":true") != nullptr,
+                        "String: press renders as true");
+            TEST_ASSERT(std::strstr(body, "timeMs") == nullptr,
+                        "String: timeMs field is skipped (ts replaces it)");
+        }
+
+        // ---- std_msgs/String fallback: empty field list ------------------
+        {
+            RTPSAutoPubCDRContext ctx{};
+            ctx.timestampMs = 1234;
+            ctx.fieldCount = 0;
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::String, ctx, buf, sizeof(buf), written),
+                        "String: serialize empty ok");
+            const char* body = reinterpret_cast<const char*>(buf + 8);
+            TEST_ASSERT(std::strstr(body, "\"ts\":1234}") != nullptr,
+                        "String: empty fields produces {\"ts\":1234}");
+        }
+
+        // ---- std_msgs/String helper: explicit body -----------------------
+        {
+            const char* payload = "{\"hello\":\"world\"}";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serializeString(
+                            payload, buf, sizeof(buf), written),
+                        "serializeString: ok");
+            uint32_t slen = le32(buf + 4);
+            TEST_ASSERT(slen == std::strlen(payload) + 1,
+                        "serializeString: length matches");
+            TEST_ASSERT(std::strcmp(reinterpret_cast<const char*>(buf + 8), payload) == 0,
+                        "serializeString: body matches");
+        }
+
+        // ---- Unknown kind rejected ---------------------------------------
+        {
+            RTPSAutoPubCDRContext ctx{};
+            TEST_ASSERT(!RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Unknown, ctx, buf, sizeof(buf), written),
+                        "Unknown kind returns false");
+        }
+
+        // ---- Buffer-too-small is rejected --------------------------------
+        {
+            pollMCP9808 s{0, 24.0f};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",      offsetof(pollMCP9808, timeMs),      RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"temperature", offsetof(pollMCP9808, temperature), RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 2;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            uint8_t tiny[8];
+            TEST_ASSERT(!RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Temperature, ctx, tiny, sizeof(tiny), written),
+                        "Temperature: rejects 8-byte buffer");
+        }
+    }
+
+    //=================================================================
+    // Phase 4 / Slice 4.11 — RTPSAutoPubQoSProfile
+    //=================================================================
+    {
+        printf("Test: RTPSAutoPubQoSProfile (Phase 4 Slice 4.11)\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+
+        // ---- Built-in profile table ---------------------------------
+        {
+            auto fast = RTPSAutoPubQoSProfile_get(RTPSAutoPubQoSProfileId::FastSensor);
+            TEST_ASSERT(fast.id == RTPSAutoPubQoSProfileId::FastSensor,
+                        "fast_sensor id");
+            TEST_ASSERT(fast.reliability == RTPS_AUTOPUB_RELIABILITY_BEST_EFFORT,
+                        "fast_sensor reliability=BEST_EFFORT");
+            TEST_ASSERT(fast.durability == RTPS_AUTOPUB_DURABILITY_VOLATILE,
+                        "fast_sensor durability=VOLATILE");
+            TEST_ASSERT(fast.historyDepth == 10, "fast_sensor depth=10");
+
+            auto slow = RTPSAutoPubQoSProfile_get(RTPSAutoPubQoSProfileId::SlowSensor);
+            TEST_ASSERT(slow.reliability == RTPS_AUTOPUB_RELIABILITY_RELIABLE,
+                        "slow_sensor reliability=RELIABLE");
+            TEST_ASSERT(slow.durability == RTPS_AUTOPUB_DURABILITY_VOLATILE,
+                        "slow_sensor durability=VOLATILE");
+            TEST_ASSERT(slow.historyDepth == 5, "slow_sensor depth=5");
+
+            auto ev = RTPSAutoPubQoSProfile_get(RTPSAutoPubQoSProfileId::Event);
+            TEST_ASSERT(ev.durability == RTPS_AUTOPUB_DURABILITY_TRANSIENT_LOCAL,
+                        "event durability=TRANSIENT_LOCAL");
+            TEST_ASSERT(ev.historyDepth == 20, "event depth=20");
+
+            auto fb = RTPSAutoPubQoSProfile_get(RTPSAutoPubQoSProfileId::FallbackString);
+            TEST_ASSERT(fb.reliability == RTPS_AUTOPUB_RELIABILITY_RELIABLE,
+                        "fallback_string reliability=RELIABLE");
+            TEST_ASSERT(fb.historyDepth == 10, "fallback_string depth=10");
+        }
+
+        // ---- Name parsing round-trip --------------------------------
+        {
+            RTPSAutoPubQoSProfileId id = RTPSAutoPubQoSProfileId::FallbackString;
+            TEST_ASSERT(RTPSAutoPubQoSProfile_parseName("fast_sensor", id) &&
+                        id == RTPSAutoPubQoSProfileId::FastSensor,
+                        "parseName fast_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_parseName("slow_sensor", id) &&
+                        id == RTPSAutoPubQoSProfileId::SlowSensor,
+                        "parseName slow_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_parseName("event", id) &&
+                        id == RTPSAutoPubQoSProfileId::Event,
+                        "parseName event");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_parseName("fallback_string", id) &&
+                        id == RTPSAutoPubQoSProfileId::FallbackString,
+                        "parseName fallback_string");
+            TEST_ASSERT(!RTPSAutoPubQoSProfile_parseName("bogus", id),
+                        "parseName rejects unknown");
+            TEST_ASSERT(!RTPSAutoPubQoSProfile_parseName(nullptr, id),
+                        "parseName rejects null");
+            TEST_ASSERT(!RTPSAutoPubQoSProfile_parseName("", id),
+                        "parseName rejects empty");
+
+            TEST_ASSERT(std::strcmp(
+                RTPSAutoPubQoSProfile_name(RTPSAutoPubQoSProfileId::FastSensor),
+                "fast_sensor") == 0, "name(FastSensor)");
+            TEST_ASSERT(std::strcmp(
+                RTPSAutoPubQoSProfile_name(RTPSAutoPubQoSProfileId::Event),
+                "event") == 0, "name(Event)");
+        }
+
+        // ---- Per-class default table --------------------------------
+        {
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("ACC") ==
+                        RTPSAutoPubQoSProfileId::FastSensor, "ACC -> fast_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("GYRO") ==
+                        RTPSAutoPubQoSProfileId::FastSensor, "GYRO -> fast_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("LGHT") ==
+                        RTPSAutoPubQoSProfileId::FastSensor, "LGHT -> fast_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("FRCE") ==
+                        RTPSAutoPubQoSProfileId::FastSensor, "FRCE -> fast_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("TEMP") ==
+                        RTPSAutoPubQoSProfileId::SlowSensor, "TEMP -> slow_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("RH") ==
+                        RTPSAutoPubQoSProfileId::SlowSensor, "RH -> slow_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("PRES") ==
+                        RTPSAutoPubQoSProfileId::SlowSensor, "PRES -> slow_sensor");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("BTN") ==
+                        RTPSAutoPubQoSProfileId::Event, "BTN -> event");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("ROT") ==
+                        RTPSAutoPubQoSProfileId::Event, "ROT -> event");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("GAME") ==
+                        RTPSAutoPubQoSProfileId::Event, "GAME -> event");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("ZZZZ") ==
+                        RTPSAutoPubQoSProfileId::FallbackString,
+                        "unknown class -> fallback_string");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass(nullptr) ==
+                        RTPSAutoPubQoSProfileId::FallbackString,
+                        "null class -> fallback_string");
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClass("") ==
+                        RTPSAutoPubQoSProfileId::FallbackString,
+                        "empty class -> fallback_string");
+        }
+
+        // ---- defaultForClasses composite + first-wins ---------------
+        {
+            // Composite IMU (ACC+GYRO) must promote to fast_sensor even if
+            // GYRO comes first and would map to fast_sensor alone — and even
+            // if extra classes follow.
+            const char* imuClas[] = {"ACC", "GYRO"};
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClasses(imuClas, 2) ==
+                        RTPSAutoPubQoSProfileId::FastSensor,
+                        "composite ACC+GYRO -> fast_sensor");
+
+            const char* imuClasRev[] = {"GYRO", "ACC"};
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClasses(imuClasRev, 2) ==
+                        RTPSAutoPubQoSProfileId::FastSensor,
+                        "composite order-independent");
+
+            // AHT20-like: TEMP+RH → first real hit wins (both slow_sensor).
+            const char* aht[] = {"TEMP", "RH"};
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClasses(aht, 2) ==
+                        RTPSAutoPubQoSProfileId::SlowSensor,
+                        "TEMP+RH -> slow_sensor");
+
+            // Unknown → fallback_string.
+            const char* unknown[] = {"ZZZZ"};
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClasses(unknown, 1) ==
+                        RTPSAutoPubQoSProfileId::FallbackString,
+                        "unknown classes -> fallback_string");
+
+            // Empty input.
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClasses(nullptr, 0) ==
+                        RTPSAutoPubQoSProfileId::FallbackString,
+                        "null classes -> fallback_string");
+
+            // First-real-match-wins: {ZZZZ, BTN} should pick BTN → event.
+            const char* mix[] = {"ZZZZ", "BTN"};
+            TEST_ASSERT(RTPSAutoPubQoSProfile_defaultForClasses(mix, 2) ==
+                        RTPSAutoPubQoSProfileId::Event,
+                        "mixed [unknown, BTN] -> event");
+        }
+
+        // ---- Lifecycle + registry carry profile id through ----------
+        {
+            RTPSAutoPubLifecycle life;
+            uint8_t eid[4] = {0};
+            const uint8_t fastId =
+                static_cast<uint8_t>(RTPSAutoPubQoSProfileId::FastSensor);
+            const int slot = life.attach({1, 0x6A}, "rt/raft/imu_1_6a",
+                                         "sensor_msgs::msg::dds_::Imu_",
+                                         eid, fastId);
+            TEST_ASSERT(slot == 0, "attach with qosProfileId -> slot 0");
+            const auto* e = life.get(0);
+            TEST_ASSERT(e && e->qosProfileId == fastId,
+                        "registry stores qosProfileId");
+
+            // Default (no profile id arg) -> FallbackString (=3).
+            int slot2 = life.attach({1, 0x38}, "rt/raft/temp_1_38",
+                                    "sensor_msgs::msg::dds_::Temperature_",
+                                    nullptr);
+            TEST_ASSERT(slot2 == 1, "second attach -> slot 1");
+            TEST_ASSERT(life.get(1)->qosProfileId ==
+                        static_cast<uint8_t>(RTPSAutoPubQoSProfileId::FallbackString),
+                        "default qosProfileId = FallbackString (3)");
         }
     }
 

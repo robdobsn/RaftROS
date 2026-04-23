@@ -166,7 +166,7 @@ Latest run (2026-04-21) passed with:
 ### Remaining Gap
 
 - Phase 2 (ESP32 `/chatter` publishing) and Phase 3 (ESP32 topic subscribing with per-topic routing) are complete and verified end-to-end against ROS 2 Humble + FastDDS 2.6.11.
-- Phase 4 (auto-wiring from DeviceManager) is next.
+- Phase 4 (DeviceManager auto-publishing) is complete; every bus device detected by DeviceManager now auto-publishes to ROS 2 with per-class type mapping, per-writer QoS, and clean dispose on detach.
 - Linux and ESP32 orchestration code continues to converge on a shared runtime; remaining drift lives in the thin wrappers only (`components/RaftROS/RaftROS.cpp` vs `linux_unit_tests/raftros_standalone.cpp`).
 
 ## Phase 2: Topic Publishing — See "Phase 2: Topic Publishing — COMPLETE ✅" above
@@ -429,9 +429,109 @@ All three fixes are regression-guarded by unit tests in `linux_unit_tests/main.c
 - **DATA submessages always honour the Q flag before reading the serialized payload**. FastDDS routinely sends dispose/unregister DATAs with `Q=1 D=0 K=1` (endpoint teardown) that contain only an inline-QoS body — there is no serialized payload after it. Code that treats `pContent + 20` as the payload for every DATA will silently misparse every one of these.
 - **N-ary SEDP announcements on one writer must use distinct sequence numbers** (same lesson as Fix 16 for the publication writer side — applies symmetrically to the subscription writer).
 
-## Phase 4: Integration with Raft — TODO
+## Phase 4: DeviceManager Auto-Publishing — COMPLETE ✅
 
-- Auto-generate ROS 2 publishers from Raft DeviceManager detected devices
-- ROS 2 topic subscription for receiving commands
-- Dynamic topic creation on device attach/detach
-- Service server support
+Every bus device detected by `DeviceManager` is automatically mirrored as a
+ROS 2 topic at runtime. No per-device code. No SysTypes topic config for the
+common path. Online → `/rt/raft/<slug>_<bus>_<addrHex>` appears in
+`ros2 topic list`; offline → SEDP dispose removes it within a heartbeat
+interval.
+
+### What works end-to-end
+
+- **Device lifecycle hook** — `RaftROS::setup()` registers a
+  `DeviceManager::registerForDeviceStatusChange` callback. `ONLINE`/
+  `PENDING_DELETION` transitions drive a fixed-capacity writer registry
+  (`DYNAMIC_WRITER_REGISTRY_CAPACITY = 16`).
+- **Class → ROS 2 type mapping** (`RTPSAutoPubClassMap.h`, precedence
+  first-match-wins):
+  1. device-type-name overrides (MCP9808 → Temperature,
+     RoboticalLightSensor → Float32MultiArray),
+  2. actuator exclusion (`SRVO`, `PUMP`, `PIX`),
+  3. composite rules: `{ACC,GYRO}` → `Imu` (single writer),
+     `{TEMP,RH}` → `Temperature` + `RelativeHumidity`,
+     `{PRES,TEMP}` → `FluidPressure` + `Temperature`,
+  4. single-class rules for TEMP, RH, PRES, LGHT, PROX, DIST, ANG, ROT,
+     ACC, TCH, BTN, FRCE, HRM, SOIL, GAME,
+  5. fallback: `std_msgs/String` with a JSON body containing every decoded
+     field, topic slug `raw`.
+- **Per-writer slot allocation** — `RTPSAutoPubLifecycle` owns 16 topic +
+  type string buffers and issues entityIds in the deterministic range
+  `0x000110xx..0x00011Fxx`. Composite devices consume two slots keyed by
+  `{bus, addr, subIndex}` (subIndex=0 primary, =1 secondary).
+- **SEDP dynamic announce** — the existing writer-heartbeat pass walks the
+  registry and emits one `PublicationBuiltinTopic` DATA(w) per active slot
+  per tick, reusing the SPDP / HB pacing loop.
+- **User-data hot path** — on each decoded bus sample the latest record is
+  serialised through `RTPSAutoPubCDRSerializer` into a per-slot 512 B buffer
+  and unicast to every discovered peer. Composite devices serialise twice
+  (once per kind) on the same decoded struct.
+- **Timestamps** — ROS 2 `Header.stamp` is taken from the first `timeMs`
+  field of the decoded poll record (not wall-clock), so subscribers see
+  sample-time not emit-time.
+- **REP-103 unit scaling** — g→m/s² (×9.80665), °/s→rad/s (×π/180),
+  mm→m (/1000), hPa→Pa (×100), %→0..1 (/100). Applied per field by the
+  attribute-field description table.
+- **QoS profiles** (design §7.2, four built-ins):
+
+  | Profile | Reliability | Durability | Depth | Default for |
+  |---------|-------------|------------|-------|-------------|
+  | `fast_sensor`     | BEST_EFFORT | VOLATILE        | 10 | ACC, GYRO, IMU, PROX, LGHT, DIST, ANG, HRM, FRCE |
+  | `slow_sensor`     | RELIABLE    | VOLATILE        | 5  | TEMP, RH, PRES, SOIL, BTHM |
+  | `event`           | RELIABLE    | TRANSIENT_LOCAL | 20 | BTN, TCH, ROT, GAME |
+  | `fallback_string` | RELIABLE    | VOLATILE        | 10 | any unmapped class |
+
+  Resolution order per writer: per-device alias → per-class override →
+  built-in default. SysTypes override surface:
+
+  ```jsonc
+  "RaftROS": {
+    "enable": true,
+    "qosProfiles": {
+      "imu_1_6a":        "slow_sensor",            // per-device alias
+      "temperature_1_38": "event",
+      "classDefaults":   { "ACC": "slow_sensor" }  // per-class override
+    }
+  }
+  ```
+- **Dispose on offline** — `PENDING_DELETION` emits an SEDP
+  `PublicationBuiltinTopic` DATA with `PID_STATUS_INFO = 0x00000003`
+  (Disposed | Unregistered) and `PID_KEY_HASH = guidPrefix+entityId`,
+  which causes ROS 2 subscribers to drop the topic within a heartbeat.
+  Composite secondary slots are disposed alongside the primary.
+
+### Verification
+
+- **Linux unit tests** — `911 passed, 0 failed` in
+  `linux_unit_tests/main.cpp` covering:
+  - dynamic writer registry + subIndex disambiguation (Slice 4.1 + 4.10),
+  - lifecycle attach/detach (Slice 4.2),
+  - topic naming (Slice 4.3),
+  - class-map (Slice 4.4 — every row in `DeviceTypeRecords.json`),
+  - CDR serialiser per kind including REP-103 scaling + JSON fallback
+    (Slices 4.5 / 4.9),
+  - QoS profile table, name parse round-trip, per-class defaults,
+    composite resolution (Slice 4.11).
+- **Firmware size** — `SysTypeMain.bin` 0x1435c0 bytes, partition 25% free
+  on ESP32-S3 (ESP-IDF v5.5.2, `-std=gnu++2b -fno-exceptions -fno-rtti`).
+
+### Source files added in Phase 4
+
+| File | Purpose |
+|------|---------|
+| `components/RaftROS/RTPS/runtime/autopub/RTPSDynamicWriterRegistry.h` | Fixed-capacity slot + entityId registry |
+| `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubLifecycle.h` | Slot allocator with owned topic/type strings |
+| `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubTopicNaming.h` | `rt/raft/<slug>_<bus>_<addr>` formatter |
+| `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubClassMap.h` | `clas[] + deviceType → msg kind + slug` |
+| `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.h/.cpp` | Per-kind CDR encoders with REP-103 unit scaling |
+| `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubQoSProfile.h` | 4 built-in profiles + override resolver |
+
+## Phase 5: Integration with Raft — TODO
+
+- ROS 2 actions / service servers.
+- Command-side subscriptions auto-wired from DeviceManager actuator classes
+  (SRVO, PUMP, PIX) — the symmetric write path. Phase 4 excludes these
+  from publishing; Phase 5 will route incoming topic data into
+  `DeviceManager::sendCmdJSON`.
+- Per-device SysTypes topic alias override (short user-friendly name instead
+  of the auto slug).

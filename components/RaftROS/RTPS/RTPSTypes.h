@@ -63,6 +63,8 @@ enum RTPSParameterId : uint16_t
     PID_BUILTIN_ENDPOINT_SET          = 0x0058,
     PID_PROPERTY_LIST                 = 0x0059,
     PID_ENDPOINT_GUID                 = 0x005A,
+    PID_KEY_HASH                      = 0x0070,
+    PID_STATUS_INFO                   = 0x0071,
 };
 
 // === Port Calculation (DDSI-RTPS §9.6.1) ===

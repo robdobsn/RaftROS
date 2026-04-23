@@ -444,20 +444,23 @@ total heap. Revisit if we see >16 devices on a single bus.
 Each slice is independently testable, with unit tests added to
 `linux_unit_tests/main.cpp`.
 
-| Slice | Scope | Success criterion |
-|-------|-------|-------------------|
-| **4.1** | **Dynamic writer registry skeleton** — add `DynamicWriterCtx`, free-list, lookup by `RaftDeviceID`. No wire-side changes yet. | Unit test: register/unregister 20 contexts, free-list invariants hold. |
-| **4.2** | **Device attach/detach listener** — subscribe to `registerForDeviceStatusChange`; on online, instantiate a `DynamicWriterCtx` + cache `DeviceTypeRecord`; on offline, destroy. Still no RTPS announce. | Unit test with fake DeviceManager: 10 attach/detach cycles, no leaks. |
-| **4.3** | **Per-device data callback wiring** — `registerForDeviceData(deviceID, cb, rateMs, ctx)` on attach; callback decodes via `pollResultDecodeFn` into a stack/per-ctx buffer; logs decoded values. | Unit test: synthetic poll buffer for `AHT20` decodes to expected temp/humidity floats. |
-| **4.4** | **Class → mapping table** — implement the §5 dispatch (lookup row by `clas`); for now only `TEMP`, `RH`, `ACC`, `GYRO`, `DIST`, `LGHT` rows active. | Unit test: each `clas` resolves to the documented topic/type. |
-| **4.5** | **CDR serializers** — hand-written per ROS 2 type used in §5.2 (`Temperature`, `RelativeHumidity`, `FluidPressure`, `Illuminance`, `Range`, `Imu`, `Float32`, `Bool`, `String`). | Byte-for-byte golden tests against captures from `ros2 bag`. |
-| **4.6** | **SEDP dynamic announce** — extend `SEDPHandler` to iterate the writer registry; emit publication DATA(w) per active writer; honour QoS profile from §7.2. | On-device: `ros2 topic list` shows attached device topics. |
-| **4.7** | **User-data publishing hot path** — bus-task callback pushes CDR sample onto writer's history cache; `RaftROS::loop()` triggers heartbeat cycle. | On-device: `ros2 topic echo /raft_<host>/imu_1_6a` prints live data. |
-| **4.8** | **Dispose on offline** — `SEDPHandler::disposePublication()`; tie to offline status callback; free entityId. | On-device: pulling device causes `ros2 topic list` to drop the topic within ≤ 10 s. |
-| **4.9** | **Fallback path** — `std_msgs/String` JSON serializer for unmapped `clas` and for BLEBTHome. | Unit test: unknown device with synthetic `devInfoJson` publishes well-formed JSON. |
-| **4.10** | **Composite classes** — Imu, TEMP+RH, PRES+TEMP. | Unit + on-device for LSM6DS and AHT20. |
-| **4.11** | **QoS profile selector + SysTypes override** — runtime config of per-device topic alias & QoS override. | Config-driven test harness. |
-| **4.12** | **Documentation & polish** — update `development-status.md` and `overview.md`. | |
+| Slice | Scope | Success criterion | Status |
+|-------|-------|-------------------|--------|
+| **4.1** | **Dynamic writer registry skeleton** — add `DynamicWriterCtx`, free-list, lookup by `RaftDeviceID`. No wire-side changes yet. | Unit test: register/unregister 20 contexts, free-list invariants hold. | ✅ |
+| **4.2** | **Device attach/detach listener** — subscribe to `registerForDeviceStatusChange`; on online, instantiate a `DynamicWriterCtx` + cache `DeviceTypeRecord`; on offline, destroy. Still no RTPS announce. | Unit test with fake DeviceManager: 10 attach/detach cycles, no leaks. | ✅ |
+| **4.3** | **Per-device data callback wiring** — `registerForDeviceData(deviceID, cb, rateMs, ctx)` on attach; callback decodes via `pollResultDecodeFn` into a stack/per-ctx buffer; logs decoded values. | Unit test: synthetic poll buffer for `AHT20` decodes to expected temp/humidity floats. | ✅ |
+| **4.4** | **Class → mapping table** — implement the §5 dispatch (lookup row by `clas`); for now only `TEMP`, `RH`, `ACC`, `GYRO`, `DIST`, `LGHT` rows active. | Unit test: each `clas` resolves to the documented topic/type. | ✅ |
+| **4.5** | **CDR serializers** — hand-written per ROS 2 type used in §5.2 (`Temperature`, `RelativeHumidity`, `FluidPressure`, `Illuminance`, `Range`, `Imu`, `Float32`, `Bool`, `String`). | Byte-for-byte golden tests against captures from `ros2 bag`. | ✅ |
+| **4.6** | **SEDP dynamic announce** — extend `SEDPHandler` to iterate the writer registry; emit publication DATA(w) per active writer; honour QoS profile from §7.2. | On-device: `ros2 topic list` shows attached device topics. | ✅ |
+| **4.7** | **User-data publishing hot path** — bus-task callback pushes CDR sample onto writer's history cache; `RaftROS::loop()` triggers heartbeat cycle. | On-device: `ros2 topic echo /raft_<host>/imu_1_6a` prints live data. | ✅ |
+| **4.8** | **Dispose on offline** — `SEDPHandler::disposePublication()`; tie to offline status callback; free entityId. | On-device: pulling device causes `ros2 topic list` to drop the topic within ≤ 10 s. | ✅ |
+| **4.9** | **Fallback path** — `std_msgs/String` JSON serializer for unmapped `clas` and for BLEBTHome. | Unit test: unknown device with synthetic `devInfoJson` publishes well-formed JSON. | ✅ |
+| **4.10** | **Composite classes** — Imu, TEMP+RH, PRES+TEMP. | Unit + on-device for LSM6DS and AHT20. | ✅ |
+| **4.11** | **QoS profile selector + SysTypes override** — runtime config of per-device topic alias & QoS override. | Config-driven test harness. | ✅ |
+| **4.12** | **Documentation & polish** — update `development-status.md` and `overview.md`. | | ✅ |
+
+**Phase 4 complete.** Linux unit tests: **911 passed, 0 failed**.
+ESP32-S3 firmware size: `0x1435c0` (25% free on `app` partition).
 
 ---
 

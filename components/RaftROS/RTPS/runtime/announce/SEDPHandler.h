@@ -36,6 +36,19 @@ public:
         uint32_t ipAddrNetOrder = 0,
         uint32_t heartbeatCount = 0);
 
+    /// Build an SEDP publication DISPOSE message (DDSI-RTPS §8.7.3.5 / §9.6.3.9).
+    /// Sent on the builtin PublicationsWriter to tell peers the advertised
+    /// DataWriter is going away.  Payload carries PID_STATUS_INFO with the
+    /// DisposedFlag|UnregisteredFlag bits set plus PID_KEY_HASH / PID_ENDPOINT_GUID
+    /// naming the vanished writer.  Returns bytes written, or 0 on error.
+    uint32_t buildPublicationDisposeMessage(
+        uint8_t* pBuf, uint32_t bufLen,
+        const RTPSParticipant& participant,
+        const uint8_t* destGuidPrefix,
+        const uint8_t* writerEntityId,
+        uint64_t sequenceNumber,
+        uint32_t heartbeatCount = 0);
+
     /// Build a user DATA message wrapping a payload from a specific writer
     /// Used for publishing on topics like ros_discovery_info
     /// Returns bytes written, or 0 on error
