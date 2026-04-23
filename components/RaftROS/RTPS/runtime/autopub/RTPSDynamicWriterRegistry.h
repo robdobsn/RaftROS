@@ -52,6 +52,22 @@ static constexpr uint8_t DYNAMIC_WRITER_REGISTRY_CAPACITY = 16;
 // map to entity-key bytes 0x10..0x1F, leaving 0x00..0x0F for static/builtin writers.
 static constexpr uint8_t DYNAMIC_WRITER_ENTITY_KEY_BASE = 0x10;
 
+// SEDP publications writer sequence-number allocation for dynamic slots.
+//
+// The SEDP publications writer is a single RTPS endpoint; every publication
+// DATA(w) sample it emits must have a unique monotonically-increasing seq.
+// Seq 1 is reserved for ros_discovery_info, seq 2 for /chatter.  Dynamic
+// writers get one seq for the announce and one for the dispose — reusing
+// the same seq for re-announces (FastDDS deduplicates by (writerGUID, seq)
+// so a re-announce with the same seq is treated as a retransmit of the
+// already-received sample rather than a fresh one, which is the behaviour
+// we want).  Layout:
+//   slot N announce  -> AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ + N
+//   slot N dispose   -> AUTOPUB_SEDP_DISPOSE_BASE_SEQ  + N
+static constexpr uint64_t AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ = 3;
+static constexpr uint64_t AUTOPUB_SEDP_DISPOSE_BASE_SEQ  =
+    AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ + DYNAMIC_WRITER_REGISTRY_CAPACITY;
+
 // Opaque per-device key identifying which physical device owns a registry slot.
 // Carries (busNum, address) rather than RaftDeviceID directly so this header has
 // zero dependency on RaftCore — the wrapper is responsible for the translation.
@@ -146,7 +162,10 @@ public:
             _entries[slot].topic      = topic;
             _entries[slot].type       = type;
             _entries[slot].seqNum     = 0;
-            _entries[slot].sedpSeqNum = 0;
+            // Fixed unique SEDP seq per slot — see comment on
+            // AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ above.  Stable across the
+            // slot's lifetime; re-announces reuse the same seq.
+            _entries[slot].sedpSeqNum = AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ + slot;
             _entries[slot].qosProfileId = qosProfileId;
             if (outEntityId)
                 std::memcpy(outEntityId, eid, 4);

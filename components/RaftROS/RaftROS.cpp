@@ -1534,19 +1534,16 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
     if (!pEntry || !pEntry->inUse || !pEntry->topic || !pEntry->type)
         return false;
 
-    // Advance the per-slot SEDP sequence number _before_ building so the
-    // receiver observes monotonically-increasing seqs across announce cycles.
-    auto* pMutable = _autoPubLifecycle.getMutable(slot);
-    if (!pMutable)
-        return false;
-    pMutable->sedpSeqNum++;
-    const uint64_t thisSeq = pMutable->sedpSeqNum;
-
     // QoS: resolved per-writer at attach time (design doc §7.2).  Profile id
     // is stored on the registry entry; Slice 4.11 translates to the SEDP
     // reliability/durability enums here.
     using RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId;
     using RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfile_get;
+    // SEDP publications writer seq is a fixed unique value per slot (assigned
+    // at allocate() time).  Re-announces reuse the same seq so FastDDS treats
+    // them as retransmits of an already-received sample rather than a fresh
+    // one colliding with ros_discovery_info (seq 1) or /chatter (seq 2).
+    const uint64_t thisSeq = pEntry->sedpSeqNum;
     const auto qos = RTPSAutoPubQoSProfile_get(
         static_cast<RTPSAutoPubQoSProfileId>(pEntry->qosProfileId));
     const uint32_t payloadLen = _sedpHandler.buildPublicationMessage(
@@ -1565,15 +1562,14 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
     const int sent = sendto(_metatrafficSock, _sendBuf, payloadLen, 0,
                             (struct sockaddr*)&dest, sizeof(dest));
 
-#ifdef DEBUG_PARTICIPANT_PROCESSING
+    // Keep a low-rate diagnostic at INFO level so on-device flash logs confirm
+    // that autopub writers are being announced to every discovered peer (this
+    // firing is prerequisite to the host's rmw seeing a matched publisher).
     LOG_I(MODULE_PREFIX,
-          "autoPubSEDP slot=%u topic=%s type=%s seq=%u sent %d/%u to port %d",
+          "autoPubSEDP slot=%u topic=%s type=%s seq=%u sent %d/%u peerIP=%08x port=%d",
           (unsigned)slot, pEntry->topic, pEntry->type,
           (unsigned)thisSeq, sent, (unsigned)payloadLen,
-          (int)remote.metatrafficPort);
-#else
-    (void)sent;
-#endif
+          (unsigned)remote.ipAddr, (int)remote.metatrafficPort);
     return payloadLen > 0;
 }
 
@@ -1583,7 +1579,22 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
 
 uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
 {
-    const uint8_t* writerIds[] = { ENTITYID_CHATTER_WRITER };
+    // Writer GIDs: static chatter writer + any in-use autopub dynamic writer
+    // entityIds.  ROS 2 tooling (`ros2 topic info`, graph API) determines the
+    // "Publisher count" for a topic by enumerating writer_gid_seq in
+    // ros_discovery_info — a DDS writer not listed here is invisible to the
+    // ROS graph even when its SEDP announce is accepted.
+    using RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY;
+    const uint8_t* writerIds[1 + DYNAMIC_WRITER_REGISTRY_CAPACITY] = {0};
+    uint32_t numWriterIds = 0;
+    writerIds[numWriterIds++] = ENTITYID_CHATTER_WRITER;
+    for (uint8_t slot = 0; slot < DYNAMIC_WRITER_REGISTRY_CAPACITY; slot++)
+    {
+        const auto* pEntry = _autoPubLifecycle.get(slot);
+        if (!pEntry)
+            continue;
+        writerIds[numWriterIds++] = pEntry->entityId;
+    }
 
     // Collect reader GIDs from the registry: slot 0 (default CHATTER_READER) plus any
     // additional subscriptions appended via addStringSubscription().
@@ -1597,7 +1608,7 @@ uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
         _participant.getParticipantGuid(),
         _nodeName.c_str(),
         _nodeNamespace.c_str(),
-        writerIds, 1,
+        writerIds, numWriterIds,
         readerIds, numReaderIds);
 }
 
@@ -1752,13 +1763,25 @@ static_assert((uint8_t)RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubAttrType:
 
 void RaftROS::autoPubOnDeviceStatusChange(RaftDevice& device, const BusAddrStatus& addrStatus)
 {
-    // Only act on real change events with a valid device type.
-    if (!addrStatus.isChange)
+    // Act on either an online/offline transition (isChange) or on the
+    // first-identification event for an already-online device
+    // (isNewlyIdentified).  I2C devices are reported ONLINE as soon as
+    // the bus scanner sees an ACK at the address; identification (and
+    // therefore a valid deviceTypeIndex) happens asynchronously in a
+    // follow-up status change with isNewlyIdentified=true but no
+    // online-state change.  Auto-publish needs the typeIdx, so we can't
+    // commit on isChange alone.
+    if (!addrStatus.isChange && !addrStatus.isNewlyIdentified)
         return;
 
     switch (addrStatus.onlineState)
     {
         case DeviceOnlineState::ONLINE:
+            // Skip attach until the bus has finished identification —
+            // deviceTypeIndex is required for class-map lookup and
+            // SEDP type-name emission.
+            if (addrStatus.deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
+                return;
             autoPubAttachDevice(device, addrStatus);
             break;
         case DeviceOnlineState::OFFLINE:
@@ -2148,6 +2171,18 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
             /*unregister=*/false);
     }
 
+    // Announce the newly-allocated writer slot(s) to every already-discovered
+    // participant.  Without this, a writer that comes up AFTER the initial
+    // SEDP announce sweep for a participant has completed would never be seen
+    // by that participant — symptom: `ros2 topic info` shows the topic with
+    // "Publisher count: 0" and `ros2 topic echo` stays silent.
+    for (const auto& remote : _discovered)
+    {
+        (void)emitAutoPubSedpAnnounce(remote, (uint8_t)slot);
+        if (pCtx->secondarySlot != 0xFF)
+            (void)emitAutoPubSedpAnnounce(remote, pCtx->secondarySlot);
+    }
+
     return true;
 }
 
@@ -2186,14 +2221,14 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
         const auto* pRegEntry = _autoPubLifecycle.get(slotIdx);
         if (!pRegEntry || !pRegEntry->inUse || _discovered.empty())
             return;
-        auto* pRegEntryMut = _autoPubLifecycle.getMutable(slotIdx);
+        // Dispose uses a fixed unique seq per slot (distinct from the
+        // announce seq on the same slot, and from other slots' announce/
+        // dispose seqs).  See AUTOPUB_SEDP_DISPOSE_BASE_SEQ.
+        using RaftRuntime::RTPS::Runtime::AutoPub::AUTOPUB_SEDP_DISPOSE_BASE_SEQ;
+        const uint64_t disposeSeq = AUTOPUB_SEDP_DISPOSE_BASE_SEQ + slotIdx;
         int disposedTo = 0;
         for (const auto& remote : _discovered)
         {
-            if (pRegEntryMut)
-                pRegEntryMut->sedpSeqNum++;
-            const uint64_t disposeSeq = pRegEntryMut ? pRegEntryMut->sedpSeqNum
-                                                     : (pRegEntry->sedpSeqNum + 1);
             const uint32_t msgLen = _sedpHandler.buildPublicationDisposeMessage(
                 _sendBuf, sizeof(_sendBuf),
                 _participant, remote.guidPrefix,
