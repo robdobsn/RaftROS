@@ -3055,12 +3055,14 @@ int main()
                         "Range: serialize ok");
             // Layout: encap(4) + hdr(4 sec + 4 ns + strlen(5)+pad to 4 → 4+4+5=17)
             //         radiation_type(uint8) @ pos 4+8+4+5 = 21
-            //         float32 fov/min/max/range aligned 4 → 24, 28, 32, 36.
+            //         float32 fov/min/max/range/variance aligned 4 → 24, 28, 32, 36, 40.
             TEST_ASSERT(buf[21] == 1, "Range: radiation_type = INFRARED (1)");
             TEST_ASSERT(nearly(lef32(buf + 24), 0.0, 1e-6), "Range: field_of_view = 0");
             TEST_ASSERT(nearly(lef32(buf + 28), 0.0, 1e-6), "Range: min_range = 0");
             TEST_ASSERT(nearly(lef32(buf + 32), 2.0, 1e-6), "Range: max_range = 2 m (DIST default)");
             TEST_ASSERT(nearly(lef32(buf + 36), 0.25, 1e-4), "Range: dist 250mm → 0.25 m");
+            TEST_ASSERT(nearly(lef32(buf + 40), 0.0, 1e-6), "Range: variance = 0 (unknown)");
+            TEST_ASSERT(written == 44, "Range: payload size = 44 bytes (Jazzy adds variance)");
         }
 
         // ---- sensor_msgs/Imu standalone ACC (ADXL313) --------------------

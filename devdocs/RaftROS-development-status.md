@@ -1,6 +1,129 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-22
+**Last Updated:** 2026-04-23
+
+## Host environment gotchas (recorded 2026-04-23 after losing a day to these)
+
+These are host-side, not firmware bugs — but they can look exactly like
+"the ESP32 is broken". Full reference in `README.md` §"Host Setup Notes".
+
+- **ESP32 does NOT push user DATA to an empty graph.** A passive
+  packet-capture with no ROS 2 subscriber running on the host will show
+  **zero** unicast DATA from the ESP32 (only periodic SPDP multicast). To
+  capture data traffic you must first start a consumer that actually
+  matches the publication, e.g.:
+  ```bash
+  # keep this running for the whole capture window
+  ros2 run demo_nodes_cpp listener                       # for /chatter
+  python3 scripts/range_probe.py --raw                   # for /raft/range_1_29
+  # OR
+  ros2 topic echo --no-daemon --qos-reliability best_effort /raft/range_1_29 sensor_msgs/msg/Range
+  ```
+  If `tshark -f 'host <esp_ip>'` reports `Packets captured: 0`, assume
+  "no subscriber is active" before assuming a firmware/network bug.
+- **WSL2 must use mirrored networking.** Default NAT mode blocks inbound
+  SPDP multicast from the LAN. Fix: add `networkingMode=mirrored` under
+  `[wsl2]` in `%UserProfile%\.wslconfig`, then `wsl --shutdown`.
+- **Windows Firewall blocks inbound UDP to WSL** even in mirrored mode.
+  Fix: `New-NetFirewallRule -DisplayName "ROS2 RTPS" -Direction Inbound
+  -Protocol UDP -LocalPort 7400-7500 -Action Allow -Profile Any` (or set
+  `firewall=false` in `.wslconfig`). Symptom: ESP32 sees the host, host
+  never sees the ESP32; `tcpdump` shows zero packets from the ESP32 IP.
+- **ROS 2 Jazzy inverted `ROS_LOCALHOST_ONLY`.** Must be `unset`, not
+  `=0`. On Humble, `=0` is still correct.
+- **`tcpdump`/`dumpcap` output to `/tmp`** is denied under WSL even as
+  root — write pcaps to `/var/tmp/` instead. User also needs `sudo` (not
+  in `wireshark` group by default).
+- **`ros2 daemon` hangs on WSL2** (XML-RPC socket). Always use
+  `--no-daemon`. If `ros2 daemon stop` times out, force-kill:
+  `pkill -9 -f _ros2_daemon`.
+- **Fast DDS log XML:** root element is
+  `<dds xmlns="http://www.eprosima.com">`, not `<profiles>`. Log kind is
+  `Log::Kind::Info`, not `log_kind::Info`.
+- **Missing `DeviceTypes.json` silently disables I2C auto-identification.**
+  When using Raft's `raftdevlibs/` override mechanism (clone
+  RaftCore/RaftI2C/etc. into `examples/<app>/raftdevlibs/` so local edits
+  survive clean builds), the build picks up devtypes from the overridden
+  tree. If that tree is missing `devtypes/DeviceTypes.json`, scanners
+  detect the device at the bus level but `identifyDevice` can't assign
+  a `deviceTypeIndex`, so auto-publish never attaches. Symptom:
+  `I2CDevIdentMgr: identifyDevice new device <name>` fires, but
+  `autoPubStatus slots=0/16` stays at 0 forever. Fix: make sure
+  `raftdevlibs/<Repo>/devtypes/DeviceTypes.json` exists (copy from the
+  upstream clone).
+
+---
+
+## Phase 4 auto-publish — current status (2026-04-23)
+
+### Verified working (end-to-end)
+
+| # | Observation | Evidence |
+|---|-------------|----------|
+| V1 | DeviceManager → listener dispatch is live | `autoPubStatusCb devID=1_29 typeIdx=5 online=1 isNewlyId=1` in ESP logs after the DeviceManager fix |
+| V2 | Auto-publish slot attach fires on identification | `autoPubAttach devID=1_29 typeIdx=5 slot=0 topic=rt/raft/range_1_29 type=sensor_msgs::msg::dds_::Range_` |
+| V3 | SEDP publication accepted by Fast DDS daemon | `/raft/range_1_29` appears in `ros2 topic list` and `ros2 topic info --verbose` |
+| V4 | CDR payload sent at expected rate | `ros2 topic hz /raft/range_1_29` reports **~4.95 Hz** stable for 23 s+ |
+| V5 | UDP delivery is reliable | `tcpdump` on `eth2` captures every frame; 216/304 packets in a 10 s run, 0 dropped by kernel |
+| V6 | Raw wire payload is structurally correct | Decoded Range DATA submsg: encap `00 01 00 00` (CDR_LE), sec, nsec, frame_id (len-prefixed + NUL + pad), radiation_type=1 (INFRARED), pad, fov, min, max, range, variance. For `frame_id="raft"` → 44 bytes total. ROS 2 Jazzy's `sensor_msgs/Range` has **5 float32** fields (`variance` was added after Humble) — omitting `variance` causes silent FastCDR deserialize failure and empty typed subscriptions. |
+| V7 | Same packet decodes cleanly for `/chatter` on the same writer flow | `/chatter` echo has worked throughout |
+
+### Confirmed topic-name rules
+
+- On the wire the topic is `rt/raft/range_1_29` (ROS 2 always adds a `rt/` prefix to user topic writers — this is a DDS-level detail).
+- From the ROS 2 CLI the correct name is **`/raft/range_1_29`** (the `rt/` prefix is stripped by rmw). Do **not** use `/rt/raft/range_1_29`; that call will silently fail.
+- `ros2 topic list`, `topic info`, `topic hz`, `topic echo`, and `rclpy` subscriptions all use the `/raft/...` form.
+
+### QoS reality check
+
+- `RTPSAutoPubQoSProfile::FastSensor` = BEST_EFFORT / VOLATILE / KEEP_LAST depth 10.
+- This class is assigned to every I2C sensor class by `RTPSAutoPubClassMap` (DIST, PROX, ACC, GYRO, LGHT, ANG, HRM, FRCE, IMU).
+- The ROS 2 CLI default QoS is RELIABLE, so `ros2 topic echo /raft/range_1_29 sensor_msgs/msg/Range` with no flags produces no output because the subscriber won't match the BEST_EFFORT writer.
+- Correct invocation: `ros2 topic echo /raft/range_1_29 sensor_msgs/msg/Range --qos-reliability best_effort`.
+- Oddity observed: `ros2 topic hz` matches and counts frames even with default QoS. That is because `hz` in Jazzy uses the "best-available" QoS profile (auto-relaxes to match the offered writer). `echo` with an explicit message type does **not** auto-relax; `echo --raw` behaviour is less clear and needs re-testing.
+
+### ACTIVE BUG: Fast CDR exception on deserialize
+
+With matching QoS, the subscriber reports:
+
+```
+Fast CDR exception deserializing message of type sensor_msgs::msg::dds_::Range_.,
+at ./src/type_support_common.cpp:118
+```
+
+`ros2 topic echo` swallows this silently and prints nothing. `rclpy` re-raises it but only as "Fast CDR exception" (no offset/reason yet).
+
+Theories in priority order (not yet disproved):
+
+1. **Data Representation policy mismatch.** Fast DDS 3.x readers in Jazzy advertise `{XCDR, XCDR2}` by default via `PID_DATA_REPRESENTATION` (id 0x0073). Our SEDP publication does **not** emit `PID_DATA_REPRESENTATION`. If Jazzy's Range `_TypeSupport` was generated with `@appendable` (it is — ROS 2 IDL default for Jazzy), the generated deserializer runs in **XCDR2 appendable mode** and expects a `DHeader` (4-byte `uint32` object length) immediately after the encapsulation header. We are sending classic XCDR1 with no DHeader — first 4 bytes of data are interpreted as a DHeader of `0x22645240 * …` (garbage) and length check fails. This theory explains every symptom: structurally correct bytes, passes `hz`, rejected by `echo`. — **HIGHEST PRIORITY TO TEST.**
+2. Jazzy's generated `sensor_msgs::msg::dds_::Range_` has a different field order or an additional `@key` field we're not aware of. Low probability (same type name works with other Fast DDS publishers). 
+3. Locator/address confusion — we send from `192.168.1.173:7411 → 192.168.1.28:7411`. On Jazzy the receiver expects user-data on an ephemeral port advertised in its SPDP. We appear to be picking the right port from discovery (delivery is reliable per `hz`), so this is unlikely.
+
+### Other odd behaviours observed
+
+| # | Observation | Explanation / theory | Severity |
+|---|-------------|----------------------|----------|
+| O1 | `ros2 node info /raft_esp32` → "Unable to find node" | ParticipantMessageData / node-name mapping incomplete — node listed by `node list` but not looked up by name. Probably missing `ros_discovery_info` GID list entries for the newly-attached autopub writer (we don't re-publish `ros_discovery_info` after attach). | Cosmetic |
+| O2 | `ros2 topic list --no-daemon` often shows **3 "discovered" participants** for every CLI invocation | Each `ros2 topic list` spawns a short-lived DDS participant that appears + disappears within its `--spin-time`. The daemon also has one. Not a bug. | Cosmetic |
+| O3 | First ACKNACK after match produces `total count change:1 total count: 1` | BEST_EFFORT writers still maintain a sequence number; the subscriber reports one "missed" sample on match because it joined mid-stream. This is normal for BEST_EFFORT and is not the deserialize failure. | Normal |
+| O4 | `echo --raw` with `--qos-reliability best_effort` printed nothing | Unclear. `--raw` may still require the type argument to create the subscription. Needs re-test: `ros2 topic echo /raft/range_1_29 sensor_msgs/msg/Range --qos-reliability best_effort --raw`. | Open |
+| O5 | LWIP still loses mid-burst sends with ENOMEM on the ESP | Known; covered by reliable retransmit. | Known / accepted |
+
+### Investigation plan (next session)
+
+1. **Prove/disprove theory #1** by examining a working Fast DDS → Fast DDS Range publication on the same host and comparing the first 8 bytes of the serialized payload. If they start with `00 0A 00 00` or `00 0B 00 00` (PL_CDR2 / XCDR2) and contain a DHeader, we need to either (a) emit `PID_DATA_REPRESENTATION = XCDR1` in our SEDP publication, or (b) switch our serializer to XCDR2 appendable.
+2. Enable Fast DDS verbose logging the right way: `export FASTDDS_DEFAULT_LOG_VERBOSITY_LEVEL=Info` and `export FASTDDS_DEFAULT_LOG_FILTER='FastCdr|RTPS_MSG_IN|SUBSCRIBER'` **before sourcing ROS**, not after. Then `ros2 topic echo ... 2>&1 | tee /tmp/fastdds.log` — the exact exception type (NOT_ENOUGH_MEMORY vs BAD_PARAM) will tell us whether it's a size mismatch or a value mismatch.
+3. If #1 is the cause, add `PID_DATA_REPRESENTATION` to `SEDPHandler::buildPublicationMessage` with value `{0x0000}` (XCDR1) before `PID_SENTINEL`.
+4. Consider flipping `FastSensor` default to RELIABLE so standard tutorials (`ros2 topic echo` with no flags) "just work" — but document the BEST_EFFORT choice for real sensor streams.
+5. Fix `ros2 node info` after autopub attach by bumping `_rosDiscSeqNum` and rebuilding the ros_discovery_info payload with the new writer GID.
+
+### Host diagnostic recipes (proven)
+
+- Run the `/tmp/range_probe.py` rclpy subscriber (fixed version below) to see the actual CDR exception text.
+- `tcpdump -i eth2 -w ~/rtps.pcap 'udp portrange 7400-7500'`, then `tcpdump -r ~/rtps.pcap -nn -X 'udp portrange 7410-7420 and greater 80' | head -80` to inspect wire bytes without Wireshark.
+- Wireshark dissector: install `wireshark-common` on WSL, `chown` the pcap, open the file directly — RTPS 2.2 is decoded natively and the serialized payload is annotated by generated type plugins if ROS 2 is sourced.
+
+---
 
 ## Goal
 

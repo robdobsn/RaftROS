@@ -54,7 +54,7 @@ uint32_t SPDPHandler::buildAnnouncementMessage(
     uint32_t leaseDurationSec,
     uint64_t sequenceNumber)
 {
-    if (!pBuf || bufLen < 256)
+    if (!pBuf || bufLen < 512)
         return 0;
 
     uint32_t pos = 0;
@@ -66,7 +66,7 @@ uint32_t SPDPHandler::buildAnnouncementMessage(
     pos += RTPSMessage::writeInfoTS(pBuf + pos, bufLen - pos, 0, 0);
 
     // Build SPDP payload (ParameterList) into a temp buffer
-    uint8_t payload[256];
+    uint8_t payload[512];
     uint32_t pp = 0;
 
     // CDR Encapsulation Header: PL_CDR_LE (0x00, 0x03 for parameter list LE)
@@ -141,6 +141,60 @@ uint32_t SPDPHandler::buildAnnouncementMessage(
         memcpy(payload + pp, userData, udLen);
         pp += udLen;
         while (pp % 4 != 0) payload[pp++] = 0;
+    }
+
+    // PID_ENTITY_NAME (0x0062): CDR string with the participant/node name.
+    // Fast DDS emits "/" for the default enclave root; rmw_fastrtps overrides
+    // with the actual node name when one is set. Use "/" for a plain participant.
+    {
+        const char* entityName = "/";
+        uint32_t enLen = (uint32_t)strlen(entityName) + 1;  // include NUL
+        uint32_t enPadded = (enLen + 3) & ~3u;
+        pp += writeParamHeader(payload + pp, PID_ENTITY_NAME, (uint16_t)(4 + enPadded));
+        payload[pp++] = enLen & 0xFF;
+        payload[pp++] = (enLen >> 8) & 0xFF;
+        payload[pp++] = (enLen >> 16) & 0xFF;
+        payload[pp++] = (enLen >> 24) & 0xFF;
+        memcpy(payload + pp, entityName, enLen);
+        pp += enLen;
+        while (pp % 4 != 0) payload[pp++] = 0;
+    }
+
+    // PID_PROPERTY_LIST (0x0059): DDS PropertyQosPolicy.
+    // Layout: uint32 nProperties, N * { cdrString name; cdrString value; },
+    //         uint32 nBinaryProperties (=0).
+    // Fast DDS looks up "PARTICIPANT_TYPE" to distinguish SIMPLE vs CLIENT/SERVER
+    // discovery participants; missing this property has been observed to cause
+    // some rmw_fastrtps-based subscribers to skip endpoint matching even when
+    // SEDP advertises the writer correctly.
+    {
+        // Helper to emit a CDR string inline (length + bytes + NUL + pad-to-4)
+        auto emitCdrString = [&](const char* s) {
+            uint32_t sLen = (uint32_t)strlen(s) + 1; // include NUL
+            payload[pp++] = sLen & 0xFF;
+            payload[pp++] = (sLen >> 8) & 0xFF;
+            payload[pp++] = (sLen >> 16) & 0xFF;
+            payload[pp++] = (sLen >> 24) & 0xFF;
+            memcpy(payload + pp, s, sLen);
+            pp += sLen;
+            while (pp % 4 != 0) payload[pp++] = 0;
+        };
+
+        // Reserve space for param header — we'll backfill length after serialising
+        uint32_t plHeaderPos = pp;
+        pp += 4; // room for PID + length
+        uint32_t plStart = pp;
+
+        // nProperties = 1
+        payload[pp++] = 1; payload[pp++] = 0; payload[pp++] = 0; payload[pp++] = 0;
+        emitCdrString("PARTICIPANT_TYPE");
+        emitCdrString("SIMPLE");
+        // nBinaryProperties = 0
+        payload[pp++] = 0; payload[pp++] = 0; payload[pp++] = 0; payload[pp++] = 0;
+
+        uint32_t plLen = pp - plStart;
+        // Backfill header now that length is known
+        writeParamHeader(payload + plHeaderPos, PID_PROPERTY_LIST, (uint16_t)plLen);
     }
 
     // PID_SENTINEL (terminates parameter list)

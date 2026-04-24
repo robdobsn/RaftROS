@@ -54,6 +54,74 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 bash -lc '
 '
 ```
 
+## Host Setup Notes (READ FIRST if discovery isn't working)
+
+Discovery silently fails on some host setups. These are the gotchas we hit
+and the fixes — verified on Windows 11 + WSL2 Ubuntu 24.04 + ROS 2 Jazzy
+(Fast DDS 3.x) and on native Linux + ROS 2 Humble (Fast DDS 2.6.x).
+
+### 1. WSL2: mirrored networking is required
+
+The default WSL2 NAT mode does NOT forward inbound multicast from the LAN
+into WSL, so SPDP (`239.255.0.1:7400`) from the ESP32 never arrives.
+Create/edit `%UserProfile%\.wslconfig` on Windows:
+
+```ini
+[wsl2]
+networkingMode=mirrored
+firewall=true
+```
+
+Then from an elevated PowerShell: `wsl --shutdown` and reopen WSL. In
+mirrored mode WSL shares the Windows LAN IP, and multicast works.
+
+### 2. Windows Firewall blocks inbound UDP to WSL
+
+Even with mirrored networking, Windows Defender Firewall drops inbound
+RTPS UDP to the WSL side by default. This is the most common "discovery
+works one-way only" symptom (ESP32 sees the host; host never sees the
+ESP32). Add a permissive rule from an elevated PowerShell:
+
+```powershell
+New-NetFirewallRule -DisplayName "ROS2 RTPS" -Direction Inbound `
+  -Protocol UDP -LocalPort 7400-7500 -Action Allow -Profile Any
+```
+
+Alternative: set `firewall=false` in `.wslconfig` (less strict, fine for
+a dev workstation). Verify with `sudo tcpdump -i any -nn udp port 7400`
+inside WSL — if you see zero packets from the ESP32 IP but
+`sudo nmap -sU -p 7400 <ESP32_IP>` works outbound, it's the firewall.
+
+### 3. ROS 2 Jazzy: `ROS_LOCALHOST_ONLY` is deprecated — UNSET it
+
+On Jazzy the semantics inverted; leaving `ROS_LOCALHOST_ONLY=0` in your
+shell actually restricts discovery. Use:
+
+```bash
+unset ROS_LOCALHOST_ONLY
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export ROS_DOMAIN_ID=0
+```
+
+On Humble, `ROS_LOCALHOST_ONLY=0` is still correct.
+
+### 4. Same subnet / same `ROS_DOMAIN_ID`
+
+ESP32 and host must be on the same L2 broadcast domain (guest WiFi
+networks often isolate clients and will block SPDP). `ROS_DOMAIN_ID`
+must match on both sides (RaftROS default is `0`).
+
+### 5. Debug recipe when discovery fails
+
+```bash
+# In WSL / Linux host
+sudo tcpdump -i any -w ~/raft_rtps.pcap 'udp and (port 7400 or portrange 7410-7500)'
+sudo chown $USER ~/raft_rtps.pcap
+# Open in Wireshark, filter on 'rtps'. Packets from the ESP32 IP confirm
+# the firewall / mirroring path is OK; only host packets means Steps 1–2
+# are not yet correct.
+```
+
 ## Repository Layout
 
 - `components/RaftROS/` — the SysMod source and shared RTPS runtime.

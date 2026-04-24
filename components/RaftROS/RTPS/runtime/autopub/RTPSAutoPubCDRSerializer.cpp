@@ -298,6 +298,8 @@ static bool serializeRange(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     }
     if (!enc.writeFloat32(maxRange)) return false;
     if (!enc.writeFloat32((float)rangeVal)) return false;
+    // variance (added in ROS 2 Jazzy); 0.0 = variance unknown per REP.
+    if (!enc.writeFloat32(0.0f)) return false;
     return true;
 }
 
