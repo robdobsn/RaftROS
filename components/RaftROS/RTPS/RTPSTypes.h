@@ -49,12 +49,25 @@ enum RTPSParameterId : uint16_t
     PID_PARTICIPANT_LEASE_DURATION    = 0x0002,
     PID_TOPIC_NAME                    = 0x0005,
     PID_TYPE_NAME                     = 0x0007,
+    PID_TIME_BASED_FILTER             = 0x0004,
     PID_PROTOCOL_VERSION              = 0x0015,
     PID_VENDORID                      = 0x0016,
     PID_RELIABILITY                   = 0x001A,
+    PID_LIVELINESS                    = 0x001B,
     PID_DURABILITY                    = 0x001D,
+    PID_DURABILITY_SERVICE            = 0x001E,
+    PID_OWNERSHIP                     = 0x001F,
+    PID_PRESENTATION                  = 0x0021,
+    PID_DEADLINE                      = 0x0023,
+    PID_DESTINATION_ORDER             = 0x0025,
+    PID_LATENCY_BUDGET                = 0x0027,
+    PID_PARTITION                     = 0x0029,
+    PID_LIFESPAN                      = 0x002B,
     PID_UNICAST_LOCATOR               = 0x002F,
     PID_USER_DATA                     = 0x002C,
+    PID_GROUP_DATA                    = 0x002D,
+    PID_TOPIC_DATA                    = 0x002E,
+    PID_TYPE_MAX_SIZE_SERIALIZED      = 0x0060,
     PID_DEFAULT_UNICAST_LOCATOR       = 0x0031,
     PID_METATRAFFIC_UNICAST_LOCATOR   = 0x0032,
     PID_METATRAFFIC_MULTICAST_LOCATOR = 0x0033,
@@ -63,9 +76,22 @@ enum RTPSParameterId : uint16_t
     PID_BUILTIN_ENDPOINT_SET          = 0x0058,
     PID_PROPERTY_LIST                 = 0x0059,
     PID_ENDPOINT_GUID                 = 0x005A,
+    PID_ENTITY_NAME                   = 0x0062,
     PID_KEY_HASH                      = 0x0070,
     PID_STATUS_INFO                   = 0x0071,
+    PID_DATA_REPRESENTATION           = 0x0073,
+    PID_TYPE_CONSISTENCY              = 0x0074,
 };
+
+// === Data Representation IDs (OMG DDS-XTypes §7.6.3.1.2) ===
+//   Value advertised in PID_DATA_REPRESENTATION to negotiate CDR wire format
+//   between matching endpoints. ROS 2 Jazzy (Fast DDS 3.x) requires readers
+//   and writers to agree on a representation; absence of PID_DATA_REPRESENTATION
+//   on a writer has been observed to cause Fast CDR deserialization failures
+//   on `@appendable` types (ROS 2 IDL default).
+static const int16_t DATA_REPRESENTATION_XCDR1  = 0;
+static const int16_t DATA_REPRESENTATION_XML    = 1;
+static const int16_t DATA_REPRESENTATION_XCDR2  = 2;
 
 // === Port Calculation (DDSI-RTPS §9.6.1) ===
 static const uint16_t RTPS_PB = 7400;

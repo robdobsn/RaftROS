@@ -11,5 +11,5 @@ extern "C" {
     char* ftoa(float value, int width, unsigned int precision, char* result);
     char* lltoa(long long value, char* result, int base);
     char* ulltoa(unsigned long long value, char* result, int base);
-    size_t strlcat(char *dst, const char *src, size_t siz);
+    size_t strlcat(char *dst, const char *src, size_t siz) noexcept;
 }

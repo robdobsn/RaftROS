@@ -272,6 +272,16 @@ void RaftROS::loop()
             LOG_I(MODULE_PREFIX, "health periodic discoveredCount=%u state=%d",
                   (unsigned)_discovered.size(), (int)_connState);
 #endif
+            // Auto-publish diagnostic: always emit (not gated on DEBUG) so we
+            // can see registry occupancy + ros_discovery_info seq across time
+            // even on release builds while investigating the graph-visibility
+            // regression.
+            LOG_I(MODULE_PREFIX,
+                  "autoPubStatus slots=%u/%u discovered=%u rosDiscSeq=%u state=%d",
+                  (unsigned)_autoPubLifecycle.inUseCount(),
+                  (unsigned)RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY,
+                  (unsigned)_discovered.size(),
+                  (unsigned)_rosDiscSeqNum, (int)_connState);
             _lastDiscoveredHealthLogMs = now;
         }
         break;
@@ -473,6 +483,39 @@ void RaftROS::recvSPDP()
 void RaftROS::processDiscoveredParticipant(DiscoveredParticipant& remote, const struct sockaddr_in& fromAddr)
 {
     uint32_t nowMs = millis();
+
+    // Override parsed locator when it isn't reachable from us. Hosts that sit
+    // on multiple interfaces (very common with WSL2 / Docker / Windows with
+    // Hyper-V) advertise every local IP in their SPDP ParticipantProxyData —
+    // including 169.254.x.x APIPA addresses from disabled virtual adapters.
+    // If we pick one of those, sendto() fails with -1 (no route to host) and
+    // SEDP never reaches the peer. The canonical RTPS fallback is the UDP
+    // source address of the packet itself, which by definition is reachable
+    // because we just received from it.
+    {
+        const uint32_t parsed = remote.ipAddr;           // network order
+        const uint32_t parsedHostOrder = ntohl(parsed);
+        const bool parsedIsLinkLocal = (parsedHostOrder & 0xFFFF0000u) == 0xA9FE0000u; // 169.254/16
+        const bool parsedIsLoopback  = (parsedHostOrder & 0xFF000000u) == 0x7F000000u; // 127/8
+        const bool parsedIsZero      = (parsed == 0);
+        if ((parsedIsLinkLocal || parsedIsLoopback || parsedIsZero) &&
+            fromAddr.sin_addr.s_addr != 0)
+        {
+            // Throttle: only log when the (parsed, sender) pair changes, so
+            // ordinary steady-state SPDP re-announces don't spam the log.
+            static uint32_t sLastParsed = 0;
+            static uint32_t sLastSender = 0;
+            if (parsed != sLastParsed || fromAddr.sin_addr.s_addr != sLastSender)
+            {
+                LOG_I(MODULE_PREFIX,
+                      "overriding unreachable SPDP locator %08x with senderIp %s",
+                      (unsigned)parsed, inet_ntoa(fromAddr.sin_addr));
+                sLastParsed = parsed;
+                sLastSender = fromAddr.sin_addr.s_addr;
+            }
+            remote.ipAddr = fromAddr.sin_addr.s_addr;
+        }
+    }
 
 #ifdef DEBUG_DISCOVERY
     // Format IP strings before logging (inet_ntoa uses static buffer)
@@ -1111,6 +1154,12 @@ void RaftROS::stepWriterHeartbeatPass()
                         rosDiscPayload, sizeof(rosDiscPayload));
                     if (rosDiscLen == 0)
                         return 0;
+                    LOG_I(MODULE_PREFIX,
+                          "rosDiscInfoHB seq=%u peerGuidPfx=%02x%02x%02x%02x payloadLen=%u",
+                          (unsigned)sequenceNumber,
+                          remoteRef.guidPrefix[0], remoteRef.guidPrefix[1],
+                          remoteRef.guidPrefix[2], remoteRef.guidPrefix[3],
+                          (unsigned)rosDiscLen);
                     return self->_sedpHandler.buildUserDataMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
@@ -1243,6 +1292,20 @@ void RaftROS::stepWriterHeartbeatPass()
 
 void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const struct sockaddr_in& senderAddr)
 {
+    // Auto-publish diagnostic: every new peer attempt logged at INFO so we
+    // can correlate peer arrival with autopub SEDP announce firings.
+    {
+        char senderIpStr[16] = {0};
+        strncpy(senderIpStr, inet_ntoa(senderAddr.sin_addr), sizeof(senderIpStr) - 1);
+        LOG_I(MODULE_PREFIX,
+              "handleNewParticipant NEW peer guidPfx=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x metaPort=%u userPort=%u senderIp=%s autoPubSlotsInUse=%u",
+              remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
+              remote.guidPrefix[4], remote.guidPrefix[5], remote.guidPrefix[6], remote.guidPrefix[7],
+              remote.guidPrefix[8], remote.guidPrefix[9], remote.guidPrefix[10], remote.guidPrefix[11],
+              (unsigned)remote.metatrafficPort, (unsigned)remote.userDataPort, senderIpStr,
+              (unsigned)_autoPubLifecycle.inUseCount());
+    }
+
     if (_pendingAnnounces.size() >= MAX_PENDING_ANNOUNCES)
     {
         LOG_W(MODULE_PREFIX, "handleNewParticipant pending-announce queue FULL (%u) - dropping burst for %02X%02X%02X%02X...",
@@ -1566,9 +1629,10 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
     // that autopub writers are being announced to every discovered peer (this
     // firing is prerequisite to the host's rmw seeing a matched publisher).
     LOG_I(MODULE_PREFIX,
-          "autoPubSEDP slot=%u topic=%s type=%s seq=%u sent %d/%u peerIP=%08x port=%d",
+          "autoPubSEDP slot=%u topic=%s type=%s seq=%u sent %d/%u peerGuidPfx=%02x%02x%02x%02x peerIP=%08x port=%d",
           (unsigned)slot, pEntry->topic, pEntry->type,
           (unsigned)thisSeq, sent, (unsigned)payloadLen,
+          remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
           (unsigned)remote.ipAddr, (int)remote.metatrafficPort);
     return payloadLen > 0;
 }
@@ -1603,13 +1667,23 @@ uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
     const uint32_t numReaderIds = _subscriptionRegistry.readerEntityIds(
         readerIds, RTPS_SUBSCRIPTION_REGISTRY_CAPACITY);
 
-    return SPDPHandler::buildRosDiscoveryInfoPayload(
+    const uint32_t payloadLen = SPDPHandler::buildRosDiscoveryInfoPayload(
         pBuf, bufLen,
         _participant.getParticipantGuid(),
         _nodeName.c_str(),
         _nodeNamespace.c_str(),
         writerIds, numWriterIds,
         readerIds, numReaderIds);
+
+    // Auto-publish diagnostic: log the writer-GID list whenever the
+    // ros_discovery_info payload is (re)built.  A writer not appearing here
+    // is invisible to `ros2 topic info` / graph queries even if its SEDP
+    // announce is accepted.
+    LOG_I(MODULE_PREFIX,
+          "buildRosDiscInfo seq=%u writerGids=%u readerGids=%u payloadLen=%u (chatter+autopub slots)",
+          (unsigned)_rosDiscSeqNum, (unsigned)numWriterIds, (unsigned)numReaderIds,
+          (unsigned)payloadLen);
+    return payloadLen;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1680,17 +1754,24 @@ void RaftROS::publishChatter()
             dest.sin_addr.s_addr = remote.ipAddr;
             int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
                               (struct sockaddr*)&dest, sizeof(dest));
-#ifdef DEBUG_PUBLISH_CHATTER
-            char destIpStr[16];
-            strncpy(destIpStr, inet_ntoa(*(struct in_addr*)&remote.ipAddr), sizeof(destIpStr));
-            destIpStr[sizeof(destIpStr)-1] = '\0';
-            LOG_I(MODULE_PREFIX, "publishChatter seq=%llu \"%s\" sent %d/%d to %s:%d (discCount=%u)",
-                  (unsigned long long)_chatterSeqNum, msgStr, sent, (int)msgLen,
-                  destIpStr, (int)remote.userDataPort,
-                  (unsigned)_discovered.size());
-#else
-            (void)sent;
-#endif
+            // Always-on diagnostic (formerly DEBUG_PUBLISH_CHATTER-gated) so
+            // we can see on-device whether chatter is being emitted per tick
+            // even in the current graph-visibility investigation.
+            {
+                char destIpStr[16];
+                strncpy(destIpStr, inet_ntoa(*(struct in_addr*)&remote.ipAddr), sizeof(destIpStr));
+                destIpStr[sizeof(destIpStr)-1] = '\0';
+                if ((_chatterSeqNum % 5) == 1)
+                {
+                    LOG_I(MODULE_PREFIX,
+                          "publishChatter seq=%llu sent %d/%d to %s:%d peerGuidPfx=%02x%02x%02x%02x (discCount=%u)",
+                          (unsigned long long)_chatterSeqNum, sent, (int)msgLen,
+                          destIpStr, (int)remote.userDataPort,
+                          remote.guidPrefix[0], remote.guidPrefix[1],
+                          remote.guidPrefix[2], remote.guidPrefix[3],
+                          (unsigned)_discovered.size());
+                }
+            }
         }
     }
 }
@@ -1763,6 +1844,16 @@ static_assert((uint8_t)RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubAttrType:
 
 void RaftROS::autoPubOnDeviceStatusChange(RaftDevice& device, const BusAddrStatus& addrStatus)
 {
+    // Auto-publish diagnostic: log every callback fire so we can tell whether
+    // DeviceManager is calling us at all and with what flags.
+    LOG_I(MODULE_PREFIX,
+          "autoPubStatusCb devID=%s typeIdx=%u online=%d isChange=%d isNewlyId=%d",
+          device.getDeviceID().toString().c_str(),
+          (unsigned)addrStatus.deviceTypeIndex,
+          (int)addrStatus.onlineState,
+          (int)addrStatus.isChange,
+          (int)addrStatus.isNewlyIdentified);
+
     // Act on either an online/offline transition (isChange) or on the
     // first-identification event for an already-online device
     // (isNewlyIdentified).  I2C devices are reported ONLINE as soon as
