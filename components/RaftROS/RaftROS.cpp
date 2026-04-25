@@ -614,7 +614,7 @@ void RaftROS::recvMetatraffic()
     rxCtx.base.discovered = &_discovered;
     rxCtx.base.ackSendSock = _metatrafficSock;
     rxCtx.base.readerPolicy = RTPSRxAdapterReaderPolicy::BuiltinEndpointMap;
-    rxCtx.base.ackDestPolicy = RTPSRxAdapterAckDestPolicy::ReplyToSender;
+    rxCtx.base.ackDestPolicy = RTPSRxAdapterAckDestPolicy::RouteToDiscoveredMetatraffic;
 
     RTPSRxSubmessageRunnerCallbacks callbacks;
     RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
@@ -713,6 +713,94 @@ void RaftROS::recvMetatraffic()
 #endif
                     break;
                 }
+            }
+        }
+        else if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
+        {
+            // SEDP subscription announce from remote.  We extract the per-reader
+            // PID_UNICAST_LOCATOR for the remote `ros_discovery_info` reader and
+            // record its port on the matching DiscoveredParticipant.
+            //
+            // Why: rmw_fastrtps creates the rdi subscription with
+            // `require_unique_network_flow_endpoints = OPTIONALLY_REQUIRED`.
+            // FastDDS honors that by binding the rdi reader to its OWN UDP socket,
+            // distinct from the participant default user-data port. If we send
+            // rdi DATA to the default user-data port (RTPS port formula), the
+            // payload is silently discarded at the UDP demuxer because no reader
+            // is bound there. Result: rdi writer is reported by the host's
+            // graph cache as `_NODE_NAME_UNKNOWN_` even though SEDP matched.
+            if (contentLen < 24)
+                return;
+            const uint8_t* pPayload = nullptr;
+            uint32_t payloadLen = 0;
+            RTPSData_getSerializedPayload(pContent, contentLen, dataFlags, pPayload, payloadLen);
+            if (!pPayload || payloadLen < 4)
+                return;
+            RaftRuntime::RTPS::Runtime::Dispatch::RTPSParsedSubscriptionAnnounce parsedSub;
+            if (!RaftRuntime::RTPS::Runtime::Dispatch::RTPSSEDPSubscriptionParser_parse(
+                    pPayload, payloadLen, parsedSub))
+                return;
+            // Filter on topic name == "ros_discovery_info" (the rdi reader is
+            // the only one for which a per-reader port matters; other readers
+            // share the participant default user-data port).
+            static constexpr const char* RDI_TOPIC = "ros_discovery_info";
+            static constexpr uint32_t RDI_TOPIC_LEN = 18;
+            if (!parsedSub.topic ||
+                parsedSub.topicLen != RDI_TOPIC_LEN ||
+                memcmp(parsedSub.topic, RDI_TOPIC, RDI_TOPIC_LEN) != 0)
+                return;
+            if (parsedSub.unicastLocatorPort == 0)
+                return;
+            // Locate the matching DiscoveredParticipant by readerGuid prefix
+            // (first 12 bytes of the reader GUID == participant guidPrefix).
+            //
+            // Fix #9: WiFi/IGMP snooping can cause SPDP multicast from new
+            // participants to never reach the ESP (group membership expiry on the
+            // AP). In that case the participant is absent from _discovered even
+            // though it has already started sending SEDP directly to ESP:7410
+            // (because it DID receive the ESP's own SPDP multicast and learned
+            // our metatraffic unicast locator). We use the SEDP subscription
+            // announcement itself as a discovery signal: extract guidPrefix from
+            // the RTPS packet header and ipAddr from the UDP source, and insert a
+            // *partial* DiscoveredParticipant (metatrafficPort = 0, userDataPort =
+            // 0) so that the HB pass can route rdi DATA to rdiReaderUnicastPort.
+            // SEDP sends to the partial entry fail silently (port 0); they are
+            // harmless and will be replaced once a full SPDP exchange completes.
+            const uint8_t* senderGuidPfx =
+                (parsedSub.hasReaderGuid) ? parsedSub.readerGuid : (packet + 8);
+            bool foundInDiscovered = false;
+            for (auto& dp : self->_discovered)
+            {
+                if (memcmp(dp.guidPrefix, senderGuidPfx, 12) == 0)
+                {
+                    foundInDiscovered = true;
+                    if (dp.rdiReaderUnicastPort != parsedSub.unicastLocatorPort)
+                    {
+                        LOG_I(MODULE_PREFIX,
+                              "SEDP rdi reader port for participant %02x%02x%02x%02x: %u (was %u)",
+                              dp.guidPrefix[0], dp.guidPrefix[1], dp.guidPrefix[2], dp.guidPrefix[3],
+                              (unsigned)parsedSub.unicastLocatorPort,
+                              (unsigned)dp.rdiReaderUnicastPort);
+                        dp.rdiReaderUnicastPort = parsedSub.unicastLocatorPort;
+                    }
+                    break;
+                }
+            }
+            if (!foundInDiscovered)
+            {
+                // Participant not yet in _discovered (missed SPDP multicast).
+                // Create a partial entry so rdi DATA reaches this rdi reader.
+                DiscoveredParticipant partial = {};
+                memcpy(partial.guidPrefix, senderGuidPfx, 12);
+                partial.ipAddr               = from.sin_addr.s_addr;
+                partial.rdiReaderUnicastPort = parsedSub.unicastLocatorPort;
+                // leaseDurationSec = 0 → uses DEFAULT_LEASE_TIMEOUT_MS (240 s)
+                LOG_I(MODULE_PREFIX,
+                      "SEDP rdi partial-disc guidPfx=%02x%02x%02x%02x rdiPort=%u",
+                      partial.guidPrefix[0], partial.guidPrefix[1],
+                      partial.guidPrefix[2], partial.guidPrefix[3],
+                      (unsigned)parsedSub.unicastLocatorPort);
+                self->processDiscoveredParticipant(partial, from);
             }
         }
         else
@@ -1211,7 +1299,19 @@ void RaftROS::stepWriterHeartbeatPass()
             else
             {
                 sock = self->_userDataSock;
-                dest.sin_port = htons(remoteRef.userDataPort);
+                // The only UserData send within the builtin writer-HB pass is
+                // RosDiscoveryInfoData. The host's rdi reader is created with
+                // OPTIONALLY_REQUIRED unique flow endpoints and therefore
+                // listens on its own UDP port (advertised in SEDP DATA(r) via
+                // PID_UNICAST_LOCATOR — see recvMetatraffic), distinct from
+                // `userDataPort`. If we know that port, use it; otherwise fall
+                // back to the participant default (which works for hosts that
+                // didn't request a unique flow endpoint).
+                const uint16_t rdiPort =
+                    remoteRef.rdiReaderUnicastPort != 0
+                        ? remoteRef.rdiReaderUnicastPort
+                        : remoteRef.userDataPort;
+                dest.sin_port = htons(rdiPort);
             }
             return sendto(sock, self->_sendBuf, payloadLen, 0,
                           (struct sockaddr*)&dest, sizeof(dest));

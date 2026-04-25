@@ -180,7 +180,20 @@ void RTPSRunnerAdapter_executeAckAction(
     if (execSpec->sendChannel == RTPSAckNackRunnerSendChannel::UserData)
     {
         sendSock = adapterCtx.userDataSock;
-        dest.sin_port = htons(remote->userDataPort);
+        // For RetransmitRosDiscoveryInfo specifically, the host's rdi reader
+        // listens on a UNIQUE per-reader UDP port (advertised in SEDP DATA(r)
+        // PID_UNICAST_LOCATOR; recorded into DiscoveredParticipant.rdiReaderUnicastPort).
+        // Sending to the participant default user-data port causes the sample
+        // to be silently discarded — the readerproxy never delivers DATA, the
+        // host never advances bitmapBase, and the writer is reported as
+        // `_NODE_NAME_UNKNOWN_` by `ros2 topic info`.
+        uint16_t destPort = remote->userDataPort;
+        if (action == RTPSAckNackRunnerAction::RetransmitRosDiscoveryInfo &&
+            remote->rdiReaderUnicastPort != 0)
+        {
+            destPort = remote->rdiReaderUnicastPort;
+        }
+        dest.sin_port = htons(destPort);
     }
     else
     {
