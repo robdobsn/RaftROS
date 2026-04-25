@@ -1252,6 +1252,65 @@ int main()
     }
 
     //=================================================================
+    // NACK bitmap wire encoding — LSB-internal to MSB-first wire
+    // RTPS §9.4.2.7: bit i (SN bitmapBase+i) maps to bit (31 - i%32) of
+    // bitmapWords[i/32], i.e. SN bitmapBase = MSB (0x80000000) of word 0.
+    //=================================================================
+    {
+        printf("Test: RTPSRxSubmessageRunner NACK bitmap wire encoding\n");
+
+        // Directly verify the bit-reversal by exercising evaluateIncomingHeartbeatDecision
+        // (builds internal bitmap) then checking that after bit-reversal the expected
+        // wire words come out correctly.
+        //
+        // Setup: reader has received nothing (highestContiguousSeq=0).
+        // HB says firstSN=1, lastSN=3.  Reader should NACK SNs 1,2,3.
+        // Internal bitmap (LSB-first): bits 0,1,2 set → 0x7 → 0x00000007
+        // Wire (MSB-first): bits 0,1,2 → bit31,30,29 of word0 → 0xE0000000
+
+        using namespace RaftRuntime::RTPS::Runtime::Reader;
+
+        RTPSReaderWriterState state;
+        state.reliabilityKind = RTPSReaderReliabilityKind::Reliable;
+
+        RTPSReaderHeartbeatFields hb;
+        hb.firstSN = 1;
+        hb.lastSN  = 3;
+        hb.count   = 1;
+        hb.finalFlag = false;
+        hb.livelinessFlag = false;
+
+        auto decision = evaluateIncomingHeartbeatDecision(state, hb);
+        TEST_ASSERT(decision.sendAckNack, "NACK bitmap: sendAckNack true");
+        TEST_ASSERT(decision.ackNackBase == 1, "NACK bitmap: ackNackBase == 1");
+        TEST_ASSERT(decision.ackNackNumBits == 3, "NACK bitmap: numBits == 3");
+        TEST_ASSERT(decision.ackNackBitmap == 0x7u,
+                    "NACK bitmap: internal bitmap == 0x7 (bits 0,1,2)");
+
+        // Simulate the bit-reversal that emitReaderRunnerAckNack applies.
+        auto bitrev32 = [](uint32_t x) -> uint32_t {
+            x = ((x >>  1) & 0x55555555u) | ((x <<  1) & 0xAAAAAAAAu);
+            x = ((x >>  2) & 0x33333333u) | ((x <<  2) & 0xCCCCCCCCu);
+            x = ((x >>  4) & 0x0F0F0F0Fu) | ((x <<  4) & 0xF0F0F0F0u);
+            x = ((x >>  8) & 0x00FF00FFu) | ((x <<  8) & 0xFF00FF00u);
+            x = ( x >> 16              ) | ( x << 16              );
+            return x;
+        };
+        uint32_t wireWord0 = bitrev32((uint32_t)(decision.ackNackBitmap & 0xFFFFFFFFu));
+        TEST_ASSERT(wireWord0 == 0xE0000000u,
+                    "NACK bitmap: wire word0 == 0xE0000000 (MSB-first, SNs 1,2,3)");
+
+        // Also verify single-SN case: NACK only SN 1 → bitmapWords[0] = 0x80000000
+        RTPSReaderHeartbeatFields hb1;
+        hb1.firstSN = 1; hb1.lastSN = 1; hb1.count = 2;
+        hb1.finalFlag = false; hb1.livelinessFlag = false;
+        auto d1 = evaluateIncomingHeartbeatDecision(state, hb1);
+        TEST_ASSERT(d1.ackNackBitmap == 0x1u, "NACK bitmap: single-SN internal bitmap == 1");
+        TEST_ASSERT(bitrev32((uint32_t)d1.ackNackBitmap) == 0x80000000u,
+                    "NACK bitmap: single-SN wire word0 == 0x80000000");
+    }
+
+    //=================================================================
     // RTPSInitialAnnouncePlan - ChatterReader SEDP subscription announce
     //=================================================================
     {

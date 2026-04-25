@@ -22,6 +22,15 @@ struct DiscoveredParticipant
     uint32_t ipAddr = 0;           // Network byte order
     uint16_t metatrafficPort = 0;
     uint16_t userDataPort = 0;
+    // Unicast port advertised by the remote participant's `ros_discovery_info`
+    // reader in its SEDP DATA(r) PID_UNICAST_LOCATOR. rmw_fastrtps creates
+    // the rdi reader with `require_unique_network_flow_endpoints = OPTIONALLY_REQUIRED`
+    // so the reader is bound to its own UDP socket DISTINCT from the
+    // participant default user-data port. When non-zero, our rdi DATA + HB
+    // sends MUST use this port instead of `userDataPort`, otherwise the
+    // sample never reaches the rdi reader and the writer is reported as
+    // `_NODE_NAME_UNKNOWN_` by `ros2 topic info`.
+    uint16_t rdiReaderUnicastPort = 0;
     uint32_t leaseDurationSec = 0;
     uint64_t discoveredTimeMs = 0;
     bool valid = false;

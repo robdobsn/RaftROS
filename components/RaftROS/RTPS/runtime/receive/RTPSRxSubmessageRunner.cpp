@@ -40,13 +40,29 @@ int emitReaderRunnerAckNack(
     pos += RTPSMessage::writeInfoDST(
         ackBuf + pos, sizeof(ackBuf) - pos, srcGuidPrefix);
 
-    // Pack the decision's bitmap (uint64_t) into up to two LE32 words.
-    // decision.ackNackNumBits is already capped at the reader runtime MAX_BITMAP_BITS (<=64).
+    // Pack the decision's bitmap (uint64_t) into up to two LE32 wire words.
+    //
+    // INTERNAL representation (RTPSReaderRuntime): bit i of ackNackBitmap (LSB-first,
+    //   i.e. bit 0 = 1<<0) represents SN (ackNackBase + i).
+    //
+    // RTPS WIRE encoding (§9.4.2.7): bit i maps to bit (31 - i%32) of word (i/32),
+    //   i.e. SN ackNackBase is the MSB of bitmapWords[0].  FastDDS serialises this as:
+    //     bitmapWords[j] |= (1u << (31 - i%32))  for each set bit i in word j.
+    //
+    // Translation: reverse the bit order within each 32-bit chunk before writing.
+    auto bitrev32 = [](uint32_t x) -> uint32_t {
+        x = ((x >>  1) & 0x55555555u) | ((x <<  1) & 0xAAAAAAAAu);
+        x = ((x >>  2) & 0x33333333u) | ((x <<  2) & 0xCCCCCCCCu);
+        x = ((x >>  4) & 0x0F0F0F0Fu) | ((x <<  4) & 0xF0F0F0F0u);
+        x = ((x >>  8) & 0x00FF00FFu) | ((x <<  8) & 0xFF00FF00u);
+        x = ( x >> 16              ) | ( x << 16              );
+        return x;
+    };
     uint32_t bitmapWords[2] = { 0u, 0u };
     if (decision.ackNackNumBits > 0)
     {
-        bitmapWords[0] = (uint32_t)(decision.ackNackBitmap & 0xFFFFFFFFu);
-        bitmapWords[1] = (uint32_t)((decision.ackNackBitmap >> 32) & 0xFFFFFFFFu);
+        bitmapWords[0] = bitrev32((uint32_t)(decision.ackNackBitmap & 0xFFFFFFFFu));
+        bitmapWords[1] = bitrev32((uint32_t)((decision.ackNackBitmap >> 32) & 0xFFFFFFFFu));
     }
 
     acknackCountOut = decision.ackNackCount;

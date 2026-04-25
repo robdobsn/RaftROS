@@ -19,6 +19,7 @@
 #include "runtime/dispatch/RTPSSubscriptionRegistry.h"
 #include "runtime/dispatch/RTPSRemotePublicationMap.h"
 #include "runtime/dispatch/RTPSSEDPPublicationParser.h"
+#include "runtime/dispatch/RTPSSEDPSubscriptionParser.h"
 #include "runtime/autopub/RTPSAutoPubLifecycle.h"
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubQoSProfile.h"
