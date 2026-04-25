@@ -533,15 +533,24 @@ int main()
         TEST_ASSERT(chatterPlan.firstSN == chatterPlan.sequenceNumber,
                     "Chatter plan firstSN == sequenceNumber (VOLATILE invariant)");
 
-        // ros_discovery_info is TRANSIENT_LOCAL: firstSN override must NOT be set
+        // ros_discovery_info: writer keeps only the LATEST sample (rebuilt
+        // from current state on every emission).  firstSN==lastSN==current is
+        // the only safe HEARTBEAT range -- a reader that joins after seq is
+        // bumped would otherwise NACK historic SNs that we no longer hold,
+        // never reaching the GraphCache update.  Plan must also request the
+        // participant key hash on retransmits (keyed builtin topic).
         RTPSAckActionUserDataPlan rosDiscPlan = {};
         TEST_ASSERT(getAckActionUserDataPlan(
                         RTPSAckNackDecisionAction::RetransmitRosDiscoveryInfo,
                         espUserCtx,
                         rosDiscPlan),
                     "ros_discovery_info retransmit plan produced");
-        TEST_ASSERT(!rosDiscPlan.hasFirstSNOverride,
-                    "ros_discovery_info plan does not override firstSN (TRANSIENT_LOCAL)");
+        TEST_ASSERT(rosDiscPlan.hasFirstSNOverride,
+                    "ros_discovery_info plan overrides firstSN (writer holds only latest sample)");
+        TEST_ASSERT(rosDiscPlan.firstSN == rosDiscPlan.sequenceNumber,
+                    "ros_discovery_info plan firstSN == sequenceNumber");
+        TEST_ASSERT(rosDiscPlan.useParticipantKeyHash,
+                    "ros_discovery_info plan requests participant key hash on retransmits");
         TEST_ASSERT(rosDiscPlan.sequenceNumber == 7,
                     "ros_discovery_info plan sequenceNumber == rosDiscoveryInfoSeqNum");
     }

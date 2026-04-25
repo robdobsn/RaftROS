@@ -378,8 +378,18 @@ bool getAckActionUserDataPlan(
         case RTPSAckNackDecisionAction::RetransmitRosDiscoveryInfo:
             outPlan.writerEntityId = ENTITYID_ROS_DISC_INFO_WRITER;
             outPlan.sequenceNumber = sequenceContext.rosDiscoveryInfoSeqNum;
-            outPlan.hasFirstSNOverride = false;
-            outPlan.firstSN = 1;
+            // Writer keeps only the latest rdi sample (rebuilt from current
+            // state on every emission).  firstSN==lastSN==current is the only
+            // safe HEARTBEAT range -- otherwise a reader that joins after we
+            // have bumped the seq number will NACK historic SNs that we no
+            // longer hold and will never reach the GraphCache update.
+            outPlan.hasFirstSNOverride = true;
+            outPlan.firstSN = sequenceContext.rosDiscoveryInfoSeqNum;
+            // ros_discovery_info is a keyed builtin topic; reliable readers
+            // (rmw_dds_common) drop samples that arrive without an inline-QoS
+            // PID_KEY_HASH.  The periodic HB path already supplies the key
+            // hash; mirror that here so retransmits aren't silently rejected.
+            outPlan.useParticipantKeyHash = true;
             return true;
 
         case RTPSAckNackDecisionAction::RetransmitChatterData:
