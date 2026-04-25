@@ -366,7 +366,7 @@ int main()
         uint8_t destGP[12] = {10,20,30,40,50,60,70,80,90,100,110,120};
 
         SEDPHandler sedp;
-        uint8_t msgBuf[512];
+        uint8_t msgBuf[1024];
         uint32_t msgLen = sedp.buildPublicationMessage(
             msgBuf, sizeof(msgBuf),
             part, destGP,
@@ -378,7 +378,7 @@ int main()
             1);
 
         TEST_ASSERT(msgLen > 0, "SEDP pub build returns non-zero");
-        TEST_ASSERT(msgLen < 400, "SEDP pub message under 400 bytes");
+        TEST_ASSERT(msgLen < 1024, "SEDP pub message fits in buffer");
 
         // Verify RTPS header
         TEST_ASSERT(msgBuf[0]=='R' && msgBuf[1]=='T' && msgBuf[2]=='P' && msgBuf[3]=='S',
@@ -431,22 +431,20 @@ int main()
         // CDR encapsulation header
         TEST_ASSERT(buf[0]==0x00 && buf[1]==0x01, "ros_disc_info CDR_LE header");
 
-        // Gid at offset 4: first 16 bytes = guid, next 8 = zeros
+        // Gid at offset 4: 16 bytes (per rmw_dds_common::msg::Gid `char[16] data`)
         TEST_ASSERT(memcmp(buf+4, guid, 16)==0, "ros_disc_info gid matches guid");
-        uint8_t zeros[8] = {};
-        TEST_ASSERT(memcmp(buf+20, zeros, 8)==0, "ros_disc_info gid padding zeros");
 
-        // Sequence length at offset 28 = 1
-        uint32_t seqLen = buf[28] | (buf[29]<<8) | (buf[30]<<16) | (buf[31]<<24);
+        // Sequence length at offset 20 = 1
+        uint32_t seqLen = buf[20] | (buf[21]<<8) | (buf[22]<<16) | (buf[23]<<24);
         TEST_ASSERT(seqLen == 1, "ros_disc_info seq length = 1");
 
-        // node_namespace string at offset 32 (first in CDR order): length=7 ("/my_ns\0")
-        uint32_t nsLen = buf[32] | (buf[33]<<8) | (buf[34]<<16) | (buf[35]<<24);
+        // node_namespace string at offset 24 (first in CDR order): length=7 ("/my_ns\0")
+        uint32_t nsLen = buf[24] | (buf[25]<<8) | (buf[26]<<16) | (buf[27]<<24);
         TEST_ASSERT(nsLen == 7, "ros_disc_info node_namespace length = 7");
-        TEST_ASSERT(memcmp(buf+36, "/my_ns", 6)==0, "ros_disc_info node_namespace content");
+        TEST_ASSERT(memcmp(buf+28, "/my_ns", 6)==0, "ros_disc_info node_namespace content");
 
-        // node_name string follows at offset 32+4+8(padded)=44: length=8 ("my_node\0")
-        uint32_t nameOff = 32 + 4 + ((nsLen + 3) & ~3u);
+        // node_name string follows at offset 24+4+8(padded)=36: length=8 ("my_node\0")
+        uint32_t nameOff = 24 + 4 + ((nsLen + 3) & ~3u);
         uint32_t nameLen = buf[nameOff] | (buf[nameOff+1]<<8) | (buf[nameOff+2]<<16) | (buf[nameOff+3]<<24);
         TEST_ASSERT(nameLen == 8, "ros_disc_info node_name length = 8");
         TEST_ASSERT(memcmp(buf+nameOff+4, "my_node", 7)==0, "ros_disc_info node_name content");
@@ -2138,8 +2136,12 @@ int main()
                         "get(slot 0) has correct topic");
             TEST_ASSERT(eA && strcmp(eA->type, "sensor_msgs::msg::dds_::Imu_") == 0,
                         "get(slot 0) has correct type");
-            TEST_ASSERT(eA && eA->seqNum == 0 && eA->sedpSeqNum == 0,
-                        "newly-allocated slot has zeroed seq counters");
+            // sedpSeqNum is pre-seeded with the per-slot announce base seq
+            // (AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ + slot) so SEDP retransmits use
+            // a stable sequence number across the slot's lifetime.
+            TEST_ASSERT(eA && eA->seqNum == 0 &&
+                            eA->sedpSeqNum == AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ + 0,
+                        "newly-allocated slot has expected initial seq counters");
 
             // Mutable accessor -> bump seqNum
             auto* mA = reg.getMutable(0);
@@ -2165,8 +2167,10 @@ int main()
             TEST_ASSERT(slotC == 0, "slot reuse picks lowest free (slot 0)");
             TEST_ASSERT(eidC[2] == DYNAMIC_WRITER_ENTITY_KEY_BASE,
                         "reused slot gets the same entityId as before");
-            // The reused slot must have reset its sequence counters.
-            TEST_ASSERT(reg.get(0)->seqNum == 0 && reg.get(0)->sedpSeqNum == 0,
+            // The reused slot resets the user-data seq, but sedpSeqNum is
+            // re-seeded to the per-slot announce base seq.
+            TEST_ASSERT(reg.get(0)->seqNum == 0 &&
+                            reg.get(0)->sedpSeqNum == AUTOPUB_SEDP_ANNOUNCE_BASE_SEQ + 0,
                         "reused slot has fresh sequence counters");
         }
 

@@ -1160,12 +1160,17 @@ void RaftROS::stepWriterHeartbeatPass()
                           remoteRef.guidPrefix[0], remoteRef.guidPrefix[1],
                           remoteRef.guidPrefix[2], remoteRef.guidPrefix[3],
                           (unsigned)rosDiscLen);
+                    // Advertise only the current sample as available
+                    // (firstSN == lastSN == sequenceNumber).  This lets us
+                    // bump _rosDiscSeqNum on autopub attach/detach without
+                    // leaving a sequence gap that the peer would NACK for.
                     return self->_sedpHandler.buildUserDataMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
                         ENTITYID_ROS_DISC_INFO_WRITER,
                         rosDiscPayload, rosDiscLen,
-                        sequenceNumber, heartbeatCount);
+                        sequenceNumber, heartbeatCount,
+                        /*firstSN=*/sequenceNumber);
                 }
                 default:
                     return 0;
@@ -2274,6 +2279,18 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
             (void)emitAutoPubSedpAnnounce(remote, pCtx->secondarySlot);
     }
 
+    // Bump the ros_discovery_info sequence number so the next user-data HB
+    // delivers an updated ParticipantEntitiesInfo sample that includes the
+    // newly-allocated writer GID(s) in writer_gid_seq.  Without this bump,
+    // the peer keeps the cached old sample and `ros2 topic info` reports
+    // "Publisher count: 0" for the autopub topic even though SEDP discovery
+    // and data delivery both work.
+    _rosDiscSeqNum++;
+    LOG_I(MODULE_PREFIX,
+          "autoPubAttach bumped rosDiscSeqNum=%u (slot=%d secSlot=%d)",
+          (unsigned)_rosDiscSeqNum, slot,
+          (int)pCtx->secondarySlot);
+
     return true;
 }
 
@@ -2350,10 +2367,16 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     _autoPubLifecycle.detachSlot(slot);
     if (pCtx && pCtx->secondarySlot != 0xFF)
         _autoPubLifecycle.detachSlot(pCtx->secondarySlot);
-    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u",
+
+    // Bump ros_discovery_info seq so peers receive an updated
+    // ParticipantEntitiesInfo sample with the disposed writer GID removed
+    // from writer_gid_seq.  Mirrors the bump done on attach.
+    _rosDiscSeqNum++;
+    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u rosDiscSeqNum=%u",
           devID.toString().c_str(), slot,
           pCtx ? (int)pCtx->secondarySlot : -1,
-          pCtx ? (unsigned)pCtx->sampleCount : 0u);
+          pCtx ? (unsigned)pCtx->sampleCount : 0u,
+          (unsigned)_rosDiscSeqNum);
     delete pCtx;
 }
 

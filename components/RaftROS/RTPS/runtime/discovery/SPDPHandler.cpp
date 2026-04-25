@@ -334,13 +334,17 @@ uint32_t SPDPHandler::buildRosDiscoveryInfoPayload(
     if (!pBuf || !participantGuid || !nodeName || !nodeNamespace)
         return 0;
 
-    // Estimate: 4 encaps + 24 gid + 4 seq + (4+name+pad) + (4+ns+pad) + 4+24*nR + 4+24*nW
+    // rmw_dds_common::msg::Gid is `char[16] data` — a 16-byte fixed array.
+    // Earlier (incorrect) revisions emitted 24 bytes per Gid here which
+    // misaligned every subsequent field and caused rmw_fastrtps to silently
+    // drop our ros_discovery_info samples (so `ros2 topic info` reported
+    // _NODE_NAME_UNKNOWN_ for any auto-pub writer we announced).
     uint32_t nameLen = (uint32_t)strlen(nodeName) + 1;
     uint32_t nsLen = (uint32_t)strlen(nodeNamespace) + 1;
-    uint32_t estimate = 4 + 24 + 4 + (4 + ((nameLen + 3) & ~3u)) +
+    uint32_t estimate = 4 + 16 + 4 + (4 + ((nameLen + 3) & ~3u)) +
                          (4 + ((nsLen + 3) & ~3u)) +
-                         4 + 24 * numReaderEntityIds +
-                         4 + 24 * numWriterEntityIds;
+                         4 + 16 * numReaderEntityIds +
+                         4 + 16 * numWriterEntityIds;
     if (bufLen < estimate)
         return 0;
 
@@ -352,11 +356,9 @@ uint32_t SPDPHandler::buildRosDiscoveryInfoPayload(
     pBuf[pos++] = 0x00;
     pBuf[pos++] = 0x00;
 
-    // Gid: fixed uint8[24] (16 bytes GUID + 8 zeros)
+    // Gid: fixed uint8[16] = 12-byte guidPrefix + 4-byte entityId
     memcpy(pBuf + pos, participantGuid, 16);
     pos += 16;
-    memset(pBuf + pos, 0, 8);
-    pos += 8;
 
     // sequence<NodeEntitiesInfo> length = 1
     pBuf[pos++] = 1; pBuf[pos++] = 0; pBuf[pos++] = 0; pBuf[pos++] = 0;
@@ -387,13 +389,11 @@ uint32_t SPDPHandler::buildRosDiscoveryInfoPayload(
     pBuf[pos++] = (numReaderEntityIds >> 24) & 0xFF;
     for (uint32_t i = 0; i < numReaderEntityIds; i++)
     {
-        // Gid = guidPrefix(12) + entityId(4) + zeros(8) = 24 bytes
+        // Gid = guidPrefix(12) + entityId(4) = 16 bytes (matches IDL char[16])
         memcpy(pBuf + pos, participantGuid, 12);  // guidPrefix from participant GUID
         pos += 12;
         memcpy(pBuf + pos, readerEntityIds[i], 4);
         pos += 4;
-        memset(pBuf + pos, 0, 8);
-        pos += 8;
     }
 
     // sequence<Gid> writer_gid_seq
@@ -407,8 +407,6 @@ uint32_t SPDPHandler::buildRosDiscoveryInfoPayload(
         pos += 12;
         memcpy(pBuf + pos, writerEntityIds[i], 4);
         pos += 4;
-        memset(pBuf + pos, 0, 8);
-        pos += 8;
     }
 
     return pos;
