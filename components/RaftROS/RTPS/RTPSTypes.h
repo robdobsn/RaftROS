@@ -26,7 +26,15 @@ static const uint8_t ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER[4] = {0x00, 0x00,
 static const uint8_t ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER[4] = {0x00, 0x00, 0x04, 0xC2};
 static const uint8_t ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER[4] = {0x00, 0x00, 0x04, 0xC7};
 
-// User-defined writer for ros_discovery_info topic
+// User-defined writer for ros_discovery_info topic.
+// Entity kind = 0x03 (USER_WRITER_NO_KEY) is what rmw_fastrtps_cpp also
+// uses for this topic in practice (verified by wire capture: matching
+// works at RTPS layer with this kind).  Although the
+// `rmw_dds_common::msg::ParticipantEntitiesInfo` IDL declares the
+// participant Gid as `@key`, rmw applies that keying at the DDS layer
+// only — the RTPS entity kind is still NO_KEY.  Trying kind=0x02
+// (USER_WRITER_WITH_KEY) caused matching to fail entirely (zero
+// ACKNACKs from host).  See dev-status "Task D" diagnostic notes.
 static const uint8_t ENTITYID_ROS_DISC_INFO_WRITER[4] = {0x00, 0x00, 0x01, 0x03};
 static const uint8_t ENTITYID_ROS_DISC_INFO_READER[4] = {0x00, 0x00, 0x02, 0x04};
 

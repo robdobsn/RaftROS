@@ -1160,17 +1160,19 @@ void RaftROS::stepWriterHeartbeatPass()
                           remoteRef.guidPrefix[0], remoteRef.guidPrefix[1],
                           remoteRef.guidPrefix[2], remoteRef.guidPrefix[3],
                           (unsigned)rosDiscLen);
-                    // Advertise only the current sample as available
-                    // (firstSN == lastSN == sequenceNumber).  This lets us
-                    // bump _rosDiscSeqNum on autopub attach/detach without
-                    // leaving a sequence gap that the peer would NACK for.
+                    // Always advertise firstSN=1.  We only ever publish a
+                    // single ros_discovery_info sample (rebuilt on demand
+                    // from current state in buildRosDiscInfoWithGids), so
+                    // the wire range is always [1..1] with no gap that
+                    // could leave a TRANSIENT_LOCAL peer stuck NACKing a
+                    // missing prior sequence.  See dev-status "Task D".
                     return self->_sedpHandler.buildUserDataMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
                         ENTITYID_ROS_DISC_INFO_WRITER,
                         rosDiscPayload, rosDiscLen,
                         sequenceNumber, heartbeatCount,
-                        /*firstSN=*/sequenceNumber);
+                        /*firstSN=*/1);
                 }
                 default:
                     return 0;
@@ -2279,17 +2281,21 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
             (void)emitAutoPubSedpAnnounce(remote, pCtx->secondarySlot);
     }
 
-    // Bump the ros_discovery_info sequence number so the next user-data HB
-    // delivers an updated ParticipantEntitiesInfo sample that includes the
-    // newly-allocated writer GID(s) in writer_gid_seq.  Without this bump,
-    // the peer keeps the cached old sample and `ros2 topic info` reports
-    // "Publisher count: 0" for the autopub topic even though SEDP discovery
-    // and data delivery both work.
-    _rosDiscSeqNum++;
+    // Note: we deliberately do NOT bump _rosDiscSeqNum here.  An earlier
+    // version did, but jumping firstSN from 1->2 (without a GAP submessage)
+    // caused TRANSIENT_LOCAL rmw_dds_common readers on the host to stay
+    // stuck at preemptive ACKNACK forever, leading to `_NODE_NAME_UNKNOWN_`
+    // in ros2 CLI output.  Instead we keep a single sample at seq=1 whose
+    // contents are rebuilt from current state in buildRosDiscInfoWithGids
+    // at each HB.  Trade-off: peers that received seq=1 *before* this
+    // attach will not see the new writer GID until they reconnect; this
+    // matters less in practice because (a) cold-start CLI binding is the
+    // common case, and (b) SEDP publication match still announces the new
+    // writer to existing peers via emitAutoPubSedpAnnounce above.
     LOG_I(MODULE_PREFIX,
-          "autoPubAttach bumped rosDiscSeqNum=%u (slot=%d secSlot=%d)",
-          (unsigned)_rosDiscSeqNum, slot,
-          (int)pCtx->secondarySlot);
+          "autoPubAttach slot=%d secSlot=%d (rosDiscSeqNum kept at %u)",
+          slot, (int)pCtx->secondarySlot,
+          (unsigned)_rosDiscSeqNum);
 
     return true;
 }
@@ -2368,11 +2374,11 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     if (pCtx && pCtx->secondarySlot != 0xFF)
         _autoPubLifecycle.detachSlot(pCtx->secondarySlot);
 
-    // Bump ros_discovery_info seq so peers receive an updated
-    // ParticipantEntitiesInfo sample with the disposed writer GID removed
-    // from writer_gid_seq.  Mirrors the bump done on attach.
-    _rosDiscSeqNum++;
-    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u rosDiscSeqNum=%u",
+    // Note: we deliberately do NOT bump _rosDiscSeqNum here either — see
+    // the matching comment in autoPubAttachDevice for the reasoning.  The
+    // SEDP publication-dispose above already informs existing peers that
+    // the writer is gone.
+    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u (rosDiscSeqNum kept at %u)",
           devID.toString().c_str(), slot,
           pCtx ? (int)pCtx->secondarySlot : -1,
           pCtx ? (unsigned)pCtx->sampleCount : 0u,
