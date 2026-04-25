@@ -285,6 +285,17 @@ private:
     // Helper to build ros_discovery_info payload with our writer GIDs
     uint32_t buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen);
 
+    // Compute the current high-water mark sequence number across every endpoint
+    // advertised on the SEDP publications / subscriptions writers.  Each builtin
+    // SEDP writer is a single RTPS endpoint with a monotonic seq stream — its
+    // HEARTBEAT lastSN MUST equal that high-water mark.  Without these helpers
+    // each per-endpoint announce naively published HB(lastSN=<endpoint seq>),
+    // which regressed every time a lower-numbered endpoint was re-announced and
+    // caused FastDDS readers to silently un-match the writer (root cause of
+    // `_NODE_NAME_UNKNOWN_` in `ros2 topic info -v`).
+    uint64_t computeSedpPubHeartbeatLastSN() const;
+    uint64_t computeSedpSubHeartbeatLastSN() const;
+
     // -----------------------------------------------------------------
     // Phase 4 / Slice 4.3 — per-bus-device auto-publishing plumbing
     //

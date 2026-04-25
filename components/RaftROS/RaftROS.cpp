@@ -1111,7 +1111,8 @@ void RaftROS::stepWriterHeartbeatPass()
                         "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
                         RELIABILITY_RELIABLE,
                         DURABILITY_TRANSIENT_LOCAL,
-                        sequenceNumber, self->_myIpAddr);
+                        sequenceNumber, self->_myIpAddr, heartbeatCount,
+                        self->computeSedpPubHeartbeatLastSN());
                 case RTPSWriterHeartbeatAction::SedpRosDiscoverySubscription:
                     return self->_sedpHandler.buildSubscriptionMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
@@ -1121,7 +1122,8 @@ void RaftROS::stepWriterHeartbeatPass()
                         "rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_",
                         RELIABILITY_RELIABLE,
                         DURABILITY_TRANSIENT_LOCAL,
-                        sequenceNumber, self->_myIpAddr);
+                        sequenceNumber, self->_myIpAddr, heartbeatCount,
+                        self->computeSedpSubHeartbeatLastSN());
                 case RTPSWriterHeartbeatAction::SedpChatterPublication:
                     return self->_sedpHandler.buildPublicationMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
@@ -1131,7 +1133,8 @@ void RaftROS::stepWriterHeartbeatPass()
                         CHATTER_DDS_TYPE,
                         RELIABILITY_RELIABLE,
                         DURABILITY_VOLATILE,
-                        sequenceNumber, self->_myIpAddr);
+                        sequenceNumber, self->_myIpAddr, heartbeatCount,
+                        self->computeSedpPubHeartbeatLastSN());
                 case RTPSWriterHeartbeatAction::SedpChatterSubscription:
                     return self->_sedpHandler.buildSubscriptionMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
@@ -1141,7 +1144,8 @@ void RaftROS::stepWriterHeartbeatPass()
                         self->_subscriptionType.c_str(),
                         RELIABILITY_RELIABLE,
                         DURABILITY_VOLATILE,
-                        sequenceNumber, self->_myIpAddr);
+                        sequenceNumber, self->_myIpAddr, heartbeatCount,
+                        self->computeSedpSubHeartbeatLastSN());
                 case RTPSWriterHeartbeatAction::ParticipantMessageData:
                     return self->_sedpHandler.buildParticipantMessageData(
                         self->_sendBuf, sizeof(self->_sendBuf),
@@ -1166,13 +1170,21 @@ void RaftROS::stepWriterHeartbeatPass()
                     // the wire range is always [1..1] with no gap that
                     // could leave a TRANSIENT_LOCAL peer stuck NACKing a
                     // missing prior sequence.  See dev-status "Task D".
+                    //
+                    // ParticipantEntitiesInfo is keyed by participant GID;
+                    // FastDDS reliable readers reject samples without an
+                    // inline-QoS PID_KEY_HASH that binds the sample to its
+                    // instance.  Pass the participant GUID (16 bytes) as
+                    // the key hash so the daemon's rmw_dds_common reader
+                    // accepts the sample and registers our node mapping.
                     return self->_sedpHandler.buildUserDataMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
                         ENTITYID_ROS_DISC_INFO_WRITER,
                         rosDiscPayload, rosDiscLen,
                         sequenceNumber, heartbeatCount,
-                        /*firstSN=*/1);
+                        /*firstSN=*/1,
+                        /*keyHash16=*/self->_participant.getParticipantGuid());
                 }
                 default:
                     return 0;
@@ -1410,7 +1422,8 @@ void RaftROS::drainPendingAnnounces()
                             self->_participant, remoteRef.guidPrefix,
                             sedpSpec.entityId, sedpSpec.topicName, sedpSpec.typeName,
                             sedpSpec.reliabilityKind, sedpSpec.durabilityKind,
-                            sequenceNumber, self->_myIpAddr, sedpHeartbeatForBuild);
+                            sequenceNumber, self->_myIpAddr, sedpHeartbeatForBuild,
+                            self->computeSedpPubHeartbeatLastSN());
                     }
                     return self->_sedpHandler.buildSubscriptionMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
@@ -1421,7 +1434,8 @@ void RaftROS::drainPendingAnnounces()
                         (buildSpec.sedpEndpointProfile == RTPSInitialAnnounceSedpEndpointProfile::ChatterReader)
                             ? self->_subscriptionType.c_str() : sedpSpec.typeName,
                         sedpSpec.reliabilityKind, sedpSpec.durabilityKind,
-                        sequenceNumber, self->_myIpAddr, sedpHeartbeatForBuild);
+                        sequenceNumber, self->_myIpAddr, sedpHeartbeatForBuild,
+                        self->computeSedpSubHeartbeatLastSN());
                 }
                 case RTPSInitialAnnounceBuildKind::ParticipantMessageData:
                     return self->_sedpHandler.buildParticipantMessageData(
@@ -1621,7 +1635,8 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
         _participant, remote.guidPrefix,
         pEntry->entityId, pEntry->topic, pEntry->type,
         qos.reliability, qos.durability,
-        thisSeq, _myIpAddr);
+        thisSeq, _myIpAddr, /*heartbeatCount*/ 0,
+        computeSedpPubHeartbeatLastSN());
     if (payloadLen == 0)
         return false;
 
@@ -1642,6 +1657,43 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
           remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
           (unsigned)remote.ipAddr, (int)remote.metatrafficPort);
     return payloadLen > 0;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Compute SEDP publications/subscriptions writer high-water mark for HEARTBEAT.
+//
+// The SEDP publications writer is a single RTPS endpoint shared by every
+// publication we announce (rdi/chatter/autopub slots).  Each emitted DATA(w)
+// uses a fixed per-endpoint seq number, but the writer's HEARTBEAT lastSN MUST
+// be the maximum seq ever advertised across all of those endpoints — otherwise
+// it regresses every time a lower-numbered endpoint is re-announced and
+// FastDDS readers silently un-match the writer (root cause of
+// `_NODE_NAME_UNKNOWN_`).  Same for the subscriptions writer.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint64_t RaftROS::computeSedpPubHeartbeatLastSN() const
+{
+    uint64_t maxSeq = _sedpSeqNum;
+    if (_chatterSedpSeqNum > maxSeq) maxSeq = _chatterSedpSeqNum;
+    using RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY;
+    for (uint8_t slot = 0; slot < DYNAMIC_WRITER_REGISTRY_CAPACITY; slot++)
+    {
+        const auto* pEntry = _autoPubLifecycle.get(slot);
+        if (pEntry && pEntry->inUse && pEntry->sedpSeqNum > maxSeq)
+            maxSeq = pEntry->sedpSeqNum;
+    }
+    return maxSeq;
+}
+
+uint64_t RaftROS::computeSedpSubHeartbeatLastSN() const
+{
+    uint64_t maxSeq = _sedpSubSeqNum;
+    for (uint8_t i = 0; i < sizeof(_extraSubscriptionSeqNums) / sizeof(_extraSubscriptionSeqNums[0]); i++)
+    {
+        if (_extraSubscriptionSeqNums[i] > maxSeq)
+            maxSeq = _extraSubscriptionSeqNums[i];
+    }
+    return maxSeq;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

@@ -247,7 +247,8 @@ uint32_t SEDPHandler::buildPublicationMessage(
     uint32_t durabilityKind,
     uint64_t sequenceNumber,
     uint32_t ipAddrNetOrder,
-    uint32_t heartbeatCount)
+    uint32_t heartbeatCount,
+    uint64_t hbLastSN)
 {
     if (!pBuf || bufLen < 900)
         return 0;
@@ -400,11 +401,16 @@ uint32_t SEDPHandler::buildPublicationMessage(
 
     // HEARTBEAT for this SEDP writer (RELIABLE built-in endpoint)
     uint32_t hbCount = heartbeatCount > 0 ? heartbeatCount : (uint32_t)sequenceNumber;
+    // lastSN MUST be the writer's true high-water mark across all of its
+    // endpoints.  If the caller passes hbLastSN==0 we fall back to the
+    // per-DATA seq, which is only safe in unit tests / single-endpoint
+    // scenarios; the runtime announce path threads through the actual max.
+    uint64_t hbLast = hbLastSN > 0 ? hbLastSN : sequenceNumber;
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
         ENTITYID_SEDP_BUILTIN_PUBLICATIONS_READER,
         ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER,
         0, 1,  // firstSN = 1
-        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),  // lastSN
+        (uint32_t)(hbLast >> 32), (uint32_t)(hbLast & 0xFFFFFFFF),  // lastSN
         hbCount);
 
     return pos;
@@ -502,9 +508,12 @@ uint32_t SEDPHandler::buildUserDataMessage(
     const uint8_t* pPayload, uint32_t payloadLen,
     uint64_t sequenceNumber,
     uint32_t heartbeatCount,
-    uint64_t firstSN)
+    uint64_t firstSN,
+    const uint8_t* keyHash16)
 {
-    if (!pBuf || bufLen < (uint32_t)(80 + payloadLen))
+    // Reserve 24 extra bytes if inline QoS w/ PID_KEY_HASH is requested.
+    const uint32_t inlineQosOverhead = (keyHash16 != nullptr) ? 24 : 0;
+    if (!pBuf || bufLen < (uint32_t)(80 + inlineQosOverhead + payloadLen))
         return 0;
 
     uint32_t pos = 0;
@@ -518,12 +527,24 @@ uint32_t SEDPHandler::buildUserDataMessage(
     // INFO_TS
     pos += RTPSMessage::writeInfoTS(pBuf + pos, bufLen - pos, 0, 0);
 
-    // DATA submessage with user payload
-    pos += RTPSMessage::writeDataSubmessage(pBuf + pos, bufLen - pos,
-        ENTITYID_UNKNOWN,
-        writerEntityId,
-        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
-        pPayload, payloadLen);
+    // DATA submessage with user payload (with inline-QoS PID_KEY_HASH if requested)
+    if (keyHash16)
+    {
+        pos += RTPSMessage::writeDataSubmessageWithKeyHash(pBuf + pos, bufLen - pos,
+            ENTITYID_UNKNOWN,
+            writerEntityId,
+            0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+            keyHash16,
+            pPayload, payloadLen);
+    }
+    else
+    {
+        pos += RTPSMessage::writeDataSubmessage(pBuf + pos, bufLen - pos,
+            ENTITYID_UNKNOWN,
+            writerEntityId,
+            0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+            pPayload, payloadLen);
+    }
 
     // HEARTBEAT (RELIABLE DataWriter)
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
@@ -552,7 +573,8 @@ uint32_t SEDPHandler::buildSubscriptionMessage(
     uint32_t durabilityKind,
     uint64_t sequenceNumber,
     uint32_t ipAddrNetOrder,
-    uint32_t heartbeatCount)
+    uint32_t heartbeatCount,
+    uint64_t hbLastSN)
 {
     if (!pBuf || bufLen < 900)
         return 0;
@@ -691,11 +713,14 @@ uint32_t SEDPHandler::buildSubscriptionMessage(
 
     // HEARTBEAT
     uint32_t hbCount = heartbeatCount > 0 ? heartbeatCount : (uint32_t)sequenceNumber;
+    // See note in buildPublicationMessage — lastSN must be the writer's
+    // monotonically-increasing high-water mark.
+    uint64_t hbLast = hbLastSN > 0 ? hbLastSN : sequenceNumber;
     pos += RTPSMessage::writeHeartbeat(pBuf + pos, bufLen - pos,
         ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_READER,
         ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER,
         0, 1,
-        0, (uint32_t)(sequenceNumber & 0xFFFFFFFF),
+        (uint32_t)(hbLast >> 32), (uint32_t)(hbLast & 0xFFFFFFFF),
         hbCount);
 
     return pos;
