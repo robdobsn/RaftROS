@@ -318,7 +318,27 @@ Only `Range` regressed.
 1. **Task D — `ros_discovery_info` node-name binding (rmw reader stuck at
    preemptive ACKNACK).** Cosmetic only — data path unaffected.
 
-   **2026-04-25 diagnostic state (post Gid-layout fix):**
+   **Fix attempts on 2026-04-25 (both unsuccessful):**
+
+   *Attempt #1 — keep `firstSN=1` always (avoid TRANSIENT_LOCAL gap):*
+   - Reverted `_rosDiscSeqNum++` bumps in `autoPubAttachDevice` and
+     `autoPubDetachDevice` so seq stays at 1 forever.
+   - Changed HB callback to advertise `firstSN=1` unconditionally.
+   - Wire trace after fix: HB now consistently `firstSN=1, lastSN=1`
+     (good), but host reader behavior **unchanged** — still 4 preemptive
+     ACKNACKs (`bitmapBase=0, numBits=0`), never advances. Status:
+     change kept (correct per RTPS spec for our single-sample design)
+     but didn't resolve Task D.
+
+   *Attempt #2 — entity kind 0x03→0x02 (USER_WRITER_WITH_KEY):*
+   - Reasoning: `ParticipantEntitiesInfo` IDL has `@key`, so theoretically
+     should use WITH_KEY entity kind.
+   - Result: matching **broke entirely** — zero ACKNACKs from host. Reverted.
+   - Conclusion: rmw_fastrtps applies the IDL @key annotation at the DDS
+     layer only; the RTPS entity kind is still NO_KEY (0x03). Documented
+     in `RTPSTypes.h` comment.
+
+   **2026-04-25 diagnostic state (post Gid-layout fix, post attempts above):**
    - Wire payload now structurally correct: 16-byte Gids per IDL,
      CDR_LE encapsulation, all PIDs present
      (`PID_TOPIC_NAME=ros_discovery_info`,
@@ -386,13 +406,14 @@ Only `Range` regressed.
    ros2 node info /raft_esp32            # Unable to find node
    ```
 2. ~~**Re-publish `ros_discovery_info` on auto-pub attach.**~~ **DONE
-   (2026-04-26).** `RaftROS::autoPubAttachDevice` and
-   `autoPubDetachDevice` now bump `_rosDiscSeqNum` after each successful
-   slot allocation/release, and the periodic ros_discovery_info HB callback
-   now passes `firstSN = sequenceNumber` so the bumped seq doesn't leave a
-   gap that peers would NACK for. Subsequent periodic HBs deliver an
-   updated `ParticipantEntitiesInfo` sample whose `writer_gid_seq` includes
-   (or excludes) the new GID. See `RaftROS.cpp` near `autoPubAttachDevice`.
+   2026-04-26, then REVERTED 2026-04-25 as part of Task D Attempt #1.**
+   The bump caused a sequence-number gap (firstSN=2, lastSN=2 with no
+   GAP submessage) which TRANSIENT_LOCAL readers couldn't recover from.
+   Per Task D analysis, we now keep `_rosDiscSeqNum=1` permanently and
+   rebuild the rdi payload from current state on every HB instead. SEDP
+   publication-announce on attach (in `emitAutoPubSedpAnnounce`) still
+   informs peers about new writers — that path was always working and
+   is what makes `ros2 topic info -v` list the ESP publisher GID.
 3. **Auto-pub QoS default.** `RTPSAutoPubQoSProfile::FastSensor` is
    BEST_EFFORT/VOLATILE. `ros2 topic echo /raft/range_1_29` requires
    `--qos-reliability best_effort` to match. Consider documenting
