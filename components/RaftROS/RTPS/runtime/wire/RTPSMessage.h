@@ -46,6 +46,18 @@ public:
                                          int32_t seqNumHigh, uint32_t seqNumLow,
                                          const uint8_t* pPayload, uint32_t payloadLen);
 
+    // Build DATA submessage with inline QoS containing a single PID_KEY_HASH.
+    // Used for keyed user-data topics (e.g. ros_discovery_info / ParticipantEntitiesInfo)
+    // where the reader requires the key hash in inline QoS to bind a sample to its
+    // instance. `keyHash16` must point to a 16-byte key (commonly the participant
+    // GUID for ParticipantEntitiesInfo). Returns bytes written or 0 on error.
+    static uint32_t writeDataSubmessageWithKeyHash(uint8_t* pBuf, uint32_t bufLen,
+                                                    const uint8_t* readerEntityId,
+                                                    const uint8_t* writerEntityId,
+                                                    int32_t seqNumHigh, uint32_t seqNumLow,
+                                                    const uint8_t* keyHash16,
+                                                    const uint8_t* pPayload, uint32_t payloadLen);
+
     // Build INFO_TS submessage (12 bytes)
     static uint32_t writeInfoTS(uint8_t* pBuf, uint32_t bufLen,
                                  int32_t seconds, uint32_t fraction);

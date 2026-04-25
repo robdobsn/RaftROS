@@ -84,6 +84,71 @@ uint32_t RTPSMessage::writeDataSubmessage(uint8_t* pBuf, uint32_t bufLen,
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Write DATA submessage with inline-QoS PID_KEY_HASH (DDSI-RTPS §8.3.7.2 + §9.6.4.8)
+// Layout: submsg header(4) + extraFlags(2) + octetsToInlineQoS(2) +
+//         readerEntityId(4) + writerEntityId(4) + writerSN(8) +
+//         inline-QoS ParameterList { PID_KEY_HASH(0x0070, len=16, 16-byte key)
+//                                    PID_SENTINEL(0x0001, len=0) } (24 bytes) +
+//         payload
+// Sets Q-flag (0x02) in submessage flags so the receiver parses the inline QoS.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+uint32_t RTPSMessage::writeDataSubmessageWithKeyHash(uint8_t* pBuf, uint32_t bufLen,
+                                                      const uint8_t* readerEntityId,
+                                                      const uint8_t* writerEntityId,
+                                                      int32_t seqNumHigh, uint32_t seqNumLow,
+                                                      const uint8_t* keyHash16,
+                                                      const uint8_t* pPayload, uint32_t payloadLen)
+{
+    // Inline QoS ParameterList = PID_KEY_HASH(20) + PID_SENTINEL(4) = 24 bytes
+    static const uint32_t INLINE_QOS_LEN = 24;
+    // Content (after submsg header): extraFlags(2) + octetsToInlineQoS(2) +
+    // readerId(4) + writerId(4) + seqNum(8) + inlineQoS(24) + payload
+    uint32_t contentSize = 2 + 2 + 4 + 4 + 8 + INLINE_QOS_LEN + payloadLen;
+    uint32_t totalSize = 4 + contentSize;
+    if (bufLen < totalSize || !keyHash16)
+        return 0;
+
+    uint32_t pos = 0;
+
+    // Submessage header
+    pBuf[pos++] = SUBMSG_DATA;                    // submessageId
+    pBuf[pos++] = 0x07;                           // flags: E=1 (LE), Q=1 (inline QoS), D=1 (data)
+    writeLE16(pBuf + pos, (uint16_t)contentSize); // octetsToNextHeader
+    pos += 2;
+
+    // Extra flags
+    writeLE16(pBuf + pos, 0);
+    pos += 2;
+
+    // Octets to inline QoS = readerId(4) + writerId(4) + seqNum(8) = 16
+    writeLE16(pBuf + pos, 16);
+    pos += 2;
+
+    // Reader / Writer Entity IDs
+    memcpy(pBuf + pos, readerEntityId, 4); pos += 4;
+    memcpy(pBuf + pos, writerEntityId, 4); pos += 4;
+
+    // Sequence Number (high, low) in LE
+    writeLE32(pBuf + pos, (uint32_t)seqNumHigh); pos += 4;
+    writeLE32(pBuf + pos, seqNumLow);            pos += 4;
+
+    // Inline QoS: PID_KEY_HASH (0x0070, length 16) + 16 bytes + PID_SENTINEL (0x0001, length 0)
+    writeLE16(pBuf + pos, 0x0070); pos += 2;     // PID_KEY_HASH
+    writeLE16(pBuf + pos, 16);     pos += 2;
+    memcpy(pBuf + pos, keyHash16, 16); pos += 16;
+    writeLE16(pBuf + pos, 0x0001); pos += 2;     // PID_SENTINEL
+    writeLE16(pBuf + pos, 0);      pos += 2;
+
+    // Serialized payload
+    if (payloadLen > 0 && pPayload)
+        memcpy(pBuf + pos, pPayload, payloadLen);
+    pos += payloadLen;
+
+    return pos;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Write INFO_TS submessage (12 bytes total)
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
