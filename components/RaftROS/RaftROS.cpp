@@ -1164,26 +1164,26 @@ void RaftROS::stepWriterHeartbeatPass()
                           remoteRef.guidPrefix[0], remoteRef.guidPrefix[1],
                           remoteRef.guidPrefix[2], remoteRef.guidPrefix[3],
                           (unsigned)rosDiscLen);
-                    // Always advertise firstSN=1.  We only ever publish a
-                    // single ros_discovery_info sample (rebuilt on demand
-                    // from current state in buildRosDiscInfoWithGids), so
-                    // the wire range is always [1..1] with no gap that
-                    // could leave a TRANSIENT_LOCAL peer stuck NACKing a
-                    // missing prior sequence.  See dev-status "Task D".
-                    //
                     // ParticipantEntitiesInfo is keyed by participant GID;
                     // FastDDS reliable readers reject samples without an
                     // inline-QoS PID_KEY_HASH that binds the sample to its
                     // instance.  Pass the participant GUID (16 bytes) as
                     // the key hash so the daemon's rmw_dds_common reader
                     // accepts the sample and registers our node mapping.
+                    //
+                    // firstSN == lastSN == current: writer holds only the
+                    // most recent rdi sample (rebuilt each HB from current
+                    // state).  Old SNs no longer exist, so readers don't
+                    // ACKNACK for them.  When _rosDiscSeqNum is bumped on
+                    // autopub attach/detach the new sample displaces the
+                    // old one in the reader's cache (same instance key).
                     return self->_sedpHandler.buildUserDataMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
                         ENTITYID_ROS_DISC_INFO_WRITER,
                         rosDiscPayload, rosDiscLen,
                         sequenceNumber, heartbeatCount,
-                        /*firstSN=*/1,
+                        /*firstSN=*/sequenceNumber,
                         /*keyHash16=*/self->_participant.getParticipantGuid());
                 }
                 default:
@@ -2333,19 +2333,19 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
             (void)emitAutoPubSedpAnnounce(remote, pCtx->secondarySlot);
     }
 
-    // Note: we deliberately do NOT bump _rosDiscSeqNum here.  An earlier
-    // version did, but jumping firstSN from 1->2 (without a GAP submessage)
-    // caused TRANSIENT_LOCAL rmw_dds_common readers on the host to stay
-    // stuck at preemptive ACKNACK forever, leading to `_NODE_NAME_UNKNOWN_`
-    // in ros2 CLI output.  Instead we keep a single sample at seq=1 whose
-    // contents are rebuilt from current state in buildRosDiscInfoWithGids
-    // at each HB.  Trade-off: peers that received seq=1 *before* this
-    // attach will not see the new writer GID until they reconnect; this
-    // matters less in practice because (a) cold-start CLI binding is the
-    // common case, and (b) SEDP publication match still announces the new
-    // writer to existing peers via emitAutoPubSedpAnnounce above.
+    // Bump _rosDiscSeqNum so the next rdi HEARTBEAT advertises a new
+    // sample (firstSN==lastSN==current).  buildRosDiscInfoWithGids() will
+    // rebuild the payload to include the newly-attached writer GID.
+    // Earlier we kept seq pinned at 1, which meant peers that had already
+    // received the seq=1 sample would dedupe later rebuilds (RTPS readers
+    // discard duplicate sequence numbers per writer instance), leaving
+    // ros2 topic info showing `_NODE_NAME_UNKNOWN_` for the new writer.
+    // Because the writer holds only the most-recent rdi sample, advancing
+    // firstSN with the seq is safe: there's no historic gap for readers
+    // to NACK on.
+    _rosDiscSeqNum++;
     LOG_I(MODULE_PREFIX,
-          "autoPubAttach slot=%d secSlot=%d (rosDiscSeqNum kept at %u)",
+          "autoPubAttach slot=%d secSlot=%d (rosDiscSeqNum bumped to %u)",
           slot, (int)pCtx->secondarySlot,
           (unsigned)_rosDiscSeqNum);
 
@@ -2426,11 +2426,11 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     if (pCtx && pCtx->secondarySlot != 0xFF)
         _autoPubLifecycle.detachSlot(pCtx->secondarySlot);
 
-    // Note: we deliberately do NOT bump _rosDiscSeqNum here either — see
-    // the matching comment in autoPubAttachDevice for the reasoning.  The
-    // SEDP publication-dispose above already informs existing peers that
-    // the writer is gone.
-    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u (rosDiscSeqNum kept at %u)",
+    // Bump _rosDiscSeqNum so the next rdi HB carries an updated sample
+    // omitting the now-detached writer GID.  See the matching comment in
+    // autoPubAttachDevice for why this is necessary and safe.
+    _rosDiscSeqNum++;
+    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u (rosDiscSeqNum bumped to %u)",
           devID.toString().c_str(), slot,
           pCtx ? (int)pCtx->secondarySlot : -1,
           pCtx ? (unsigned)pCtx->sampleCount : 0u,

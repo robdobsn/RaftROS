@@ -370,6 +370,12 @@ uint32_t standardBuildUserData(RTPSAckActionStandardCtx& ctx,
 
     const uint32_t hb = ctx.exec.heartbeatCount ? *ctx.exec.heartbeatCount : 0;
 
+    // Keyed builtin topics (e.g. ros_discovery_info) require the inline-QoS
+    // PID_KEY_HASH on every DATA emission.  The plan requests this for
+    // retransmits to mirror what the periodic HB build path supplies.
+    const uint8_t* keyHash16 =
+        plan.useParticipantKeyHash ? ctx.participant->getParticipantGuid() : nullptr;
+
     if (plan.hasFirstSNOverride)
     {
         return ctx.sedpHandler->buildUserDataMessage(
@@ -378,7 +384,8 @@ uint32_t standardBuildUserData(RTPSAckActionStandardCtx& ctx,
             plan.writerEntityId,
             payloadBuf, payloadLen,
             plan.sequenceNumber, hb,
-            plan.firstSN);
+            plan.firstSN,
+            keyHash16);
     }
 
     return ctx.sedpHandler->buildUserDataMessage(
@@ -386,7 +393,9 @@ uint32_t standardBuildUserData(RTPSAckActionStandardCtx& ctx,
         *ctx.participant, destGuidPrefix,
         plan.writerEntityId,
         payloadBuf, payloadLen,
-        plan.sequenceNumber, hb);
+        plan.sequenceNumber, hb,
+        /*firstSN=*/1,
+        keyHash16);
 }
 
 uint32_t standardBuildSedpRosDiscoveryPublication(

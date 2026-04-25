@@ -149,7 +149,7 @@ private:
     uint64_t _spdpSeqNum = 0;
     uint64_t _sedpSeqNum = 1;     // seq 1 on SEDP pubs writer = ros_disc_info publication
     uint64_t _sedpSubSeqNum = 1;  // always 1 (single SEDP sub, never changes)
-    uint64_t _rosDiscSeqNum = 1;  // always 1 (single ros_discovery_info sample)
+    uint64_t _rosDiscSeqNum = 1;  // bumped on autopub attach/detach (writer keeps only latest sample, firstSN==lastSN==seq)
     uint64_t _livelinessSeqNum = 0; // incremented each liveliness send
     uint32_t _heartbeatCount = 0;
     uint32_t _acknackCount = 0;

@@ -87,6 +87,11 @@ struct RTPSAckActionUserDataPlan
     uint64_t sequenceNumber = 0;
     bool hasFirstSNOverride = false;
     uint64_t firstSN = 1;
+    // When true, the user-data builder must include an inline-QoS PID_KEY_HASH
+    // set to the sending participant's GUID (16 bytes).  Required for retransmits
+    // of keyed builtin topics like ros_discovery_info, whose readers reject
+    // samples that lack a key hash.
+    bool useParticipantKeyHash = false;
 };
 
 RTPSAckActionSedpSequenceContext makeAckSedpSequenceContext(
