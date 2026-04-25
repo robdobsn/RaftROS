@@ -82,6 +82,22 @@ firmware is fine and the issue is daemon/CLI plumbing.
   match nothing. Always pass `--qos-reliability best_effort` to `ros2
   topic echo` for sensor streams.
 
+### Most recent fix (2026-04-25)
+
+**`ros_discovery_info` Gid CDR layout corrected (24 → 16 bytes).**
+`SPDPHandler::buildRosDiscoveryInfoPayload` was emitting each Gid as
+`{16-byte GUID, 8 zero bytes padding}` (24 bytes total). The
+`rmw_dds_common::msg::Gid` IDL declares `octet[16] data` — exactly 16
+bytes, no padding. The 8-byte over-emit caused every subsequent CDR
+field to misalign, so `rmw_dds_common`'s reader silently rejected the
+sample. Fixed all three sites (top participant Gid, reader_gid_seq
+loop, writer_gid_seq loop) and updated the buffer-size estimate.
+Verified via wire trace + `rclpy.serialization.deserialize_message` that
+the resulting payload now decodes correctly to the expected fields.
+
+This was **necessary but not sufficient** — see "Pending Task D" below
+for the remaining symptom (`_NODE_NAME_UNKNOWN_` despite valid wire).
+
 ### Most recent fix (2026-04-24)
 
 `sensor_msgs/Range` typed deserialization was failing on Jazzy because
@@ -299,15 +315,76 @@ Only `Range` regressed.
 
 ### Pending follow-ups
 
-1. **Task D — `ros_discovery_info` entity kind for topic-graph resolution
-   (Cosmetic, DEFERRED).** ESP advertises the `ros_discovery_info` writer
-   with `entityKind=0x03` (USER_WRITER_NO_KEY). Theory was that Fast DDS
-   Jazzy's discovery builtins expect `0xc2` (BUILTIN_WITH_KEY). Investigation
-   on 2026-04-26 showed the host's rclpy graph cache itself hangs (not just
-   the CLI), so the failure mode is not as simple as a single entity-id
-   change. Theory remains unverified. **Do not change `ENTITYID_ROS_DISC_INFO_WRITER`
-   in `RTPSTypes.h` blindly** — verify against a reference Fast DDS publisher
-   via packet capture first. Data path is unaffected.
+1. **Task D — `ros_discovery_info` node-name binding (rmw reader stuck at
+   preemptive ACKNACK).** Cosmetic only — data path unaffected.
+
+   **2026-04-25 diagnostic state (post Gid-layout fix):**
+   - Wire payload now structurally correct: 16-byte Gids per IDL,
+     CDR_LE encapsulation, all PIDs present
+     (`PID_TOPIC_NAME=ros_discovery_info`,
+     `PID_TYPE_NAME=rmw_dds_common::msg::dds_::ParticipantEntitiesInfo_`,
+     `PID_USER_DATA=typehash=RIHS01_91a05...;`,
+     `PID_DATA_REPRESENTATION=XCDR1`,
+     `RELIABILITY=RELIABLE`, `DURABILITY=TRANSIENT_LOCAL`).
+   - Payload deserializes successfully via
+     `rclpy.serialization.deserialize_message(data, ParticipantEntitiesInfo)` —
+     gid, ns="/", name="raft_esp32", reader_gid_seq=2, writer_gid_seq=2 all
+     decoded correctly. So the CDR is provably valid.
+   - `ros2 topic info /raft/range_1_29 -v` correctly lists the ESP
+     publisher's GID — proving SEDP-publication match works end-to-end.
+   - But host-side rmw still shows `Node name: _NODE_NAME_UNKNOWN_` and
+     `ros2 node info /raft_esp32` returns "Unable to find node".
+
+   **Wire trace finding (the smoking gun):** Multiple host-side readers
+   (4 distinct ACKNACK count streams) each match our writer at RTPS layer
+   and send **preemptive** ACKNACK (`bitmapBase=0, numBits=0`) but **never
+   advance past it**, despite us sending DATA(seq=2) +
+   HEARTBEAT(firstSN=2, lastSN=2, count=14620+) repeatedly. After 28 DATA
+   samples + ~14000 HBs over 10s, every captured ACKNACK is still
+   preemptive (`tshark` analysis: "Preemptive ACKNACK"). The host's
+   rmw_dds_common listener never gets a sample.
+
+   **Likely root cause (next investigation should start here):** When the
+   autopub attach bumps `_rosDiscSeqNum` from 1→2, our HB jumps from
+   `firstSN=1,lastSN=2` to `firstSN=2,lastSN=2` (we drop seq=1).
+   Reliable + TRANSIENT_LOCAL readers need a `GAP` submessage to know
+   seq=1 is gone — without it they may NACK seq=1 forever or stay in
+   preemptive. Two candidate fixes to try:
+   1. Send a `GAP` submessage covering [1..lastSN-1] when first
+      heartbeating after a bump.
+   2. Keep `firstSN=1` always for ros_discovery_info; never bump
+      `_rosDiscSeqNum` on attach. Instead, build the rdi sample lazily so
+      the very first publication (at seq=1) already includes any autopub
+      writer GIDs allocated during boot. Will require deferring first rdi
+      send until after `autoPubAttachDevice` has run (or a small init
+      barrier).
+
+   **Things that are NOT the issue (verified by capture/test 2026-04-25):**
+   - typehash mismatch — RIHS01_91a05... is correct in
+     `/opt/ros/jazzy/share/rmw_dds_common/msg/ParticipantEntitiesInfo.json`.
+   - CDR layout — payload deserializes round-trip with rclpy.
+   - Gid layout — was wrong (24 bytes), fixed to 16 bytes per IDL.
+     This was necessary but not sufficient.
+   - SEDP-pub matching — ESP writer's GID is visible in
+     `ros2 topic info -v`, proving rmw saw our SEDP publication DATA.
+   - QoS mismatch — RELIABLE+TRANSIENT_LOCAL+KEEP_LAST is what
+     rmw_dds_common requires and we declare.
+
+   **Do not change `ENTITYID_ROS_DISC_INFO_WRITER` (0x00000103) in
+   `RTPSTypes.h`** — wire trace shows host correctly targets that
+   entityId in its ACKNACKs.
+
+   **Reproduce:**
+   ```bash
+   source /opt/ros/jazzy/setup.bash
+   export RMW_IMPLEMENTATION=rmw_fastrtps_cpp FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+   unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
+   ros2 daemon stop; sleep 1
+   python3 scripts/range_reference_pub.py &
+   sleep 3 && ros2 daemon start && sleep 5
+   ros2 topic info /raft/range_1_29 -v   # ESP shown but NODE_NAME_UNKNOWN
+   ros2 node info /raft_esp32            # Unable to find node
+   ```
 2. ~~**Re-publish `ros_discovery_info` on auto-pub attach.**~~ **DONE
    (2026-04-26).** `RaftROS::autoPubAttachDevice` and
    `autoPubDetachDevice` now bump `_rosDiscSeqNum` after each successful
