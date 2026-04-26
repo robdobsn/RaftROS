@@ -46,6 +46,64 @@
 #define WARN_SDSP_SEND_FAILURE
 #define WARN_INVALID_RTPS_HEADER
 
+namespace
+{
+
+void patchRosDiscoveryInfoReaderId(uint8_t* packet, uint32_t packetLen, const uint8_t* readerEntityId)
+{
+    if (!packet || !readerEntityId)
+        return;
+
+    uint8_t srcGuidPrefix[12];
+    uint32_t offset = RTPSMessage::parseHeader(packet, packetLen, srcGuidPrefix);
+    if (offset == 0)
+        return;
+
+    while (offset < packetLen)
+    {
+        RTPSSubmessageId submsgId;
+        uint8_t flags;
+        const uint8_t* pContentConst = nullptr;
+        uint32_t contentLen = 0;
+        const uint32_t submsgSize = RTPSMessage::parseSubmessage(
+            packet + offset, packetLen - offset, submsgId, flags, pContentConst, contentLen);
+        if (submsgSize == 0)
+            break;
+
+        uint8_t* pContent = const_cast<uint8_t*>(pContentConst);
+        if (submsgId == SUBMSG_DATA && contentLen >= 12 &&
+            memcmp(pContent + 8, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
+        {
+            memcpy(pContent + 4, readerEntityId, 4);
+        }
+        else if (submsgId == SUBMSG_HEARTBEAT && contentLen >= 8 &&
+                 memcmp(pContent + 4, ENTITYID_ROS_DISC_INFO_WRITER, 4) == 0)
+        {
+            memcpy(pContent, readerEntityId, 4);
+        }
+
+        offset += submsgSize;
+    }
+}
+
+bool addRdiReaderEntityIdCandidate(DiscoveredParticipant& dp, const uint8_t* readerEntityId)
+{
+    if (!readerEntityId)
+        return false;
+    for (uint8_t i = 0; i < dp.rdiReaderEntityIdCount; i++)
+    {
+        if (memcmp(dp.rdiReaderEntityIds[i], readerEntityId, 4) == 0)
+            return false;
+    }
+    if (dp.rdiReaderEntityIdCount >= DiscoveredParticipant::RDI_READER_ENTITY_ID_CANDIDATE_CAPACITY)
+        return false;
+    memcpy(dp.rdiReaderEntityIds[dp.rdiReaderEntityIdCount], readerEntityId, 4);
+    dp.rdiReaderEntityIdCount++;
+    return true;
+}
+
+} // namespace
+
 // Slice 4.11 — ensure the QoS mirrors in the header-only autopub profile match
 // the canonical RTPS enum values so the stored profile id can be translated
 // without hidden drift between the two headers.
@@ -444,36 +502,45 @@ void RaftROS::sendSPDP()
 
 void RaftROS::recvSPDP()
 {
-    // Receive SPDP announcement via multicast
-    struct sockaddr_in fromAddr;
-    socklen_t fromLen = sizeof(fromAddr);
-    int n = recvfrom(_spdpSock, _recvBuf, sizeof(_recvBuf), 0,
-                     (struct sockaddr*)&fromAddr, &fromLen);
-    if (n <= 0)
-        return;
+    // Receive a bounded batch per loop tick. FastDDS discovery often arrives
+    // in bursts, and this socket also carries metatraffic multicast DATA.
+    for (uint8_t rxBudget = 0; rxBudget < 8; rxBudget++)
+    {
+        struct sockaddr_in fromAddr;
+        socklen_t fromLen = sizeof(fromAddr);
+        int n = recvfrom(_spdpSock, _recvBuf, sizeof(_recvBuf), 0,
+                         (struct sockaddr*)&fromAddr, &fromLen);
+        if (n <= 0)
+            return;
 
 #ifdef DEBUG_SDSP_RECEIVE
-    // Debug log raw message and source (note that the message may be binary and not null-terminated, so we print the first few bytes as chars if available)
-    LOG_I(MODULE_PREFIX, "recvSPDP raw %d bytes from %s:%d magic=%c%c%c%c",
-          n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port),
-          n > 0 ? _recvBuf[0] : '?', n > 1 ? _recvBuf[1] : '?',
-          n > 2 ? _recvBuf[2] : '?', n > 3 ? _recvBuf[3] : '?');
+        // Debug log raw message and source (note that the message may be binary and not null-terminated, so we print the first few bytes as chars if available)
+        LOG_I(MODULE_PREFIX, "recvSPDP raw %d bytes from %s:%d magic=%c%c%c%c",
+              n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port),
+              n > 0 ? _recvBuf[0] : '?', n > 1 ? _recvBuf[1] : '?',
+              n > 2 ? _recvBuf[2] : '?', n > 3 ? _recvBuf[3] : '?');
 #endif
 
-    DiscoveredParticipant remote;
-    if (!_spdpHandler.parseAnnouncementMessage(_recvBuf, (uint32_t)n, remote))
-    {
+        DiscoveredParticipant remote;
+        if (!_spdpHandler.parseAnnouncementMessage(_recvBuf, (uint32_t)n, remote))
+        {
 #ifdef WARN_SDSP_PARSE_FAILURE
-        LOG_W(MODULE_PREFIX, "recvSPDP parse FAILED (%d bytes)", n);
+            LOG_W(MODULE_PREFIX, "recvSPDP parse FAILED (%d bytes)", n);
 #endif
-        return;
+            // FastDDS may send SEDP builtin endpoint DATA on the metatraffic
+            // multicast port (7400), which shares this socket with SPDP. If this
+            // is not a participant announcement, feed it through the ordinary
+            // metatraffic parser instead of dropping it.
+            processMetatrafficPacket(_recvBuf, (uint32_t)n, fromAddr);
+            continue;
+        }
+
+        // Skip our own announcements
+        if (memcmp(remote.guidPrefix, _participant.getGuidPrefix(), 12) == 0)
+            continue;
+
+        processDiscoveredParticipant(remote, fromAddr);
     }
-
-    // Skip our own announcements
-    if (memcmp(remote.guidPrefix, _participant.getGuidPrefix(), 12) == 0)
-        return;
-
-    processDiscoveredParticipant(remote, fromAddr);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -590,18 +657,26 @@ void RaftROS::processDiscoveredParticipant(DiscoveredParticipant& remote, const 
 
 void RaftROS::recvMetatraffic()
 {
-    struct sockaddr_in fromAddr;
-    socklen_t fromLen = sizeof(fromAddr);
-    int n = recvfrom(_metatrafficSock, _recvBuf, sizeof(_recvBuf), 0,
-                     (struct sockaddr*)&fromAddr, &fromLen);
-    if (n <= 0)
-        return;
+    for (uint8_t rxBudget = 0; rxBudget < 8; rxBudget++)
+    {
+        struct sockaddr_in fromAddr;
+        socklen_t fromLen = sizeof(fromAddr);
+        int n = recvfrom(_metatrafficSock, _recvBuf, sizeof(_recvBuf), 0,
+                         (struct sockaddr*)&fromAddr, &fromLen);
+        if (n <= 0)
+            return;
 
 #ifdef DEBUG_RECEIVE_METATRAFFIC
-    LOG_I(MODULE_PREFIX, "recvMetatraffic %d bytes from %s:%d",
-          n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port));
+        LOG_I(MODULE_PREFIX, "recvMetatraffic %d bytes from %s:%d",
+              n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port));
 #endif
 
+        processMetatrafficPacket(_recvBuf, (uint32_t)n, fromAddr);
+    }
+}
+
+void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen, const struct sockaddr_in& fromAddr)
+{
     struct RxCtx
     {
         RTPSRxRunnerAdapterBaseCtx base;
@@ -614,7 +689,10 @@ void RaftROS::recvMetatraffic()
     rxCtx.base.discovered = &_discovered;
     rxCtx.base.ackSendSock = _metatrafficSock;
     rxCtx.base.readerPolicy = RTPSRxAdapterReaderPolicy::BuiltinEndpointMap;
-    rxCtx.base.ackDestPolicy = RTPSRxAdapterAckDestPolicy::RouteToDiscoveredMetatraffic;
+    // FastDDS may source builtin HEARTBEATs from a process-local UDP socket
+    // rather than the participant's metatraffic unicast port. Reply to the
+    // source tuple so SEDP retransmit ACKNACKs reach the writer that sent the HB.
+    rxCtx.base.ackDestPolicy = RTPSRxAdapterAckDestPolicy::ReplyToSender;
 
     RTPSRxSubmessageRunnerCallbacks callbacks;
     RTPSRunnerAdapter_applyRxBaseCallbacks(callbacks);
@@ -633,6 +711,12 @@ void RaftROS::recvMetatraffic()
     };
     callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
     {
+        if (responded && memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
+        {
+            LOG_I(MODULE_PREFIX,
+                  "SEDP sub HEARTBEAT lastSN=%u -> ACKNACK %d bytes",
+                  (unsigned)lastSNLow, sentBytes);
+        }
 #ifdef DEBUG_RECEIVED_HEARTBEAT
         if (responded)
         {
@@ -645,6 +729,69 @@ void RaftROS::recvMetatraffic()
                   writerEID[0], writerEID[1], writerEID[2], writerEID[3], lastSNLow);
         }
 #endif
+    };
+    callbacks.onHeartbeatDecision = [](void*, RTPSRxChannel,
+                                       const uint8_t* writerEID,
+                                       const RaftRuntime::RTPS::Runtime::Reader::RTPSReaderHeartbeatFields& fields,
+                                       const RaftRuntime::RTPS::Runtime::Reader::RTPSReaderHeartbeatDecision& decision,
+                                       bool responded,
+                                       int sentBytes)
+    {
+        if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) != 0)
+            return;
+        LOG_I(MODULE_PREFIX,
+              "SEDP sub ACKDEC first=%u last=%u hbCount=%u final=%d ackBase=%u bits=%u bitmap=0x%08x%08x responded=%d sent=%d",
+              (unsigned)(fields.firstSN & 0xFFFFFFFFu),
+              (unsigned)(fields.lastSN & 0xFFFFFFFFu),
+              (unsigned)fields.count,
+              (int)fields.finalFlag,
+              (unsigned)(decision.ackNackBase & 0xFFFFFFFFu),
+              (unsigned)decision.ackNackNumBits,
+              (unsigned)((decision.ackNackBitmap >> 32) & 0xFFFFFFFFu),
+              (unsigned)(decision.ackNackBitmap & 0xFFFFFFFFu),
+              (int)responded,
+              sentBytes);
+    };
+    callbacks.onAckNackBuilt = [](void*, RTPSRxChannel,
+                                  const uint8_t* readerEID,
+                                  const uint8_t* writerEID,
+                                  const RaftRuntime::RTPS::Runtime::Reader::RTPSReaderHeartbeatDecision& decision,
+                                  const uint8_t* ackBuf,
+                                  uint32_t ackLen,
+                                  const struct sockaddr_in& fromAddr,
+                                  const struct sockaddr_in& destAddr)
+    {
+        static uint16_t sedpSubAckLogCount = 0;
+        if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) != 0)
+            return;
+        sedpSubAckLogCount++;
+        if ((sedpSubAckLogCount > 12) && ((sedpSubAckLogCount % 32) != 0))
+            return;
+        const uint32_t subOff = 36; // RTPS header (20) + INFO_DST (16).
+        if (ackLen < subOff + 32)
+            return;
+        char srcIp[16] = {0};
+        char dstIp[16] = {0};
+        snprintf(srcIp, sizeof(srcIp), "%s", inet_ntoa(fromAddr.sin_addr));
+        snprintf(dstIp, sizeof(dstIp), "%s", inet_ntoa(destAddr.sin_addr));
+        LOG_I(MODULE_PREFIX,
+              "SEDP sub ACKWIRE src=%s:%u dst=%s:%u reader=%02x%02x%02x%02x writer=%02x%02x%02x%02x base=%u bits=%u sub=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x",
+              srcIp,
+              (unsigned)ntohs(fromAddr.sin_port),
+              dstIp,
+              (unsigned)ntohs(destAddr.sin_port),
+              readerEID[0], readerEID[1], readerEID[2], readerEID[3],
+              writerEID[0], writerEID[1], writerEID[2], writerEID[3],
+              (unsigned)(decision.ackNackBase & 0xFFFFFFFFu),
+              (unsigned)decision.ackNackNumBits,
+              ackBuf[subOff + 0], ackBuf[subOff + 1], ackBuf[subOff + 2], ackBuf[subOff + 3],
+              ackBuf[subOff + 4], ackBuf[subOff + 5], ackBuf[subOff + 6], ackBuf[subOff + 7],
+              ackBuf[subOff + 8], ackBuf[subOff + 9], ackBuf[subOff + 10], ackBuf[subOff + 11],
+              ackBuf[subOff + 12], ackBuf[subOff + 13], ackBuf[subOff + 14], ackBuf[subOff + 15],
+              ackBuf[subOff + 16], ackBuf[subOff + 17], ackBuf[subOff + 18], ackBuf[subOff + 19],
+              ackBuf[subOff + 20], ackBuf[subOff + 21], ackBuf[subOff + 22], ackBuf[subOff + 23],
+              ackBuf[subOff + 24], ackBuf[subOff + 25], ackBuf[subOff + 26], ackBuf[subOff + 27],
+              ackBuf[subOff + 28], ackBuf[subOff + 29], ackBuf[subOff + 30], ackBuf[subOff + 31]);
     };
     callbacks.onData = [](void* userCtx,
                           RTPSRxChannel,
@@ -735,11 +882,93 @@ void RaftROS::recvMetatraffic()
             uint32_t payloadLen = 0;
             RTPSData_getSerializedPayload(pContent, contentLen, dataFlags, pPayload, payloadLen);
             if (!pPayload || payloadLen < 4)
+            {
+                const uint8_t* keyHash = nullptr;
+                if ((dataFlags & 0x02) && contentLen >= 20)
+                {
+                    uint32_t off = 4u + (uint32_t)(pContent[2] | (pContent[3] << 8));
+                    while (off + 4 <= contentLen)
+                    {
+                        const uint16_t pid = (uint16_t)(pContent[off] | (pContent[off + 1] << 8));
+                        const uint16_t plen = (uint16_t)(pContent[off + 2] | (pContent[off + 3] << 8));
+                        off += 4;
+                        if (pid == PID_SENTINEL)
+                            break;
+                        if ((uint32_t)off + plen > contentLen)
+                            break;
+                        if (pid == PID_KEY_HASH && plen >= 16)
+                        {
+                            keyHash = pContent + off;
+                            break;
+                        }
+                        off += plen;
+                    }
+                }
+                if (keyHash)
+                {
+                    for (auto& dp : self->_discovered)
+                    {
+                        if (memcmp(dp.guidPrefix, keyHash, 12) == 0 &&
+                            addRdiReaderEntityIdCandidate(dp, keyHash + 12))
+                        {
+                            const uint16_t fromPort = ntohs(from.sin_port);
+                            if (fromPort != 0 && dp.rdiReaderUnicastPort != fromPort)
+                            {
+                                LOG_I(MODULE_PREFIX,
+                                      "SEDP sub inferred rdi reader port guidPfx=%02x%02x%02x%02x: %u (was %u)",
+                                      dp.guidPrefix[0], dp.guidPrefix[1],
+                                      dp.guidPrefix[2], dp.guidPrefix[3],
+                                      (unsigned)fromPort, (unsigned)dp.rdiReaderUnicastPort);
+                                dp.rdiReaderUnicastPort = fromPort;
+                            }
+                            LOG_I(MODULE_PREFIX,
+                                  "SEDP sub learned rdi reader candidate guidPfx=%02x%02x%02x%02x readerEID=%02x%02x%02x%02x count=%u",
+                                  dp.guidPrefix[0], dp.guidPrefix[1],
+                                  dp.guidPrefix[2], dp.guidPrefix[3],
+                                  keyHash[12], keyHash[13], keyHash[14], keyHash[15],
+                                  (unsigned)dp.rdiReaderEntityIdCount);
+                            break;
+                        }
+                    }
+                    LOG_I(MODULE_PREFIX,
+                          "SEDP sub DATA no payload fromPort=%u contentLen=%u flags=0x%02x payloadLen=%u keyGuidPfx=%02x%02x%02x%02x keyEID=%02x%02x%02x%02x",
+                          (unsigned)ntohs(from.sin_port),
+                          (unsigned)contentLen, (unsigned)dataFlags, (unsigned)payloadLen,
+                          keyHash[0], keyHash[1], keyHash[2], keyHash[3],
+                          keyHash[12], keyHash[13], keyHash[14], keyHash[15]);
+                }
+                else
+                {
+                    LOG_I(MODULE_PREFIX,
+                          "SEDP sub DATA no payload fromPort=%u contentLen=%u flags=0x%02x payloadLen=%u",
+                          (unsigned)ntohs(from.sin_port),
+                          (unsigned)contentLen, (unsigned)dataFlags, (unsigned)payloadLen);
+                }
                 return;
+            }
             RaftRuntime::RTPS::Runtime::Dispatch::RTPSParsedSubscriptionAnnounce parsedSub;
-            if (!RaftRuntime::RTPS::Runtime::Dispatch::RTPSSEDPSubscriptionParser_parse(
-                    pPayload, payloadLen, parsedSub))
+            const bool subParseOk =
+                RaftRuntime::RTPS::Runtime::Dispatch::RTPSSEDPSubscriptionParser_parse(
+                    pPayload, payloadLen, parsedSub);
+            LOG_I(MODULE_PREFIX,
+                  "SEDP sub DATA contentLen=%u flags=0x%02x payloadLen=%u parseOk=%d encap=%02x%02x%02x%02x",
+                  (unsigned)contentLen, (unsigned)dataFlags, (unsigned)payloadLen,
+                  (int)subParseOk,
+                  payloadLen > 0 ? pPayload[0] : 0,
+                  payloadLen > 1 ? pPayload[1] : 0,
+                  payloadLen > 2 ? pPayload[2] : 0,
+                  payloadLen > 3 ? pPayload[3] : 0);
+            if (!subParseOk)
                 return;
+            LOG_I(MODULE_PREFIX,
+                  "SEDP sub parsed topic='%.*s' readerEID=%02x%02x%02x%02x port=%u",
+                  (int)parsedSub.topicLen,
+                  parsedSub.topic ? parsedSub.topic : "",
+                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[12] : 0,
+                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[13] : 0,
+                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[14] : 0,
+                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[15] : 0,
+                  (unsigned)parsedSub.unicastLocatorPort);
             // Filter on topic name == "ros_discovery_info" (the rdi reader is
             // the only one for which a per-reader port matters; other readers
             // share the participant default user-data port).
@@ -749,6 +978,16 @@ void RaftROS::recvMetatraffic()
                 parsedSub.topicLen != RDI_TOPIC_LEN ||
                 memcmp(parsedSub.topic, RDI_TOPIC, RDI_TOPIC_LEN) != 0)
                 return;
+            if (parsedSub.hasReaderGuid)
+            {
+                LOG_I(MODULE_PREFIX,
+                      "SEDP rdi reader guidPfx=%02x%02x%02x%02x readerEID=%02x%02x%02x%02x port=%u",
+                      parsedSub.readerGuid[0], parsedSub.readerGuid[1],
+                      parsedSub.readerGuid[2], parsedSub.readerGuid[3],
+                      parsedSub.readerGuid[12], parsedSub.readerGuid[13],
+                      parsedSub.readerGuid[14], parsedSub.readerGuid[15],
+                      (unsigned)parsedSub.unicastLocatorPort);
+            }
             if (parsedSub.unicastLocatorPort == 0)
                 return;
             // Locate the matching DiscoveredParticipant by readerGuid prefix
@@ -783,6 +1022,8 @@ void RaftROS::recvMetatraffic()
                               (unsigned)dp.rdiReaderUnicastPort);
                         dp.rdiReaderUnicastPort = parsedSub.unicastLocatorPort;
                     }
+                    if (parsedSub.hasReaderGuid)
+                        (void)addRdiReaderEntityIdCandidate(dp, parsedSub.readerGuid + 12);
                     break;
                 }
             }
@@ -794,6 +1035,8 @@ void RaftROS::recvMetatraffic()
                 memcpy(partial.guidPrefix, senderGuidPfx, 12);
                 partial.ipAddr               = from.sin_addr.s_addr;
                 partial.rdiReaderUnicastPort = parsedSub.unicastLocatorPort;
+                if (parsedSub.hasReaderGuid)
+                    (void)addRdiReaderEntityIdCandidate(partial, parsedSub.readerGuid + 12);
                 // leaseDurationSec = 0 → uses DEFAULT_LEASE_TIMEOUT_MS (240 s)
                 LOG_I(MODULE_PREFIX,
                       "SEDP rdi partial-disc guidPfx=%02x%02x%02x%02x rdiPort=%u",
@@ -841,7 +1084,7 @@ void RaftROS::recvMetatraffic()
     };
 
     RTPSRxSubmessageRunner_run(
-        _recvBuf, (uint32_t)n, fromAddr,
+        packet, packetLen, fromAddr,
         RTPSRxChannel::Metatraffic,
         _acknackCount,
         callbacks,
@@ -1313,8 +1556,27 @@ void RaftROS::stepWriterHeartbeatPass()
                         : remoteRef.userDataPort;
                 dest.sin_port = htons(rdiPort);
             }
-            return sendto(sock, self->_sendBuf, payloadLen, 0,
-                          (struct sockaddr*)&dest, sizeof(dest));
+            const int primarySent = sendto(sock, self->_sendBuf, payloadLen, 0,
+                                           (struct sockaddr*)&dest, sizeof(dest));
+            if (sendTarget == RTPSWriterHeartbeatSendTarget::UserData &&
+                remoteRef.rdiReaderEntityIdCount > 0)
+            {
+                for (uint8_t i = 0; i < remoteRef.rdiReaderEntityIdCount; i++)
+                {
+                    patchRosDiscoveryInfoReaderId(
+                        self->_sendBuf, payloadLen, remoteRef.rdiReaderEntityIds[i]);
+                    const int fanoutSent = sendto(sock, self->_sendBuf, payloadLen, 0,
+                                                 (struct sockaddr*)&dest, sizeof(dest));
+                    LOG_I(MODULE_PREFIX,
+                          "rosDiscInfo fanout readerEID=%02x%02x%02x%02x sent %d/%u port=%u",
+                          remoteRef.rdiReaderEntityIds[i][0],
+                          remoteRef.rdiReaderEntityIds[i][1],
+                          remoteRef.rdiReaderEntityIds[i][2],
+                          remoteRef.rdiReaderEntityIds[i][3],
+                          fanoutSent, (unsigned)payloadLen, (unsigned)ntohs(dest.sin_port));
+                }
+            }
+            return primarySent;
         };
 
         callbacks.logSend = [](void* userCtx,

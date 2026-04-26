@@ -74,6 +74,22 @@ struct RTPSRxSubmessageRunnerCallbacks
                         uint32_t lastSNLow,
                         bool responded,
                         int sentBytes) = nullptr;
+    void (*onHeartbeatDecision)(void* userCtx,
+                                RTPSRxChannel channel,
+                                const uint8_t* writerEID,
+                                const RaftRuntime::RTPS::Runtime::Reader::RTPSReaderHeartbeatFields& fields,
+                                const RaftRuntime::RTPS::Runtime::Reader::RTPSReaderHeartbeatDecision& decision,
+                                bool responded,
+                                int sentBytes) = nullptr;
+    void (*onAckNackBuilt)(void* userCtx,
+                           RTPSRxChannel channel,
+                           const uint8_t* readerEID,
+                           const uint8_t* writerEID,
+                           const RaftRuntime::RTPS::Runtime::Reader::RTPSReaderHeartbeatDecision& decision,
+                           const uint8_t* ackBuf,
+                           uint32_t ackLen,
+                           const struct sockaddr_in& fromAddr,
+                           const struct sockaddr_in& destAddr) = nullptr;
     void (*onData)(void* userCtx,
                    RTPSRxChannel channel,
                    const uint8_t* packet,

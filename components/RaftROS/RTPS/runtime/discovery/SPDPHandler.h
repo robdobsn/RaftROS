@@ -31,6 +31,14 @@ struct DiscoveredParticipant
     // sample never reaches the rdi reader and the writer is reported as
     // `_NODE_NAME_UNKNOWN_` by `ros2 topic info`.
     uint16_t rdiReaderUnicastPort = 0;
+    // Diagnostic/fallback: FastDDS transient CLI/daemon participants may use
+    // dynamically allocated reader entity IDs for ros_discovery_info rather
+    // than the builtin-looking 0x00000204. These candidates are learned from
+    // SEDP subscription inline-QoS key hashes and can be used to fan out rdi
+    // DATA/HEARTBEAT until a full DATA(r) announce identifies the live reader.
+    static constexpr uint8_t RDI_READER_ENTITY_ID_CANDIDATE_CAPACITY = 8;
+    uint8_t rdiReaderEntityIds[RDI_READER_ENTITY_ID_CANDIDATE_CAPACITY][4] = {};
+    uint8_t rdiReaderEntityIdCount = 0;
     uint32_t leaseDurationSec = 0;
     uint64_t discoveredTimeMs = 0;
     bool valid = false;

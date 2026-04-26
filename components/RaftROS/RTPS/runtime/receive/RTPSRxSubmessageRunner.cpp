@@ -79,6 +79,12 @@ int emitReaderRunnerAckNack(
         return -1;
     pos += ackLen;
 
+    if (callbacks.onAckNackBuilt)
+    {
+        callbacks.onAckNackBuilt(
+            userCtx, channel, ourReaderEID, parsed.writerEID, decision,
+            ackBuf, pos, fromAddr, ackDest);
+    }
     return callbacks.sendAck(userCtx, ackBuf, pos, ackDest);
 }
 
@@ -158,6 +164,11 @@ bool RTPSRxSubmessageRunner_run(
                     RaftRuntime::RTPS::Runtime::Reader::applyHeartbeatProcessedToReaderState(
                         *readerState, parsed.fields, responded);
 
+                    if (callbacks.onHeartbeatDecision)
+                    {
+                        callbacks.onHeartbeatDecision(
+                            userCtx, channel, writerEID, parsed.fields, decision, responded, sent);
+                    }
                     if (callbacks.onHeartbeat)
                         callbacks.onHeartbeat(userCtx, channel, writerEID, lastSNLow, responded, sent);
 
@@ -203,6 +214,34 @@ bool RTPSRxSubmessageRunner_run(
         }
         else if ((submsgId == SUBMSG_DATA) && (contentLen >= 24))
         {
+            RaftRuntime::RTPS::Runtime::Reader::RTPSReaderWriterState* readerState = nullptr;
+            const uint8_t* writerEID = pContent + 8;
+            if (callbacks.resolveReaderWriterState)
+                readerState = callbacks.resolveReaderWriterState(
+                    userCtx, channel, srcGuidPrefix, writerEID);
+            if (readerState)
+            {
+                RTPSReaderDataParsed parsed;
+                if (RTPSReaderRunner_parseData(pContent, contentLen, flags, parsed))
+                {
+                    // Key-only dispose/unregister DATA can arrive long after
+                    // the live endpoint ADD samples. Do not advance the reader
+                    // reliability window for those no-payload samples, or the
+                    // next HEARTBEAT ACKNACK will start near the dispose SN and
+                    // never request the earlier ADD payloads we actually need.
+                    if (parsed.payload && parsed.payloadLen > 0)
+                    {
+                        const auto decision =
+                            RaftRuntime::RTPS::Runtime::Reader::evaluateIncomingDataDecision(
+                                *readerState, parsed.fields);
+                        if (decision == RaftRuntime::RTPS::Runtime::Reader::RTPSReaderDataAction::Accept)
+                        {
+                            RaftRuntime::RTPS::Runtime::Reader::applyAcceptedDataToReaderState(
+                                *readerState, parsed.fields.writerSeqNum);
+                        }
+                    }
+                }
+            }
             if (callbacks.onData)
                 callbacks.onData(userCtx, channel, packet, packetLen, srcGuidPrefix, fromAddr, pContent, contentLen, flags);
         }

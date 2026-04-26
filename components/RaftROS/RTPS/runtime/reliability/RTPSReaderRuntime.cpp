@@ -106,6 +106,13 @@ RTPSReaderHeartbeatDecision evaluateIncomingHeartbeatDecision(
     if (base < hb.firstSN)
         base = hb.firstSN;
 
+    // If the writer is far beyond our tracked window, request the most recent
+    // window rather than repeatedly NACKing old samples that may have already
+    // fallen out of the writer history. This is important for long-lived SEDP
+    // writers, whose sequence numbers can be very high before this reader joins.
+    if (hb.lastSN >= base + RTPS_READER_MAX_BITMAP_BITS)
+        base = hb.lastSN - (RTPS_READER_MAX_BITMAP_BITS - 1);
+
     // If we are fully caught up (base > hb.lastSN), send a "nothing missing" ACKNACK
     // with numBits=0 at base = hb.lastSN + 1 ONLY when the writer did not set FINAL
     // (writer is explicitly asking for confirmation).
