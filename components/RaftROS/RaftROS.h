@@ -263,6 +263,7 @@ private:
     void sendSPDP();
     void recvSPDP();
     void recvMetatraffic();
+    void processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen, const struct sockaddr_in& fromAddr);
     void recvUserData();
     void startWriterHeartbeatPass();
     void stepWriterHeartbeatPass();

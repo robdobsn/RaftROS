@@ -82,6 +82,234 @@ firmware is fine and the issue is daemon/CLI plumbing.
   match nothing. Always pass `--qos-reliability best_effort` to `ros2
   topic echo` for sensor streams.
 
+### Task D investigation 2026-04-25 (continuing) — `_NODE_NAME_UNKNOWN_` for transient CLI participants
+
+This session pursued the "rdi DATA never reaches transient `ros2 topic
+info` / daemon participants" hypothesis. Net effect on the user-visible
+symptom: still `_NODE_NAME_UNKNOWN_`, but several real defects in the
+discovery-routing path were found and fixed; the remaining symptom now
+appears to be a different (post-DATA) handshake issue, not a routing
+issue. Detailed below.
+
+#### Root cause diagnosis (current best theory)
+
+The Linux daemon (`010fee75…`) and every short-lived `ros2 topic info`
+process spin up their own DDS participant. Each one uses **two unicast
+ports**:
+* a metatraffic locator (advertised in the participant's SPDP DATA),
+  which is what most of FastDDS's reliable discovery exchanges use; and
+* a dedicated **user-data unicast locator advertised inside the
+  participant's own SEDP `subs` DATA** for `ros_discovery_info` —
+  i.e. the per-reader unicast locator embedded in the
+  `PublicationBuiltinTopicData` / `SubscriptionBuiltinTopicData` PIDs.
+
+We were sending rdi DATA to the participant's metatraffic port (or to
+the SPDP-advertised user-data port). For the daemon and CLI participants
+those are *not* the same as the rdi reader's per-endpoint unicast
+locator. Result: rdi DATA hit a port at which the listener-side reader
+proxy was not listening; rmw_dds_common never matched, so the cached
+node-name → GID map stayed empty and the CLI printed
+`_NODE_NAME_UNKNOWN_`.
+
+The standalone `range_reference_pub.py` participant happens to use the
+same locator for everything (small Python participant, single endpoint),
+so it has always worked — which is why this regressed silently past
+every previous round of testing.
+
+#### Fixes implemented this session (all on disk, in
+`components/RaftROS/RaftROS.cpp` and friends)
+
+* **Fix #5 — bump SEDP-publication seq on autopub attach.**
+  `_rosDiscSeqNum++` was correct here, but the previous attempt's revert
+  also reverted the SEDP-pub bump. Restored as `++_sedpPubSeqNum` (not
+  `_rosDiscSeqNum`) so peers re-advertise our autopub writers without
+  regressing the rdi GAP problem from earlier attempt #1.
+* **Fix #6 — rdi ACK retransmit firstSN + key hash.** Reliable
+  retransmit path was sending DATA with `writerSN=0` and an empty
+  PID_KEY_HASH; FastDDS dropped these as malformed. Now copies the
+  current `firstSN` and the participant key hash on every retransmit.
+* **Fix #7a — route rdi DATA to the SEDP-advertised reader port.**
+  In `stepWriterHeartbeatPass` the `sendPayload` callback now uses
+  `DiscoveredParticipant::rdiReaderUnicastPort` when non-zero, falling
+  back to `userDataPort` only when no SEDP-subs has been observed yet.
+* **Fix #7b — ACKNACK NACK bitmap bit-reversal.** Reader runtime was
+  emitting bits in the wrong order so retransmit requests targeted the
+  wrong sequence numbers. Corrected in
+  `RTPSRunnerAdapterHelpers::emitReaderRunnerAckNack`.
+* **Fix #8 — ACKNACK routing to the metatraffic locator.** Builtin
+  ACKNACKs were being sent to the user-data port (which sometimes works
+  for FastDDS but not for CycloneDDS or transient CLI participants); now
+  routed via `RouteToDiscoveredMetatraffic`.
+* **Fix #9 — partial-discovery from SEDP `subs` DATA for
+  `ros_discovery_info`.** The transient `ros2 topic info` participant
+  multicasts its SPDP DATA before joining; if the ESP's WiFi IGMP
+  membership for `239.255.0.1` has aged out (very common on this AP),
+  that SPDP is missed and the participant is never added to
+  `_discovered`. We then never have a route to send rdi DATA back. New
+  helper `RTPSSEDPSubscriptionParser_parse()` extracts
+  `PID_ENDPOINT_GUID`, `PID_TOPIC_NAME` and `PID_UNICAST_LOCATOR` from
+  every incoming SEDP-subs DATA on the metatraffic socket; if the topic
+  is `ros_discovery_info` and the sender's GUID prefix is **not** in
+  `_discovered`, we now insert a partial `DiscoveredParticipant`
+  initialised from the SEDP subs locator (`rdiReaderUnicastPort`,
+  `ipAddr`, `guidPrefix`) and call `processDiscoveredParticipant` so the
+  normal pending-announce / heartbeat path picks it up.
+
+  All fields needed for partial discovery were added to
+  `DiscoveredParticipant` (new `rdiReaderUnicastPort`); `MAX_DISCOVERED`
+  raised to 8 to fit daemon + CLI + reference publisher + ESP itself
+  without LRU churn.
+
+#### Wire-level outcome after Fix #9 (m13.pcap, 20 s capture)
+
+After flashing the Fix #9 build via `raft f` and capturing a
+`ros2 topic info -v /raft/range_1_29` invocation:
+
+```
+=== rdi DATA from ESP — destination ports ===
+   6 7411
+   7 7413
+=== ESP→host port distribution (all UDP, 20 s) ===
+   2 7400
+ 116 7410   metatraffic announce (SPDP/SEDP) — host daemon
+ 112 7411   user-data — transient ros2-CLI participant (NEW with Fix #9)
+  44 7412   metatraffic — transient ros2-CLI participant
+ 113 7413   user-data — host daemon
+```
+
+So Fix #9 *does* fire: rdi DATA now reaches the transient
+`ros2 topic info` participant on its advertised port (7411), in addition
+to the daemon (7413). The partial-discovery path is observably correct.
+
+#### What is still broken
+
+`ros2 topic info -v /raft/range_1_29` still reports
+`Node name: _NODE_NAME_UNKNOWN_` for the ESP after Fix #9. Wire
+analysis of m13.pcap shows the cause: **the host never sends an
+ACKNACK back for our rdi writer.** Across the whole 20 s capture
+there are **zero** ACKNACK submessages from the host targeted at our
+rdi writer (`writerEntityId=0x00000103`, `readerEntityId=0x00000204`),
+even though our DATA(seq=1) and HEARTBEAT(firstSN=1, lastSN=1) are
+visibly arriving at port 7411 of the live CLI participant.
+
+Symptoms in the trace:
+* ESP→7411 contains DATA(rdi, seq=1) + HEARTBEAT(rdi, firstSN=1,
+  lastSN=1, count incrementing). Payload deserializes round-trip with
+  `rclpy.serialization.deserialize_message` (verified in earlier
+  session) — it is byte-correct.
+* Host→ESP contains the host's own SEDP DATA + HEARTBEAT for
+  `ros_discovery_info` (writerEntityId 0x000004c2) — i.e. the host is
+  publishing its own rdi reader endpoint as expected.
+* Host→ESP contains ACKNACKs for SEDP-subs and SEDP-pubs
+  (`rdEntityId=0x000004c7`, `0x000003c7`) — so the SEDP reliable channel
+  is fine on both sides.
+* Host→ESP contains **no** ACKNACK at all for the rdi writer
+  (`rdEntityId=0x00000204`).
+
+This means the host's rmw_dds_common reader proxy for our rdi writer
+was never created (or, if it was, it never matched our writer-proxy
+on its side). Our rdi DATA arrives at the right port but lands on a
+participant which has no matching reader, so it is silently dropped at
+the RTPS layer.
+
+Most likely outstanding causes (ordered by likelihood):
+
+1. **Reader entityId in the SEDP-subs DATA we receive does not
+   match what we put in our rdi DATA's
+   `readerId` field.** We currently send rdi DATA with
+   `readerEntityId = ENTITYID_ROS_DISC_INFO_READER (0x00000204)`.
+   Some FastDDS versions allocate a per-process entityId for
+   `ros_discovery_info` readers (e.g. `0x00010204` or similar) and
+   advertise it via PID_ENDPOINT_GUID in the SEDP subs. We are not
+   currently propagating that observed reader entityId into our rdi
+   DATA submessage — we should.
+2. **No SEDP publication of our rdi reader to the new participant.**
+   Even though we publish our rdi *writer* in SEDP-pubs, transient
+   CLI participants may also need to see our rdi *reader* (so their
+   builtin SEDP-subs writer matches and they ACK our SEDP-subs). The
+   SEDP-subs HB-driven retransmit only fires after a discovered
+   participant is in `_discovered`; for partial entries we're not
+   re-sending SEDP-subs to the new locator.
+3. **Daemon rdi locator port still 0.** The daemon (long-lived
+   `010fee75…`) was discovered via SPDP in the past; its
+   `rdiReaderUnicastPort` is still 0 because we did not capture its
+   own SEDP-subs locator at the time. After Fix #9 a fresh `daemon
+   start` would pick it up, but historical entries don't get
+   retroactively patched. Add a periodic re-scan of SEDP-subs against
+   `_discovered` to update locator ports for already-known
+   participants.
+4. **PID_ENDPOINT_GUID parser accepts the *first* PID_UNICAST_LOCATOR
+   regardless of `kind`.** The transient CLI participant advertises
+   three locators (10.255.255.254 / 192.168.1.28 / 169.254.83.107)
+   all on port 7000 in m12, port 7411 in m13. Currently fine because
+   they all have the same port, but a host with mixed UDPv4/SHM
+   locators could trip this.
+
+#### Plan for the next session
+
+In priority order:
+
+1. **Verify the reader-entityId hypothesis.**  Add a
+   one-shot `LOG_I` in the SEDP-subs handler that prints the parsed
+   `readerEntityId` for `ros_discovery_info`, then build with
+   `idf.py build` (esp-idf-v5.5.3) and `raft f`. If the host's reader
+   entityId is *not* 0x00000204, store it per-participant and use it
+   in the `readerId` field of every rdi DATA / HEARTBEAT we send to
+   that participant.
+2. **Send a directed SEDP-subs DATA to partial participants** as part
+   of the pending-announce flow, so the new participant has our rdi
+   reader endpoint before it tries to match our writer.
+3. **Periodic SEDP-subs locator backfill.** On each incoming SEDP-subs
+   DATA, also update `rdiReaderUnicastPort` on existing
+   `_discovered` entries (we currently only update on the
+   "found-in-discovered" branch — Fix #9's new branch only handles
+   the "not found" case). Re-check the code: the existing `for` loop
+   does update; confirm the daemon never enters that branch (it
+   doesn't because the daemon's rdi-subs DATA arrives via multicast
+   metatraffic, which we may not parse the same way as the unicast
+   path). Make sure the SEDP-subs parser is invoked on multicast
+   traffic too.
+4. **Locator-kind filter.** Make
+   `RTPSSEDPSubscriptionParser_parse()` prefer
+   `LOCATOR_KIND_UDPv4` over UDPv6/SHM/TCP when multiple
+   `PID_UNICAST_LOCATOR`s are present.
+5. **Address WiFi IGMP aging at source.** The whole "partial
+   discovery" branch only exists because the ESP's multicast group
+   membership for `239.255.0.1` ages out under
+   ESP-IDF's WiFi/LWIP. Either:
+   * Periodically re-issue an IGMP membership report (use
+     `igmp_joingroup`/`igmp_leavegroup` cycle every 30 s); or
+   * Drop the partial-discovery hack once IGMP renewal is in place.
+
+Tracking artefact for this session: `m13.pcap` at `/tmp/m13.pcap`
+(host capture, all UDP to/from `192.168.1.173`, 20 s window
+covering one `ros2 topic info -v` invocation post Fix #9 flash).
+
+#### Build / flash procedure that worked (use this; OTA is broken)
+
+```bash
+cd /home/rob/rdev/raft/RaftROS/examples/ExampleDiscoverable
+source /home/rob/esp/esp-idf-v5.5.3/export.sh
+idf.py build
+cp build/SysTypeMain.bin build/SysTypeMain/SysTypeMain.bin   # required for `raft f`
+raft f       # WSL → Windows raft.exe → COM3 esptool, ~10 s
+# optional separate terminal:
+raft m
+```
+
+`raft r -c` (docker / esp-idf-v6) also produces a working binary, but
+it overwrites `build/SysTypeMain/SysTypeMain.bin` with a slightly
+different sized binary; both are confirmed to contain the Fix #9
+literal `partial-disc` string in their `.rodata`.
+
+**Do NOT use OTA (`/api/espFwUpdate`) while the rdi/RTPS task is
+running.** OTATask blocks CPU0 long enough to trip the watchdog within
+the first ~64 KB of upload; the connection is RST'd and the response
+oscillates between `{"rslt":"fail","error":"InProgress"}` and
+`{"rslt":"fail","error":"NotStarted"}` after retry. The serial flash
+path via `raft f` is the only reliable option for now; possibly
+add a watchdog-feed in the OTA write loop or yield on every chunk.
+
 ### Most recent fix (2026-04-25)
 
 **`ros_discovery_info` Gid CDR layout corrected (24 → 16 bytes).**
