@@ -1,7 +1,12 @@
 # RaftROS Next Stages Implementation Plan
 
 **Date:** 2026-04-22
-**Scope:** Phase 2 (ESP32 topic publishing) and Phase 3 (ESP32 topic subscribing, including N-ary per-topic routing) are now complete and verified end-to-end. Remaining work: reader-side ACKNACK consolidation polish, and Phase 4 DeviceManager integration.
+**Status update:** 2026-04-27
+**Scope:** Historical implementation plan for Phases 2–4. Phase 2
+(publishing), Phase 3 (subscribing, including N-ary per-topic routing), and
+Phase 4 (DeviceManager auto-publishing) are now complete. This document is
+kept as an implementation history; use `RaftROS-development-status.md` for the
+current status and known issues.
 
 ## Status Summary
 
@@ -11,12 +16,15 @@
 - Stage 4 (Native Linux app path alignment) — **in progress**; most orchestration is shared; `raftros_standalone.cpp` is now mostly callbacks.
 - Stage 5 (Hardening and test expansion) — **ongoing**.
 - Stage 6 (Topic subscribing, Phase 3) — **done and verified 2026-04-22**: ESP32 subscribes to N topics (`/chatter_in`, `/chatter_in2`, …) with per-topic dispatch; `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` routes to `MainSysMod::chatter_in2` handler via remote-writer-GUID → slot mapping populated from SEDP publication DATAs.
+- Stage 7 (DeviceManager auto-publishing, Phase 4) — **done and verified by 2026-04-25**: plugging a supported I2C sensor into `ExampleDiscoverable` creates a typed `/raft/...` ROS 2 topic, publishes CDR samples with standard message types, and disposes the endpoint on detach.
+- Demo polish (2026-04-27) — **done for first demo path**: `examples/DemoSimple` dynamically discovers `/raft/...` topics, subscribes with compatible QoS, and displays live values. Foxglove Studio is documented with `foxglove_bridge` for both WSL-to-Windows and native Linux.
+- Known caveat — `ros2 topic info -v` can still show `_NODE_NAME_UNKNOWN_` on the current WSL2/Jazzy/FastDDS setup. Data subscribers, `DemoSimple`, and Foxglove Bridge work. See `RaftROS-development-status.md` for the Task D investigation and current WSL-specific assumption.
 
 ## Objectives (forward)
 
 1. Finish convergence of the remaining writer-state/action-execution policy under `RTPSReliabilityAndWriterStateRuntime`.
 2. ~~Add topic subscribing (Phase 3): SEDP reader announcement, reader-side ACKNACK, CDR deserialization, message dispatch hook.~~ **DONE 2026-04-22** (Stage 6).
-3. Start Phase 4: auto-wire publishers from Raft DeviceManager data sources through StatePublisher into RaftROS as a CommsChannel.
+3. ~~Start Phase 4: auto-wire publishers from Raft DeviceManager data sources through StatePublisher into RaftROS as a CommsChannel.~~ **DONE** via direct DeviceManager status/data callbacks and dynamic writer lifecycle. See `RaftROS-auto-publishing-design.md`.
 
 ## Guiding Principles
 
@@ -144,18 +152,21 @@
 
 - Reader-side ACKNACK consolidation: fold the last per-writer-kind bookkeeping (labels, FINAL-flag suppression nuances) fully behind `RTPSReaderRuntime`.
 
-## Stage 7: DeviceManager Auto-Publishing (Phase 4) — FUTURE
+## Stage 7: DeviceManager Auto-Publishing (Phase 4) — DONE ✅
 
 ### Deliverables
 
-- `RaftROS` registers as a `CommsChannel` with `CommsCoreIF`.
-- Configured `pubSources` wire StatePublisher subscriptions (e.g., `devjson`, `devbin`) into the RaftROS channel.
-- DeviceTypeRecord → ROS 2 message type mapping (`clas` tag → `sensor_msgs/*`).
-- Dynamic SEDP publication announcement as devices appear/disappear.
+- DeviceManager status-change callbacks instantiate/release dynamic writers.
+- DeviceManager data callbacks feed decoded poll records into CDR serializers.
+- DeviceTypeRecord → ROS 2 message type mapping (`clas` tag → `sensor_msgs/*`, `std_msgs/*`, `geometry_msgs/*`) is implemented by `RTPSAutoPubClassMap`.
+- Dynamic SEDP publication ADD / DISPOSE announcements are emitted as devices appear/disappear.
+- Per-class QoS profiles and SysTypes overrides are implemented.
 
 ### Exit Criteria
 
-- Plugging an I2C sensor into a running ExampleDiscoverable board creates a new ROS 2 topic visible in `ros2 topic list` within one SEDP heartbeat.
+- Plugging an I2C sensor into a running `ExampleDiscoverable` board creates a new ROS 2 topic visible to `rclpy` graph discovery and `DemoSimple` within a few seconds.
+- Example validation on 2026-04-27: VL6180 appears as `/raft/range_1_29` (`sensor_msgs/msg/Range`) and publishes live range samples.
+- Note: `ros2 topic list` / `ros2 topic info` remain less reliable on WSL/Jazzy because of ros2cli daemon and `_NODE_NAME_UNKNOWN_` graph-attribution behavior. Prefer `DemoSimple`/`rclpy` for validation on that host.
 
 ## Recommended Immediate Implementation Order
 
@@ -174,11 +185,13 @@
 - **Risk:** Reader-side reliability subtleties (missed heartbeats, out-of-order DATA) introduce the same kind of hard-to-diagnose bugs seen in the writer path.
   - **Mitigation:** Put reader decision logic in shared runtime from day one; keep wrappers to IO only; mirror the writer-side test pattern.
 - **Risk:** Dynamic endpoint creation (Phase 4) conflicts with the static SEDP sequence numbering assumptions.
-  - **Mitigation:** Track a per-writer SEDP-pub sequence counter already centralized — just ensure new writers get a fresh unique SN; cover with unit tests before go-live.
+  - **Mitigation:** Done. Dynamic writers use registry-managed entity IDs and monotonically increasing SEDP publication sequence numbers, covered by Linux tests and on-device validation.
+- **Risk:** `ros2` CLI graph attribution reports `_NODE_NAME_UNKNOWN_` on WSL/Jazzy, making demos look broken even when data subscriptions work.
+  - **Mitigation:** Use `DemoSimple`/direct `rclpy` and Foxglove Bridge as the primary demo surfaces. Treat native Linux reproduction as the next discriminator before assuming a firmware protocol defect.
 
 ## Definition of Done for the Next Milestone
 
-- Phase 3: ESP32 receives a ROS 2 topic reliably, with shared reader runtime behind runner callbacks.
-- Phase 2 regression tests in place (VOLATILE firstSN invariant; distinct SEDP-pub SNs).
-- Linux and ESP32 use the same writer and reader orchestration logic in shared code.
-- Unit tests pass and devdocs reflect test commands and expected outputs.
+- Phase 4 remains stable with hot-plug auto-published device topics.
+- `DemoSimple` remains the canonical simple demo for dynamic topic discovery.
+- Native Linux validation is run to confirm whether `_NODE_NAME_UNKNOWN_` is WSL/Jazzy-specific.
+- Unit tests pass and devdocs reflect test commands, expected outputs, and known caveats.

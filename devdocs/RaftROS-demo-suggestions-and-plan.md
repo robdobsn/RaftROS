@@ -1,6 +1,8 @@
 # RaftROS / ExampleDiscoverable Demo Suggestions and Implementation Plan
 
 **Date:** 2026-04-26  
+**Status update:** 2026-04-27 — first demo path implemented in
+`examples/DemoSimple`; Foxglove Bridge instructions added to `README.md`.
 **Scope:** Demonstrations for `ExampleDiscoverable` showing hot-plug I2C devices appearing as native ROS 2 publishers.
 
 ## Demo Goal
@@ -43,6 +45,14 @@ This is the best fit because it demonstrates what is novel about RaftROS:
 ### Demo Surface 1: Dynamic Terminal Dashboard
 
 Create a small `rclpy` utility that watches the ROS graph, detects `/raft/...` topics, dynamically subscribes using the discovered type, and prints the latest value from each active topic.
+
+Implemented as:
+
+```text
+examples/DemoSimple/raftros_dynamic_dashboard.py
+examples/DemoSimple/run_dashboard.sh
+examples/DemoSimple/README.md
+```
 
 This avoids the main weakness of plain `ros2 topic echo`: `echo` normally requires the user to know both the topic and type ahead of time. The dashboard should discover both dynamically.
 
@@ -112,10 +122,10 @@ That would be a good second-stage demo, but it adds a simulation layer that dist
 
 ### Slice 1: Create Dynamic Dashboard Utility
 
-Add a script, proposed path:
+Added a script at:
 
 ```text
-scripts/raftros_dynamic_dashboard.py
+examples/DemoSimple/raftros_dynamic_dashboard.py
 ```
 
 Responsibilities:
@@ -131,10 +141,10 @@ Responsibilities:
 
 Use BEST_EFFORT / VOLATILE / KEEP_LAST QoS by default because that matches the fast sensor auto-publishing profile. Add an option to force RELIABLE for slow or diagnostic topics if needed.
 
-Suggested CLI:
+CLI:
 
 ```bash
-python3 scripts/raftros_dynamic_dashboard.py \
+examples/DemoSimple/run_dashboard.sh \
   --namespace /raft \
   --qos best_effort \
   --refresh-hz 4
@@ -178,23 +188,37 @@ Keep the dashboard generic so future RaftROS-supported devices appear automatica
 
 ### Slice 4: Demo Runner Script
 
-Add a small wrapper script or documented command block that prepares the environment and starts the dashboard.
+Added a wrapper script that prepares the environment and starts the dashboard:
 
-Example:
+```text
+examples/DemoSimple/run_dashboard.sh
+```
+
+It sources ROS, selects Fast DDS over UDPv4, clears Fast DDS profile overrides,
+uses a local `examples/DemoSimple/logs` directory, and handles
+`ROS_LOCALHOST_ONLY` for Humble vs newer distros.
+
+Equivalent manual command:
 
 ```bash
 source /opt/ros/jazzy/setup.bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
 export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
 unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
-python3 -u scripts/raftros_dynamic_dashboard.py --namespace /raft
+unset ROS_LOCALHOST_ONLY
+python3 -u examples/DemoSimple/raftros_dynamic_dashboard.py --namespace /raft
 ```
 
 If using ROS 2 Humble, keep `ROS_LOCALHOST_ONLY=0` where needed. If using Jazzy, leave `ROS_LOCALHOST_ONLY` unset.
 
 ### Slice 5: Foxglove Layout
 
-Create a saved Foxglove layout or a short setup guide:
+Foxglove Bridge setup is documented in the main `README.md` for:
+
+- `foxglove_bridge` running in WSL with Foxglove Studio on Windows.
+- `foxglove_bridge` and Foxglove Studio both running natively on Linux.
+
+Future optional polish: create a saved Foxglove layout or a short panel setup guide:
 
 1. Connect Foxglove to the ROS 2 data source.
 2. Add a topic list / raw messages panel.
@@ -240,6 +264,18 @@ python3 -u scripts/typed_deserialize_probe.py /raft/range_1_29 sensor_msgs/msg/R
 
 ## Risks and Mitigations
 
+### `_NODE_NAME_UNKNOWN_` In ROS CLI
+
+On the current WSL2/Jazzy/FastDDS host, `ros2 topic info -v` can show RaftROS
+publishers as `Node name: _NODE_NAME_UNKNOWN_` even when the data path works.
+The current assumption is that the remaining symptom is specific to ros2cli/rmw
+graph attribution on this WSL setup until it is reproduced on native Linux.
+
+Mitigation: make `DemoSimple` and direct `rclpy` subscribers the primary demo
+and validation path. Use Foxglove through `foxglove_bridge` for visualization.
+Treat native Linux validation as the next discriminator before assuming a
+remaining firmware protocol defect.
+
 ### ROS 2 CLI / Daemon Fragility
 
 The demo should not depend on `ros2 topic list` or `ros2 topic echo` as the primary viewer. Use `rclpy` directly for the dashboard because it avoids several ros2cli daemon issues already observed in development.
@@ -262,9 +298,9 @@ Topic removal timing depends on dispose handling and participant / endpoint disc
 
 ## Recommended First Implementation
 
-Implement `scripts/raftros_dynamic_dashboard.py` first. It provides the highest-value demo with the least extra infrastructure.
+`examples/DemoSimple/raftros_dynamic_dashboard.py` has been implemented. It provides the highest-value demo with the least extra infrastructure.
 
-After that, add a short `ExampleDiscoverable` demo guide that references this document and gives the exact commands for:
+The main `README.md` now includes the demo guide and exact commands for:
 
 - Flashing the firmware.
 - Starting the dashboard.
