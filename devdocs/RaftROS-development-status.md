@@ -1,6 +1,64 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-25
+**Last Updated:** 2026-04-27
+
+## Current Demo / Interop Status (2026-04-27)
+
+The primary user-facing demo path is now:
+
+1. Flash and boot `examples/ExampleDiscoverable`.
+2. Attach supported I2C devices to the ESP32.
+3. Run `examples/DemoSimple/run_dashboard.sh` on the ROS 2 host.
+4. Optionally run `foxglove_bridge` in the same ROS 2 environment and connect
+   Foxglove Studio.
+
+Validated on the current Windows 11 + WSL2 + ROS 2 Jazzy + FastDDS host:
+
+- `DemoSimple` discovers `/raft/range_1_29` from a live VL6180 and displays
+  `sensor_msgs/msg/Range` samples with live range values.
+- A direct `rclpy` graph snapshot discovers `/chatter` and
+  `/raft/range_1_29`.
+- `foxglove_bridge` running in WSL can be used by Foxglove Studio on Windows
+  via `ws://localhost:8765` when WSL mirrored networking and firewall rules are
+  configured.
+
+### Current Known Issue: `_NODE_NAME_UNKNOWN_`
+
+On the current WSL2/Jazzy/FastDDS test setup, some `ros2` CLI graph commands
+still attribute RaftROS publishers to `Node name: _NODE_NAME_UNKNOWN_`, and
+`ros2 node info /raft_esp32` can fail even while data subscribers work.
+
+Current classification:
+
+- **Severity:** cosmetic / graph-introspection only.
+- **Not blocked:** typed data subscriptions, `DemoSimple`, direct `rclpy`
+  subscribers, and Foxglove via bridge.
+- **Observed environment:** Windows 11 + WSL2 Ubuntu 24.04 + ROS 2 Jazzy +
+  FastDDS 3.x.
+- **Current assumption:** likely host/ros2cli/rmw graph-attribution behavior
+  specific to the WSL/Jazzy/FastDDS environment unless reproduced on native
+  Linux. This is an assumption, not proof. Native Linux validation remains the
+  next check before spending more firmware time on the remaining symptom.
+- **Protocol evidence:** RaftROS emits structurally valid `ros_discovery_info`
+  CDR with 16-byte GIDs; rdi DATA and HEARTBEAT packets reach the transient CLI
+  participant's user-data port after the Fix #9 partial-discovery routing work.
+  In the remaining failing trace the host does not ACKNACK the RaftROS rdi
+  writer, which indicates the host did not create or match a reader proxy for
+  that writer even though normal user-topic readers do match.
+
+Mitigations:
+
+- Prefer `examples/DemoSimple/run_dashboard.sh` and direct `rclpy` subscribers
+  for functional demos and validation.
+- Use `foxglove_bridge` + Foxglove Studio for visualization. Confirm
+  `DemoSimple` sees the topic first; then start the bridge from the same ROS
+  environment.
+- Treat `ros2 topic echo`, `ros2 topic list`, `ros2 topic info`, and
+  `ros2 node info` as diagnostic tools only on WSL/Jazzy. If they disagree with
+  `rclpy`, trust the `rclpy` data-path result.
+- For native Linux, first repeat `DemoSimple`, then `ros2 topic info -v`, then
+  `ros2 node info /raft_esp32`. If native Linux also shows
+  `_NODE_NAME_UNKNOWN_`, continue Task D firmware-side investigation below.
 
 ## ⚠️ ros2 CLI Usage Prerequisites — READ THIS FIRST
 
@@ -36,8 +94,14 @@ ros2cli + Jazzy daemon, not of the ESP firmware:
 
 **Diagnostic short-circuit.**  If `ros2 node list` hangs or returns
 empty, it is almost always a daemon problem — *not* a firmware problem.
-Use `rclpy` directly instead, which talks to DDS without the daemon and
-is the canonical functional regression test:
+Use `DemoSimple` or `rclpy` directly instead, which talks to DDS without the
+ros2cli daemon and is the canonical functional regression test:
+
+```bash
+examples/DemoSimple/run_dashboard.sh
+```
+
+For direct payload debugging:
 
 ```bash
 python3 -u scripts/typed_deserialize_probe.py
@@ -47,7 +111,7 @@ python3 -u scripts/typed_deserialize_probe.py
 If `typed_deserialize_probe.py` works but `ros2 topic info` does not, the
 firmware is fine and the issue is daemon/CLI plumbing.
 
-## Current State Summary (2026-04-25)
+## Current State Summary (2026-04-27)
 
 ### What works end-to-end
 
@@ -55,6 +119,10 @@ firmware is fine and the issue is daemon/CLI plumbing.
   rclpy subscriptions receive every sample and successfully deserialize
   (verified with `scripts/typed_deserialize_probe.py`: `got 10 samples`,
   `frame_id='raft_range_1_29'`, valid range values).
+- `examples/DemoSimple/run_dashboard.sh` discovers `/raft/range_1_29`
+  dynamically and displays live VL6180 range samples.
+- `foxglove_bridge` in WSL + Foxglove Studio on Windows works as a demo
+  visualization path once WSL networking/firewall permits ROS 2 discovery.
 - All Phase 1 (Discovery), Phase 2 (Topic Publishing — `/chatter`),
   Phase 3 (Topic Subscribing), and Phase 4 (DeviceManager auto-publish)
   capabilities continue to work.
@@ -68,13 +136,14 @@ firmware is fine and the issue is daemon/CLI plumbing.
 
 - **`ros2 topic info -v` shows ESP publisher with `_NODE_NAME_UNKNOWN_`
   / `ros2 node info /raft_esp32` returns "Unable to find node".**
-  Cosmetic only — rclpy and any user code subscribes fine. Wire-level
-  `ros_discovery_info` payload is now structurally correct (16-byte
-  Gids, valid CDR, matches the IDL), and rmw does *list* the ESP
-  publisher's GID via `ros2 topic info`, but it still won't bind that
-  GID to our advertised node name. Tracked as **Pending Task D** below.
-  The Gid-layout fix (24 → 16 bytes per IDL) was necessary but not
-  sufficient; root cause now under investigation.
+  Cosmetic / graph-introspection only in the current WSL/Jazzy environment:
+  rclpy, `DemoSimple`, and Foxglove Bridge data paths subscribe fine.
+  Wire-level `ros_discovery_info` payload is now structurally correct
+  (16-byte GIDs, valid CDR, matches the IDL), and rmw does *list* the ESP
+  publisher's GID via `ros2 topic info`, but it still won't bind that GID to
+  our advertised node name. Tracked as **Pending Task D** below. The current
+  working assumption is WSL/Jazzy/FastDDS graph-attribution behavior until
+  reproduced on native Linux.
 - **`ros2 topic echo` / `ros2 topic list` / `ros2 topic info`** work
   only when the prerequisites at the top of this document are met
   (daemon + native peer). Without them they hang.
@@ -535,7 +604,7 @@ Only `Range` regressed.
 | O3 | First ACKNACK after match produces `total count change:1 total count: 1` | BEST_EFFORT writers still maintain a sequence number; the subscriber reports one "missed" sample on match because it joined mid-stream. This is normal for BEST_EFFORT and is not the deserialize failure. | Normal |
 | O4 | `ros2 topic echo --raw` only prints with explicit `--qos-reliability best_effort` | The CLI `echo` doesn't auto-relax QoS for explicit message-type subscriptions. `hz` does because it uses "best-available" QoS. | Known / documented |
 | O5 | LWIP still loses mid-burst sends with ENOMEM on the ESP | Known; covered by reliable retransmit. | Known / accepted |
-| O6 | `ros2 topic echo` / `ros2 topic list` / `ros2 topic info` hang under Jazzy on this host even with `--no-daemon` | Topic graph resolution path; rclpy subscriptions still receive data fine. Suspected `ros_discovery_info` writer entity-kind mismatch (we advertise USER_NO_KEY=0x03; Jazzy host treats `ros_discovery_info` as BUILTIN_WITH_KEY=0xc2 in some code paths and shows `_NODE_NAME_UNKNOWN_` in the graph). Does not block data flow. See "Pending Task D" below. | Cosmetic / CLI-only |
+| O6 | `ros2 topic echo` / `ros2 topic list` / `ros2 topic info` can hang or show `_NODE_NAME_UNKNOWN_` under Jazzy on this WSL host even with `--no-daemon` | Topic graph resolution path; rclpy subscriptions, `DemoSimple`, and Foxglove Bridge still receive data fine. Earlier hypotheses included rdi entity-kind mismatch; the current evidence after Fix #9 is that rdi DATA reaches the transient CLI participant but the host does not create/match the rdi reader proxy or ACKNACK our rdi writer. Treat as WSL/Jazzy/FastDDS graph-attribution behavior unless reproduced on native Linux. See "Pending Task D" below. | Cosmetic / CLI-only |
 
 ### Investigation outcome (closed)
 

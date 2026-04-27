@@ -2,6 +2,29 @@
 
 ## 1. Introduction and Motivation
 
+### 1.0 Current Implementation Status
+
+As of 2026-04-27, Phases 1–4 are implemented:
+
+- ESP32 participates directly in RTPS/SPDP/SEDP discovery.
+- `/chatter` publishes as `std_msgs/msg/String`.
+- ESP32 can subscribe to multiple `std_msgs/msg/String` topics with per-topic
+  dispatch.
+- DeviceManager-detected bus devices auto-publish as typed ROS 2 topics under
+  `/raft/...`, with standard message types, CDR serialization, per-class QoS,
+  and dispose-on-detach.
+- `examples/DemoSimple` provides the current recommended simple demo: a
+  dynamic `rclpy` dashboard that discovers `/raft/...` topics and displays live
+  values.
+
+Known caveat: on the current Windows 11 + WSL2 + ROS 2 Jazzy + FastDDS test
+host, `ros2 topic info -v` can show RaftROS publishers as
+`Node name: _NODE_NAME_UNKNOWN_` even while typed data subscriptions work. This
+is currently treated as a WSL/Jazzy ros2cli/rmw graph-attribution issue unless
+it is reproduced on native Linux. Use `DemoSimple`, direct `rclpy`, or
+Foxglove Bridge for functional validation. See
+`RaftROS-development-status.md` for the detailed Task D investigation.
+
 ### 1.1 Goal
 
 RaftROS aims to make ESP32 firmware, built on the Raft framework, function as a **native ROS 2 node** — participating directly in ROS 2 discovery and data exchange without relying on micro-ROS or any external agent/bridge process.
