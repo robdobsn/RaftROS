@@ -6,10 +6,11 @@ RaftROS enables ESP32 firmware built on the Raft framework to function as a nati
 
 ## Status
 
-**Phases 1–4 are complete.** Verified end-to-end against ROS 2 Humble +
-FastDDS 2.6.11 with an ESP32-S3 on WiFi:
+**Phases 1–4 are complete.** Verified end-to-end against ROS 2 Humble /
+Jazzy + FastDDS with an ESP32-S3 on WiFi:
 
-- **Phase 1 (Discovery)** — `ros2 node list` shows `/raft_esp32`.
+- **Phase 1 (Discovery)** — the ESP32 participates in SPDP/SEDP discovery
+  and standard ROS 2/rclpy subscribers discover its publishers.
 - **Phase 2 (Topic Publishing)** — `ros2 topic echo /chatter` prints a
   sample per second; RELIABLE + VOLATILE QoS.
 - **Phase 3 (Topic Subscribing)** — `ros2 topic pub --once /chatter_in2 ...`
@@ -21,11 +22,32 @@ FastDDS 2.6.11 with an ESP32-S3 on WiFi:
   code. Composite devices (AHT20, BMP280, IMUs) publish multiple topics
   from a single bus sample.
 
-**911 linux unit tests pass.** ESP32-S3 firmware fits in 25% of a
+**912 linux unit tests pass.** ESP32-S3 firmware fits in 25% of a
 `0x1b0000` app partition.
 
 See `devdocs/RaftROS-development-status.md` for the full fix list and
 `devdocs/RaftROS-auto-publishing-design.md` for the Phase 4 design.
+
+### Current CLI Caveat
+
+On the current Windows 11 + WSL2 + ROS 2 Jazzy test setup, `ros2 topic info -v`
+may show the ESP32 publisher with `Node name: _NODE_NAME_UNKNOWN_`, and
+`ros2 node info /raft_esp32` may fail even while typed subscriptions receive
+valid samples. This is currently treated as a host/CLI graph-attribution issue,
+not a firmware data-path failure:
+
+- `rclpy` subscribers receive and deserialize RaftROS samples correctly.
+- `examples/DemoSimple/run_dashboard.sh` discovers `/raft/...` topics and
+  displays live values.
+- `foxglove_bridge` running in WSL works with Foxglove Studio on Windows when
+  WSL networking/firewall setup allows ROS 2 discovery.
+
+Assumption as of 2026-04-27: the remaining `_NODE_NAME_UNKNOWN_` symptom is
+specific to ros2cli/rmw graph introspection on this WSL/Jazzy/FastDDS setup
+until reproduced on native Linux. Native Linux avoids the WSL multicast and
+firewall layer and should be used to confirm whether any protocol-side fix is
+still required. See `devdocs/RaftROS-development-status.md` for the detailed
+wire-level investigation and mitigations.
 
 ## Features
 
@@ -53,6 +75,154 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 bash -lc '
   ros2 topic echo /chatter std_msgs/msg/String --no-daemon
 '
 ```
+
+## Demo: ExampleDiscoverable + DemoSimple + Foxglove
+
+`examples/ExampleDiscoverable` is the ESP32 firmware demo. When flashed to an
+ESP32 with WiFi configured, it appears as a native ROS 2 participant and
+auto-publishes every supported I2C device detected by `DeviceManager`.
+
+`examples/DemoSimple` is the host-side terminal demo. It watches the ROS graph
+for RaftROS topics, dynamically subscribes using the discovered message type,
+and prints live sensor values without needing to know which I2C devices are
+attached ahead of time.
+
+### 1. Flash And Boot ExampleDiscoverable
+
+From `examples/ExampleDiscoverable`:
+
+```bash
+raft run
+```
+
+If WiFi has not been configured yet, use the serial console:
+
+```text
+w/<SSID>/<password>
+```
+
+Attach one or more supported I2C devices. Typical demo devices include:
+
+| Device | Expected topic | ROS 2 type |
+| --- | --- | --- |
+| VL6180 distance sensor | `/raft/range_1_29` | `sensor_msgs/msg/Range` |
+| VEML7700 ambient light sensor | `/raft/illuminance_1_10` | `sensor_msgs/msg/Illuminance` |
+| AS5600 magnetic angle sensor | `/raft/angle_1_36` | `std_msgs/msg/Float32` |
+| LSM6DS IMU | `/raft/imu_1_6a` | `sensor_msgs/msg/Imu` |
+
+### 2. Run DemoSimple
+
+From the repository root on a ROS 2 host:
+
+```bash
+examples/DemoSimple/run_dashboard.sh
+```
+
+The dashboard should show rows appearing and disappearing as I2C devices are
+plugged and unplugged. For example, with a VL6180 attached:
+
+```text
+topic             type                   age    count  latest
+/raft/range_1_29  sensor_msgs/msg/Range  0.1s      42  range=0.184 m min=0.000 max=2.000 frame=raft
+```
+
+Useful options:
+
+```bash
+examples/DemoSimple/run_dashboard.sh --namespace /raft
+examples/DemoSimple/run_dashboard.sh --all-raft-topics --include-chatter
+examples/DemoSimple/run_dashboard.sh --no-clear
+```
+
+The wrapper sources `/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash`, selects Fast
+DDS over UDPv4, and uses a local log directory under `examples/DemoSimple/logs`.
+If you already have a ROS environment sourced, you can run the Python script
+directly:
+
+```bash
+python3 -u examples/DemoSimple/raftros_dynamic_dashboard.py
+```
+
+### 3. Run Foxglove Studio With A Bridge
+
+Foxglove Studio connects to ROS 2 through `foxglove_bridge`. Install the bridge
+in the ROS environment that can already see the RaftROS topics:
+
+```bash
+sudo apt update
+sudo apt install ros-${ROS_DISTRO:-jazzy}-foxglove-bridge
+```
+
+Start the bridge:
+
+```bash
+source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
+unset ROS_LOCALHOST_ONLY
+
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+```
+
+Then open Foxglove Studio and connect to:
+
+```text
+ws://localhost:8765
+```
+
+Suggested Foxglove panels:
+
+- Plot `/raft/range_1_29.range` for the VL6180.
+- Plot `/raft/illuminance_1_10.illuminance` for the VEML7700.
+- Plot `/raft/angle_1_36.data` for the AS5600.
+- Inspect `/raft/imu_1_6a` as a `sensor_msgs/msg/Imu` stream.
+
+#### Windows Foxglove + WSL Bridge
+
+This setup works well: run ROS 2 and `foxglove_bridge` inside WSL, then run the
+Foxglove Studio desktop app on Windows.
+
+1. Install Foxglove Studio on Windows from <https://foxglove.dev/download>.
+2. In WSL, confirm `examples/DemoSimple/run_dashboard.sh` can see the RaftROS
+   topics.
+3. In WSL, start `foxglove_bridge` with the command above.
+4. In Windows Foxglove Studio, connect to `ws://localhost:8765`.
+
+If `localhost` does not connect, get the WSL IP:
+
+```bash
+hostname -I
+```
+
+Then connect Foxglove Studio to:
+
+```text
+ws://<WSL_IP>:8765
+```
+
+For ESP32 discovery through WSL2, mirrored networking and permissive inbound
+UDP firewall rules are usually required; see the host setup notes below.
+
+#### Native Linux Foxglove
+
+On native Linux, run both `foxglove_bridge` and Foxglove Studio on the same
+machine. Install Foxglove Studio from <https://foxglove.dev/download>, start
+the bridge with the command above, and connect to:
+
+```text
+ws://localhost:8765
+```
+
+Native Linux avoids the WSL multicast and firewall issues, but the machine
+still needs to be on the same subnet and `ROS_DOMAIN_ID` as the ESP32.
+
+### 4. QoS Note
+
+RaftROS fast sensor streams use BEST_EFFORT / VOLATILE QoS by default. The
+`DemoSimple` dashboard subscribes with compatible QoS. If Foxglove shows topics
+but does not show samples, check whether `foxglove_bridge` is subscribing with
+compatible QoS for the topic.
 
 ## Host Setup Notes (READ FIRST if discovery isn't working)
 
@@ -128,6 +298,7 @@ sudo chown $USER ~/raft_rtps.pcap
 - `components/RaftROS/RTPS/runtime/{discovery,reliability,announce,receive,schedule,wire,core}/` — shared runtime modules consumed by both ESP32 and Linux wrappers.
 - `components/RaftROS/CDR/` — CDR encoder/decoder.
 - `examples/ExampleDiscoverable/` — minimal ESP32 app that brings up RaftROS and publishes `/chatter` at 1 Hz.
+- `examples/DemoSimple/` — host-side dynamic ROS 2 dashboard for hot-plugged RaftROS device topics.
 - `linux_unit_tests/` — Linux-hosted unit tests (388+ cases) and a standalone linux RTPS publisher (`raftros_standalone.cpp`) used as a non-embedded reference implementation.
 - `devdocs/` — design overview, development status, and implementation plan.
 
