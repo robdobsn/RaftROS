@@ -36,26 +36,21 @@ struct RTPSParsedSubscriptionAnnounce
     uint16_t unicastLocatorPort = 0;    // first PID_UNICAST_LOCATOR UDPv4 port (0 if absent)
 };
 
-// Parse an SEDP BuiltinSubscriptionsData ParameterList payload (starting with the 4-byte
-// CDR encapsulation header).  Returns true if at least PID_ENDPOINT_GUID was extracted.
-inline bool RTPSSEDPSubscriptionParser_parse(
-    const uint8_t* pPayload,
-    uint32_t payloadLen,
+inline bool RTPSSEDPSubscriptionParser_parseParameterList(
+    const uint8_t* p,
+    uint32_t remaining,
     RTPSParsedSubscriptionAnnounce& out)
 {
     out = RTPSParsedSubscriptionAnnounce{};
 
-    if (!pPayload || payloadLen < 8)
+    if (!p || remaining < 4)
         return false;
-
-    // Skip 4-byte CDR encapsulation header.
-    const uint8_t* p = pPayload + 4;
-    uint32_t remaining = payloadLen - 4;
 
     static constexpr uint16_t PID_SENTINEL          = 0x0001;
     static constexpr uint16_t PID_TOPIC_NAME        = 0x0005;
     static constexpr uint16_t PID_UNICAST_LOCATOR   = 0x002F;
     static constexpr uint16_t PID_ENDPOINT_GUID     = 0x005A;
+    static constexpr uint16_t PID_KEY_HASH          = 0x0070;
 
     uint32_t off = 0;
     while (off + 4 <= remaining)
@@ -74,6 +69,7 @@ inline bool RTPSSEDPSubscriptionParser_parse(
         switch (pid)
         {
             case PID_ENDPOINT_GUID:
+            case PID_KEY_HASH:
                 if (plen >= 16)
                 {
                     memcpy(out.readerGuid, pVal, 16);
@@ -122,6 +118,25 @@ inline bool RTPSSEDPSubscriptionParser_parse(
     }
 
     return out.hasReaderGuid;
+}
+
+// Parse an SEDP BuiltinSubscriptionsData ParameterList payload (starting with the 4-byte
+// CDR encapsulation header).  Returns true if the reader GUID was extracted from either
+// PID_ENDPOINT_GUID or PID_KEY_HASH.
+inline bool RTPSSEDPSubscriptionParser_parse(
+    const uint8_t* pPayload,
+    uint32_t payloadLen,
+    RTPSParsedSubscriptionAnnounce& out)
+{
+    if (!pPayload || payloadLen < 8)
+    {
+        out = RTPSParsedSubscriptionAnnounce{};
+        return false;
+    }
+
+    // Skip 4-byte CDR encapsulation header.
+    return RTPSSEDPSubscriptionParser_parseParameterList(
+        pPayload + 4, payloadLen - 4, out);
 }
 
 } // namespace RaftRuntime::RTPS::Runtime::Dispatch

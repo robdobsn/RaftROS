@@ -657,7 +657,11 @@ void RaftROS::processDiscoveredParticipant(DiscoveredParticipant& remote, const 
 
 void RaftROS::recvMetatraffic()
 {
-    for (uint8_t rxBudget = 0; rxBudget < 8; rxBudget++)
+    // FastDDS sends SPDP plus several SEDP DATA(r/w) samples in a tight burst
+    // when a new participant appears. Drain enough packets per loop to avoid
+    // losing the full DATA(r) locator sample and later seeing only key-only
+    // retransmits.
+    for (uint8_t rxBudget = 0; rxBudget < 32; rxBudget++)
     {
         struct sockaddr_in fromAddr;
         socklen_t fromLen = sizeof(fromAddr);
@@ -884,9 +888,19 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
             if (!pPayload || payloadLen < 4)
             {
                 const uint8_t* keyHash = nullptr;
+                const uint8_t* inlineQos = nullptr;
+                uint32_t inlineQosLen = 0;
                 if ((dataFlags & 0x02) && contentLen >= 20)
                 {
-                    uint32_t off = 4u + (uint32_t)(pContent[2] | (pContent[3] << 8));
+                    const uint32_t inlineQosOff =
+                        4u + (uint32_t)(pContent[2] | (pContent[3] << 8));
+                    if (inlineQosOff < contentLen)
+                    {
+                        inlineQos = pContent + inlineQosOff;
+                        inlineQosLen = contentLen - inlineQosOff;
+                    }
+
+                    uint32_t off = inlineQosOff;
                     while (off + 4 <= contentLen)
                     {
                         const uint16_t pid = (uint16_t)(pContent[off] | (pContent[off + 1] << 8));
@@ -904,45 +918,69 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                         off += plen;
                     }
                 }
-                if (keyHash)
+                RaftRuntime::RTPS::Runtime::Dispatch::RTPSParsedSubscriptionAnnounce inlineSub;
+                const bool inlineParseOk =
+                    RaftRuntime::RTPS::Runtime::Dispatch::RTPSSEDPSubscriptionParser_parseParameterList(
+                        inlineQos, inlineQosLen, inlineSub);
+                static constexpr const char* RDI_TOPIC = "ros_discovery_info";
+                static constexpr uint32_t RDI_TOPIC_LEN = 18;
+                if (inlineParseOk &&
+                    inlineSub.topic &&
+                    inlineSub.topicLen == RDI_TOPIC_LEN &&
+                    memcmp(inlineSub.topic, RDI_TOPIC, RDI_TOPIC_LEN) == 0)
+                {
+                    const uint8_t* senderGuidPfx =
+                        inlineSub.hasReaderGuid ? inlineSub.readerGuid : (packet + 8);
+                    bool foundInDiscovered = false;
+                    for (auto& dp : self->_discovered)
+                    {
+                        if (memcmp(dp.guidPrefix, senderGuidPfx, 12) == 0)
+                        {
+                            foundInDiscovered = true;
+                            if (inlineSub.unicastLocatorPort != 0 &&
+                                dp.rdiReaderUnicastPort != inlineSub.unicastLocatorPort)
+                            {
+                                LOG_I(MODULE_PREFIX,
+                                      "SEDP inline rdi reader port for participant %02x%02x%02x%02x: %u (was %u)",
+                                      dp.guidPrefix[0], dp.guidPrefix[1],
+                                      dp.guidPrefix[2], dp.guidPrefix[3],
+                                      (unsigned)inlineSub.unicastLocatorPort,
+                                      (unsigned)dp.rdiReaderUnicastPort);
+                                dp.rdiReaderUnicastPort = inlineSub.unicastLocatorPort;
+                            }
+                            if (inlineSub.hasReaderGuid)
+                                (void)addRdiReaderEntityIdCandidate(dp, inlineSub.readerGuid + 12);
+                            break;
+                        }
+                    }
+                    if (!foundInDiscovered)
+                    {
+                        DiscoveredParticipant partial = {};
+                        memcpy(partial.guidPrefix, senderGuidPfx, 12);
+                        partial.ipAddr = from.sin_addr.s_addr;
+                        partial.rdiReaderUnicastPort = inlineSub.unicastLocatorPort;
+                        if (inlineSub.hasReaderGuid)
+                            (void)addRdiReaderEntityIdCandidate(partial, inlineSub.readerGuid + 12);
+                        LOG_I(MODULE_PREFIX,
+                              "SEDP inline rdi partial-disc guidPfx=%02x%02x%02x%02x rdiPort=%u",
+                              partial.guidPrefix[0], partial.guidPrefix[1],
+                              partial.guidPrefix[2], partial.guidPrefix[3],
+                              (unsigned)inlineSub.unicastLocatorPort);
+                        self->processDiscoveredParticipant(partial, from);
+                    }
+                    return;
+                }
+                if (keyHash &&
+                    memcmp(keyHash + 12, ENTITYID_ROS_DISC_INFO_READER, 4) == 0)
                 {
                     for (auto& dp : self->_discovered)
                     {
                         if (memcmp(dp.guidPrefix, keyHash, 12) == 0 &&
                             addRdiReaderEntityIdCandidate(dp, keyHash + 12))
                         {
-                            const uint16_t fromPort = ntohs(from.sin_port);
-                            if (fromPort != 0 && dp.rdiReaderUnicastPort != fromPort)
-                            {
-                                LOG_I(MODULE_PREFIX,
-                                      "SEDP sub inferred rdi reader port guidPfx=%02x%02x%02x%02x: %u (was %u)",
-                                      dp.guidPrefix[0], dp.guidPrefix[1],
-                                      dp.guidPrefix[2], dp.guidPrefix[3],
-                                      (unsigned)fromPort, (unsigned)dp.rdiReaderUnicastPort);
-                                dp.rdiReaderUnicastPort = fromPort;
-                            }
-                            LOG_I(MODULE_PREFIX,
-                                  "SEDP sub learned rdi reader candidate guidPfx=%02x%02x%02x%02x readerEID=%02x%02x%02x%02x count=%u",
-                                  dp.guidPrefix[0], dp.guidPrefix[1],
-                                  dp.guidPrefix[2], dp.guidPrefix[3],
-                                  keyHash[12], keyHash[13], keyHash[14], keyHash[15],
-                                  (unsigned)dp.rdiReaderEntityIdCount);
                             break;
                         }
                     }
-                    LOG_I(MODULE_PREFIX,
-                          "SEDP sub DATA no payload fromPort=%u contentLen=%u flags=0x%02x payloadLen=%u keyGuidPfx=%02x%02x%02x%02x keyEID=%02x%02x%02x%02x",
-                          (unsigned)ntohs(from.sin_port),
-                          (unsigned)contentLen, (unsigned)dataFlags, (unsigned)payloadLen,
-                          keyHash[0], keyHash[1], keyHash[2], keyHash[3],
-                          keyHash[12], keyHash[13], keyHash[14], keyHash[15]);
-                }
-                else
-                {
-                    LOG_I(MODULE_PREFIX,
-                          "SEDP sub DATA no payload fromPort=%u contentLen=%u flags=0x%02x payloadLen=%u",
-                          (unsigned)ntohs(from.sin_port),
-                          (unsigned)contentLen, (unsigned)dataFlags, (unsigned)payloadLen);
                 }
                 return;
             }
@@ -950,25 +988,8 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
             const bool subParseOk =
                 RaftRuntime::RTPS::Runtime::Dispatch::RTPSSEDPSubscriptionParser_parse(
                     pPayload, payloadLen, parsedSub);
-            LOG_I(MODULE_PREFIX,
-                  "SEDP sub DATA contentLen=%u flags=0x%02x payloadLen=%u parseOk=%d encap=%02x%02x%02x%02x",
-                  (unsigned)contentLen, (unsigned)dataFlags, (unsigned)payloadLen,
-                  (int)subParseOk,
-                  payloadLen > 0 ? pPayload[0] : 0,
-                  payloadLen > 1 ? pPayload[1] : 0,
-                  payloadLen > 2 ? pPayload[2] : 0,
-                  payloadLen > 3 ? pPayload[3] : 0);
             if (!subParseOk)
                 return;
-            LOG_I(MODULE_PREFIX,
-                  "SEDP sub parsed topic='%.*s' readerEID=%02x%02x%02x%02x port=%u",
-                  (int)parsedSub.topicLen,
-                  parsedSub.topic ? parsedSub.topic : "",
-                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[12] : 0,
-                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[13] : 0,
-                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[14] : 0,
-                  parsedSub.hasReaderGuid ? parsedSub.readerGuid[15] : 0,
-                  (unsigned)parsedSub.unicastLocatorPort);
             // Filter on topic name == "ros_discovery_info" (the rdi reader is
             // the only one for which a per-reader port matters; other readers
             // share the participant default user-data port).
@@ -988,10 +1009,12 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                       parsedSub.readerGuid[14], parsedSub.readerGuid[15],
                       (unsigned)parsedSub.unicastLocatorPort);
             }
-            if (parsedSub.unicastLocatorPort == 0)
-                return;
             // Locate the matching DiscoveredParticipant by readerGuid prefix
             // (first 12 bytes of the reader GUID == participant guidPrefix).
+            // Some FastDDS graph readers use the participant default user-data
+            // port and therefore do not advertise a per-reader locator here.
+            // Still record their entityId so the RDI DATA fanout can address
+            // the reader explicitly instead of relying on ENTITYID_UNKNOWN.
             //
             // Fix #9: WiFi/IGMP snooping can cause SPDP multicast from new
             // participants to never reach the ESP (group membership expiry on the
@@ -1013,7 +1036,8 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                 if (memcmp(dp.guidPrefix, senderGuidPfx, 12) == 0)
                 {
                     foundInDiscovered = true;
-                    if (dp.rdiReaderUnicastPort != parsedSub.unicastLocatorPort)
+                    if (parsedSub.unicastLocatorPort != 0 &&
+                        dp.rdiReaderUnicastPort != parsedSub.unicastLocatorPort)
                     {
                         LOG_I(MODULE_PREFIX,
                               "SEDP rdi reader port for participant %02x%02x%02x%02x: %u (was %u)",
@@ -1489,18 +1513,11 @@ void RaftROS::stepWriterHeartbeatPass()
                         rosDiscPayload, sizeof(rosDiscPayload));
                     if (rosDiscLen == 0)
                         return 0;
-                    LOG_I(MODULE_PREFIX,
-                          "rosDiscInfoHB seq=%u peerGuidPfx=%02x%02x%02x%02x payloadLen=%u",
-                          (unsigned)sequenceNumber,
-                          remoteRef.guidPrefix[0], remoteRef.guidPrefix[1],
-                          remoteRef.guidPrefix[2], remoteRef.guidPrefix[3],
-                          (unsigned)rosDiscLen);
-                    // ParticipantEntitiesInfo is keyed by participant GID;
-                    // FastDDS reliable readers reject samples without an
-                    // inline-QoS PID_KEY_HASH that binds the sample to its
-                    // instance.  Pass the participant GUID (16 bytes) as
-                    // the key hash so the daemon's rmw_dds_common reader
-                    // accepts the sample and registers our node mapping.
+                    // Jazzy rmw_fastrtps creates the internal graph
+                    // subscription with keyed-topic support disabled; keep
+                    // ros_discovery_info DATA as a plain unkeyed sample.
+                    // The participant GID is carried in the serialized
+                    // ParticipantEntitiesInfo payload itself.
                     //
                     // firstSN == lastSN == current: writer holds only the
                     // most recent rdi sample (rebuilt each HB from current
@@ -1515,7 +1532,7 @@ void RaftROS::stepWriterHeartbeatPass()
                         rosDiscPayload, rosDiscLen,
                         sequenceNumber, heartbeatCount,
                         /*firstSN=*/sequenceNumber,
-                        /*keyHash16=*/self->_participant.getParticipantGuid());
+                        /*keyHash16=*/nullptr);
                 }
                 default:
                     return 0;
@@ -1558,6 +1575,24 @@ void RaftROS::stepWriterHeartbeatPass()
             }
             const int primarySent = sendto(sock, self->_sendBuf, payloadLen, 0,
                                            (struct sockaddr*)&dest, sizeof(dest));
+            if (sendTarget == RTPSWriterHeartbeatSendTarget::UserData)
+            {
+                patchRosDiscoveryInfoReaderId(
+                    self->_sendBuf, payloadLen, ENTITYID_ROS_DISC_INFO_READER);
+                (void)sendto(sock, self->_sendBuf, payloadLen, 0,
+                              (struct sockaddr*)&dest, sizeof(dest));
+                if (remoteRef.rdiReaderUnicastPort == 0 &&
+                    remoteRef.metatrafficPort != 0 &&
+                    remoteRef.metatrafficPort != ntohs(dest.sin_port))
+                {
+                    struct sockaddr_in metaDest = dest;
+                    metaDest.sin_port = htons(remoteRef.metatrafficPort);
+                    (void)sendto(self->_metatrafficSock,
+                                  self->_sendBuf, payloadLen, 0,
+                                  (struct sockaddr*)&metaDest,
+                                  sizeof(metaDest));
+                }
+            }
             if (sendTarget == RTPSWriterHeartbeatSendTarget::UserData &&
                 remoteRef.rdiReaderEntityIdCount > 0)
             {
@@ -1565,15 +1600,8 @@ void RaftROS::stepWriterHeartbeatPass()
                 {
                     patchRosDiscoveryInfoReaderId(
                         self->_sendBuf, payloadLen, remoteRef.rdiReaderEntityIds[i]);
-                    const int fanoutSent = sendto(sock, self->_sendBuf, payloadLen, 0,
-                                                 (struct sockaddr*)&dest, sizeof(dest));
-                    LOG_I(MODULE_PREFIX,
-                          "rosDiscInfo fanout readerEID=%02x%02x%02x%02x sent %d/%u port=%u",
-                          remoteRef.rdiReaderEntityIds[i][0],
-                          remoteRef.rdiReaderEntityIds[i][1],
-                          remoteRef.rdiReaderEntityIds[i][2],
-                          remoteRef.rdiReaderEntityIds[i][3],
-                          fanoutSent, (unsigned)payloadLen, (unsigned)ntohs(dest.sin_port));
+                    (void)sendto(sock, self->_sendBuf, payloadLen, 0,
+                                  (struct sockaddr*)&dest, sizeof(dest));
                 }
             }
             return primarySent;
@@ -1590,8 +1618,15 @@ void RaftROS::stepWriterHeartbeatPass()
 #ifdef RAFTROS_VERBOSE_LOGGING
             ExecCtx* ctx = static_cast<ExecCtx*>(userCtx);
             const DiscoveredParticipant& remoteRef = *ctx->remote;
-            LOG_I(MODULE_PREFIX, "sendWriterHB rosDisc %d/%d to port %d",
-                  sentBytes, (int)payloadLen, (int)remoteRef.userDataPort);
+            const uint16_t rdiPort =
+                remoteRef.rdiReaderUnicastPort != 0
+                    ? remoteRef.rdiReaderUnicastPort
+                    : remoteRef.userDataPort;
+            LOG_I(MODULE_PREFIX,
+                  "sendWriterHB rosDisc %d/%d to rdiPort %u userPort %u readerEIDs %u",
+                  sentBytes, (int)payloadLen, (unsigned)rdiPort,
+                  (unsigned)remoteRef.userDataPort,
+                  (unsigned)remoteRef.rdiReaderEntityIdCount);
 #else
             (void)userCtx; (void)sentBytes; (void)payloadLen;
 #endif
@@ -2695,21 +2730,17 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
             (void)emitAutoPubSedpAnnounce(remote, pCtx->secondarySlot);
     }
 
-    // Bump _rosDiscSeqNum so the next rdi HEARTBEAT advertises a new
-    // sample (firstSN==lastSN==current).  buildRosDiscInfoWithGids() will
-    // rebuild the payload to include the newly-attached writer GID.
-    // Earlier we kept seq pinned at 1, which meant peers that had already
-    // received the seq=1 sample would dedupe later rebuilds (RTPS readers
-    // discard duplicate sequence numbers per writer instance), leaving
-    // ros2 topic info showing `_NODE_NAME_UNKNOWN_` for the new writer.
-    // Because the writer holds only the most-recent rdi sample, advancing
-    // firstSN with the seq is safe: there's no historic gap for readers
-    // to NACK on.
-    _rosDiscSeqNum++;
+    // Bump _rosDiscSeqNum only when at least one participant could already
+    // have seen the previous rdi sample. If auto-publish attaches before any
+    // ROS participant is discovered, advancing from seq=1 to seq=2 creates a
+    // gap for the first later reader; FastDDS ACKNACKs seq=1 and withholds
+    // seq=2 from the graph listener.
+    if (!_discovered.empty())
+        _rosDiscSeqNum++;
     LOG_I(MODULE_PREFIX,
-          "autoPubAttach slot=%d secSlot=%d (rosDiscSeqNum bumped to %u)",
+          "autoPubAttach slot=%d secSlot=%d (rosDiscSeqNum now %u discovered=%u)",
           slot, (int)pCtx->secondarySlot,
-          (unsigned)_rosDiscSeqNum);
+          (unsigned)_rosDiscSeqNum, (unsigned)_discovered.size());
 
     return true;
 }
@@ -2788,15 +2819,15 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     if (pCtx && pCtx->secondarySlot != 0xFF)
         _autoPubLifecycle.detachSlot(pCtx->secondarySlot);
 
-    // Bump _rosDiscSeqNum so the next rdi HB carries an updated sample
-    // omitting the now-detached writer GID.  See the matching comment in
-    // autoPubAttachDevice for why this is necessary and safe.
-    _rosDiscSeqNum++;
-    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u (rosDiscSeqNum bumped to %u)",
+    // See autoPubAttachDevice: only advance the RDI writer sequence when a
+    // discovered participant may already have accepted the previous sample.
+    if (!_discovered.empty())
+        _rosDiscSeqNum++;
+    LOG_I(MODULE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u (rosDiscSeqNum now %u discovered=%u)",
           devID.toString().c_str(), slot,
           pCtx ? (int)pCtx->secondarySlot : -1,
           pCtx ? (unsigned)pCtx->sampleCount : 0u,
-          (unsigned)_rosDiscSeqNum);
+          (unsigned)_rosDiscSeqNum, (unsigned)_discovered.size());
     delete pCtx;
 }
 
