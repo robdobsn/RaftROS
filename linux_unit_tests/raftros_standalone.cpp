@@ -27,21 +27,19 @@
 #include <poll.h>
 
 #include "RTPSTypes.h"
-#include "RTPSMessage.h"
-#include "RTPSAckNack.h"
-#include "RTPSAckNackRunner.h"
-#include "RTPSReliabilityPolicy.h"
-#include "RTPSRuntimeSchedule.h"
-#include "RTPSBuiltinEndpointMap.h"
-#include "RTPSInitialAnnouncePlan.h"
-#include "RTPSInitialAnnounceRunner.h"
-#include "RTPSWriterHeartbeatRunner.h"
-#include "RTPSRxSubmessageRunner.h"
-#include "RTPSRunnerAdapterHelpers.h"
+#include "runtime/wire/RTPSMessage.h"
+#include "runtime/reliability/RTPSAckNackRunner.h"
+#include "runtime/reliability/RTPSReliabilityAndWriterStateRuntime.h"
+#include "runtime/schedule/RTPSRuntimeSchedule.h"
+#include "runtime/announce/RTPSInitialAnnouncePlan.h"
+#include "runtime/announce/RTPSInitialAnnounceRunner.h"
+#include "runtime/announce/RTPSWriterHeartbeatRunner.h"
+#include "runtime/receive/RTPSRxSubmessageRunner.h"
+#include "runtime/receive/RTPSRunnerAdapterHelpers.h"
 #include "runtime/discovery/RTPSDiscoveryRuntime.h"
-#include "RTPSParticipant.h"
-#include "SPDPHandler.h"
-#include "SEDPHandler.h"
+#include "runtime/core/RTPSParticipant.h"
+#include "runtime/discovery/SPDPHandler.h"
+#include "runtime/announce/SEDPHandler.h"
 #include "Logger.h"
 
 static const char* MODULE_PREFIX = "RaftROS";
@@ -262,10 +260,10 @@ static void processDiscoveredParticipant(DiscoveredParticipant& remote, const st
           srcIpStr, (int)ntohs(fromAddr.sin_port), locIpStr,
           (int)remote.metatrafficPort, (int)remote.userDataPort, (int)remote.leaseDurationSec);
 
-    RaftROS::RTPS::Runtime::DiscoveryRuntime::MergeResult mergeResult =
-        RaftROS::RTPS::Runtime::DiscoveryRuntime::mergeParticipant(
+    RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult mergeResult =
+        RaftRuntime::RTPS::Runtime::DiscoveryRuntime::mergeParticipant(
             discovered, remote, nowMs, MAX_DISCOVERED);
-    if (mergeResult == RaftROS::RTPS::Runtime::DiscoveryRuntime::MergeResult::AddedNew)
+    if (mergeResult == RaftRuntime::RTPS::Runtime::DiscoveryRuntime::MergeResult::AddedNew)
     {
         handleNewParticipant(remote, fromAddr);
     }
@@ -437,7 +435,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
         LOG_I(MODULE_PREFIX, "  ACKNACK readerEID=%02X%02X%02X%02X writerEID=%02X%02X%02X%02X (%s) base=%u numBits=%u",
               fields.readerEID[0], fields.readerEID[1], fields.readerEID[2], fields.readerEID[3],
               fields.writerEID[0], fields.writerEID[1], fields.writerEID[2], fields.writerEID[3],
-              RTPSAckNack_writerKindToStr(writerKind),
+              RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::writerKindToStr(writerKind),
               fields.bitmapBaseLow, fields.numBits);
     };
     callbacks.resolveRemote = RTPSRunnerAdapter_ackResolveRemote;
@@ -598,7 +596,7 @@ static void handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pContent,
             });
     };
 
-    RTPSAckNackRunnerOptions options;
+    RaftRuntime::RTPS::Runtime::ReliabilityAndWriterState::RTPSAckNackDecisionOptions options;
     options.publicationsIncludesChatterAnnouncement = true;
     options.requirePublicationSeq2GateForRetransmit = true;
     RTPSAckNackRunner_run(srcGuidPrefix, pContent, contentLen, options, callbacks, &ctx);
@@ -651,7 +649,8 @@ static void recvMetatraffic()
                           const uint8_t*,
                           const struct sockaddr_in& from,
                           const uint8_t* pContent,
-                          uint32_t contentLen)
+                          uint32_t contentLen,
+                          uint8_t flags)
     {
         const uint8_t* writerEID = pContent + 8;
         if (memcmp(writerEID, ENTITYID_SPDP_BUILTIN_PARTICIPANT_WRITER, 4) == 0)
@@ -671,10 +670,11 @@ static void recvMetatraffic()
             if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 ||
                 memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
             {
-                if (contentLen > 20)
+                const uint8_t* payload = nullptr;
+                uint32_t payloadLen = 0;
+                RTPSData_getSerializedPayload(pContent, contentLen, flags, payload, payloadLen);
+                if (payload && payloadLen > 0)
                 {
-                    const uint8_t* payload = pContent + 20;
-                    uint32_t payloadLen = contentLen - 20;
                     fprintf(stderr, "SEDP_INCOMING_%s_HEX (%d bytes):",
                             memcmp(writerEID, ENTITYID_SEDP_BUILTIN_PUBLICATIONS_WRITER, 4) == 0 ? "PUB" : "SUB",
                             (int)payloadLen);
@@ -794,7 +794,7 @@ static void purgeStaleParticipants()
     uint32_t now = millis();
     for (auto it = discovered.begin(); it != discovered.end(); )
     {
-        if (RaftROS::RTPS::Runtime::DiscoveryRuntime::isLeaseExpired(
+        if (RaftRuntime::RTPS::Runtime::DiscoveryRuntime::isLeaseExpired(
             now, it->discoveredTimeMs, it->leaseDurationSec))
         {
             LOG_I(MODULE_PREFIX, "purge stale participant (expired %d sec ago)",
@@ -1237,14 +1237,14 @@ int main(int argc, char* argv[])
 
         // Transition to active on first discovery
         RTPSParticipantSetPolicyResult setPolicy =
-            RaftROS::RTPS::Runtime::DiscoveryRuntime::applyParticipantSetPolicy(
+            RaftRuntime::RTPS::Runtime::DiscoveryRuntime::applyParticipantSetPolicy(
                 active,
                 (uint32_t)discovered.size(),
                 false,
                 false);
         active = setPolicy.shouldBeActive;
         if (setPolicy.triggerImmediateWriterHeartbeat)
-            RaftROS::RTPS::Runtime::DiscoveryRuntime::onActivated(lastHbMs);
+            RaftRuntime::RTPS::Runtime::DiscoveryRuntime::onActivated(lastHbMs);
     }
 
     printf("\nShutting down...\n");

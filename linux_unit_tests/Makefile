@@ -74,11 +74,21 @@ DEST_DIR=./RaftCore
 # GIT_TAG=v1.0  # Optional: Specify a tag if needed
 
 # Ensure raft_core is executed every time by making it .PHONY
-.PHONY: raft_core clean all standalone
+.PHONY: raft_core clean all standalone zenoh-test
 
 all: $(OUTPUT)
 
 standalone: $(STANDALONE_OUT)
+
+ZENOH_TEST_OUT = $(BUILD_DIR)/zenoh/zenoh_codec_tests
+ZENOH_TEST_CFLAGS = -std=c++17 -Wall -Wextra -Werror -pedantic -g
+
+$(ZENOH_TEST_OUT): zenoh_codec_tests.cpp ../components/RaftROS/Zenoh/ZenohROSCodec.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS $< -o $@
+
+zenoh-test: $(ZENOH_TEST_OUT)
+	./$(ZENOH_TEST_OUT)
 
 raft_core:
 	@echo "Fetching RaftCore repository..."

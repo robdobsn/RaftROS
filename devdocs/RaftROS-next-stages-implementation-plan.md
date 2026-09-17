@@ -1,7 +1,7 @@
 # RaftROS Next Stages Implementation Plan
 
 **Date:** 2026-04-22
-**Status update:** 2026-09-17 (Zenoh planning pointer; RTPS results unchanged)
+**Status update:** 2026-09-17 (Zenoh metadata work started; historical RTPS results retained)
 **Scope:** Historical implementation plan for Phases 2–4. Phase 2
 (publishing), Phase 3 (subscribing, including N-ary per-topic routing), and
 Phase 4 (DeviceManager auto-publishing) are now complete. This document is
@@ -16,8 +16,11 @@ the existing Raft-only/source-license and standalone goals, a native ROS
 interoperability proof, common sensor/CDR extraction, mutually exclusive
 RTPS/Zenoh builds, and dynamic sensor/subscription/QoS validation.
 
-RTPS stays the default; Zenoh is not implemented. Runtime selection of both
-backends is deferred. The remaining RTPS hardening/alignment items below stay
+RTPS stays the default. Z0 has started with a pinned ROS metadata codec and
+isolated Linux tests; the Zenoh session/firmware backend is not implemented.
+Fresh results and the resolution of the standalone build failure are recorded in
+the new plan and development-status document, not in the historical counts
+below. Runtime selection of both backends is deferred. The remaining RTPS hardening/alignment items below stay
 valid but do not block the initial Zenoh experiment. Do not reuse DDS graph,
 type-hash leniency, or heartbeat assumptions as a Zenoh design.
 

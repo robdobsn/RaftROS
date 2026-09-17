@@ -1,7 +1,7 @@
 # RaftROS Zenoh Alternative: Design and Implementation Plan
 
 **Date:** 2026-09-17
-**Status:** Planned only; all Z-series slices below are not started.
+**Status:** Z0 in progress; first isolated metadata-codec slice implemented.
 **Scope:** A native ROS 2 Zenoh backend for Raft ESP32 firmware, preserving
 DeviceManager-driven sensor auto-publishing and the existing RTPS backend.
 
@@ -10,6 +10,60 @@ and parameters. Phases 1-4 remain completed **RTPS** work, not evidence of Zenoh
 support. See [development status](RaftROS-development-status.md), the
 [overview](RaftROS-overview.md), and the implemented
 [auto-publishing design](RaftROS-auto-publishing-design.md).
+
+## Implementation Record (2026-09-17)
+
+The first preparatory slice is
+[ZenohROSCodec.h](../components/RaftROS/Zenoh/ZenohROSCodec.h), original
+Raft-owned C++17 code with no RTPS, RaftCore, ESP-IDF or Zenoh SDK dependency:
+
+- Encodes/decodes the pinned 33-byte publisher attachment, preserving signed
+  sequence/source-time values and the 16-byte publisher GID.
+- Formats ROS topic data keys from a fully qualified topic, DDS-style message
+  type and `RIHS01_...` hash, without an RTPS `rt/` prefix.
+- Formats node (`NN`) graph-liveliness tokens, including namespace/enclave
+  mangling and the repeated node ID.
+- Uses caller-owned output storage, no dynamic allocation, and explicit input
+  and capacity checks. The isolated `make zenoh-test` target builds only the
+  codec tests, without fetching RaftCore or linking RTPS.
+
+This does **not** implement a Zenoh session, publisher/subscriber (`MP`/`MS`)
+QoS token, publisher-GID derivation, graph query, transport, routerless
+topology, or firmware backend. Formatting a node token does not announce a
+node. Z0/Z1 feasibility gates remain open, and no production source extraction
+or dependency-policy change has been made.
+
+### Pinned Reference and Observed Baseline
+
+| Item | Evidence |
+| --- | --- |
+| Metadata reference | `rmw_zenoh_cpp` Jazzy 0.2.11, commit `8c1fe8ef412bca5e6ac64f320468c70dcb03fc52`; [immutable design document](https://github.com/ros2/rmw_zenoh/blob/8c1fe8ef412bca5e6ac64f320468c70dcb03fc52/docs/design.md). The profile is also identified in the codec header. |
+| Fixture provenance | Topic and node examples from that design, plus independently specified attachment bytes. These are specification-based tests, not captured packets or native RMW interoperability evidence. |
+| Compiler/environment | Ubuntu WSL, g++ 13.3.0 (`13.3.0-6ubuntu2~24.04.1`), CMake 3.28.3. Native Jazzy RMW/Zenoh vendor/FastDDS/sensor-msgs packages were not found by `dpkg-query`. |
+| Zenoh unit checks | 610 passed, 0 failed with C++17, `-Wall -Wextra -Werror -pedantic`; also passed with AddressSanitizer and UndefinedBehaviorSanitizer. Includes every short output/input length, invalid GID lengths, malformed names/hashes, maximum names and unaligned integer buffers. |
+| RTPS unit baseline | Rebuilt and ran successfully: 921 passed, 0 failed. RaftCore revision used: `feb4f77f1778be04fbf1789bdaa6c84ec4e8fe5c`. |
+| RTPS standalone baseline | Initial build exposed stale includes and runtime API references in `raftros_standalone.cpp`. Resolved in the 2026-09-17 follow-up: current runtime include paths, discovery namespace, ACKNACK declarations and DATA flags/payload helper. Standalone compilation/linking and the 921 RTPS tests pass; live ROS smoke testing remains unverified. |
+| Still unmeasured | Host Zenoh runtime compatibility, protocol/link versions, actual ROS graph/data exchange, ESP32 flash/heap/stacks, hardware regression, and routerless multi-process operation. No Z0 resource or topology gate is satisfied by these unit results. |
+
+### Initial Codec Contract
+
+The formatters accept string views valid for the duration of the call; inputs
+must not overlap output storage. Names are a deliberately bounded subset:
+fully qualified ROS paths with identifier segments, at most 255 bytes, and
+message wire types of the form `package::msg::dds_::Message_` at most 128 bytes.
+Empty/root node namespace and enclave map to `%`; root is not a valid topic.
+Session IDs are nonzero lowercase hex strings of 1-32 characters. Type hashes
+must have the `RIHS01_` prefix and 64 lowercase hex digits; syntax validation
+does not establish that a hash matches a message definition. No type-hash
+registry or Humble compatibility is supplied yet.
+
+On string-format failure a non-null, nonempty output is set to an empty
+string; no truncated key/token may be used. Attachment encode returns 33 on
+success or zero without writing on failure. Decode requires exactly 33 bytes
+and GID length 16 and leaves its result unchanged on failure; trailing bytes
+and future profile extensions are not accepted implicitly. The codec preserves
+integer values but supplies no timestamp clock, sequence policy or identity
+generator. Those remain session/ROS-adapter responsibilities.
 
 ## 1. Decisions and Constraints
 
@@ -271,9 +325,10 @@ Nothing in the small common API requires that feature now.
 
 ## 6. Implementation Slices and Gates
 
-All statuses are **not started**. Work in order; keep each extraction small
-and validate RTPS before continuing. Z0/Z1 can use a throwaway native harness
-without restructuring production RaftROS.
+**Z0 is in progress.** The isolated metadata preparatory slice above is
+complete; Z1's live proof has not started and Z2-Z6 remain unstarted. Work in
+order; keep each extraction small and validate RTPS before continuing. Z0/Z1
+can use a native harness without restructuring production RaftROS.
 
 | Slice | Deliverables | Exit gate |
 | --- | --- | --- |
@@ -297,7 +352,20 @@ approach in [the wire-diff guide](RaftROS-model-publisher-wire-diff.md).
 Add a focused Zenoh fixture/test group alongside existing tests only when
 needed to preserve dependency isolation, not a second copy of mapping tests.
 
-Existing RTPS baseline command, from `linux_unit_tests` on Linux/WSL:
+Implemented metadata-codec checks, from `linux_unit_tests` on Linux/WSL:
+
+```bash
+make zenoh-test
+make zenoh-test BUILD_DIR=build/zenoh-sanitize \
+  ZENOH_TEST_CFLAGS='-std=c++17 -Wall -Wextra -Werror -pedantic -g -fsanitize=address,undefined -fno-omit-frame-pointer'
+```
+
+Separate build directories prevent a previously built non-sanitized binary
+from satisfying the sanitizer target. `make clean` removes both with the
+default build directory. Neither target implements `RAFTROS_TRANSPORT` or
+changes the default RTPS source selection.
+
+Historical combined RTPS baseline command, from `linux_unit_tests` on Linux/WSL:
 
 ```bash
 make -j"$(nproc)" all standalone && ./linux_unit_tests
@@ -305,7 +373,8 @@ make -j"$(nproc)" all standalone && ./linux_unit_tests
 
 Run clean or separate-profile builds when comparing backends. The Makefile
 currently fetches RaftCore; pin/record its revision for repeatability. The
-reported 912/912 result is historical until this command is rerun.
+unit rerun passed 921/921 on 2026-09-17. The initial standalone include/API
+failure has been resolved; the standalone executable now compiles and links.
 
 Host prerequisites for the **future** Zenoh integration tests:
 
@@ -364,7 +433,9 @@ Implementation slices must also update the relevant example READMEs, build
 instructions and root README; this planning change does not make their current
 RTPS commands work for Zenoh.
 
-Upstream material consulted 2026-09-17; pin immutable revisions in Z0:
+Upstream material consulted 2026-09-17. The metadata design revision is pinned
+in the implementation record above; the remaining runtime/link versions still
+need pinning in Z0:
 
 - [rmw_zenoh README](https://github.com/ros2/rmw_zenoh): host configuration,
   non-RMW API compatibility obligations, DDS-bridge distinction, distro caveat.
