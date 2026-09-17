@@ -1,19 +1,19 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-09-17 (planning update; last recorded RTPS validation
-remains 2026-04-27)
+**Last Updated:** 2026-09-17 (first Zenoh codec slice and Linux unit rerun;
+last recorded hardware/demo validation remains 2026-04-27)
 
-## Next Milestone: Zenoh Alternative (Planned)
+## Next Milestone: Zenoh Alternative (Started)
 
 RTPS is still the only implemented/buildable backend. The
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) defines the
-new forward work; no Zenoh firmware, build selector, interop result, or size
-measurement is claimed by this update.
+new forward work. An isolated ROS metadata codec is implemented; no Zenoh
+firmware, build selector, live interop result, or size measurement is claimed.
 
 | Work | State / next evidence |
 | --- | --- |
-| Z0: feasibility and baseline | Not started. Pin Jazzy/RMW/Zenoh versions, measure RTPS baseline, assess a Raft-owned implementation under the existing source/dependency policy. zenoh-pico incorporation needs explicit approval. |
-| Z1: native ROS proof | Not started. Prove named-node graph visibility, typed CDR, late join and multi-process routerless operation. A router-assisted control test is not standalone acceptance. |
+| Z0: feasibility and baseline | In progress. Metadata reference pinned to Jazzy `rmw_zenoh_cpp` 0.2.11; RTPS unit baseline rerun, isolated metadata tests passing. Host runtime/profile, hardware budgets and topology feasibility remain open. zenoh-pico incorporation still needs explicit approval. |
+| Z1: native ROS proof | Live proof not started. Attachment, topic-key and node-token codec is preparatory work only. Prove named-node graph visibility, typed CDR, late join and multi-process routerless operation; a router-assisted test is not standalone acceptance. |
 | Z2-Z3: boundary and isolated builds | Not started. Common DeviceManager/CDR pipeline, RTPS adapter, then exactly-one-backend build with RTPS default and Zenoh-only alternative. |
 | Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
 
@@ -21,9 +21,33 @@ Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
 prerequisite for the initial Zenoh feasibility experiment.
 
-All results, counts and troubleshooting instructions below describe **RTPS /
-FastDDS** unless explicitly stated otherwise. The 912/912 test result and
-firmware size figures are historical, not rerun for this documentation change.
+### First Implementation Slice (2026-09-17)
+
+- [ZenohROSCodec.h](../components/RaftROS/Zenoh/ZenohROSCodec.h): bounded,
+  allocation-free attachment encode/decode, topic keys and `NN` node tokens.
+  No RTPS/Zenoh SDK dependency, no network operations and no firmware changes.
+- [Codec tests](../linux_unit_tests/zenoh_codec_tests.cpp): 610 passed, 0 failed
+  with strict compiler warnings and again with address/undefined-behavior
+  sanitizers. Run `make zenoh-test` from `linux_unit_tests`; the target does not
+  fetch RaftCore or link RTPS. Exact sanitizer command and profile provenance
+  are in the [implementation record](RaftROS-zenoh-implementation-plan.md#implementation-record-2026-09-17).
+- Existing RTPS Linux unit tests rebuilt and passed: **921/921**. Compiler:
+  g++ 13.3.0 on Ubuntu WSL; RaftCore
+  `feb4f77f1778be04fbf1789bdaa6c84ec4e8fe5c`.
+- Standalone build gap resolved on 2026-09-17: updated the wrapper's stale
+  includes, discovery namespace, ACKNACK declarations and DATA callback
+  signature to the current runtime APIs. The executable compiles and links;
+  all 921 RTPS tests still pass. Live ROS and hardware smoke tests remain
+  unverified.
+- Native Jazzy ROS/RMW packages were not found by the local package query.
+  Golden metadata fixtures are specification-derived, not a substitute for
+  typed ROS data/graph tests. Session transport, `MP`/`MS` QoS tokens, GID
+  derivation, reconnection and the strict routerless gate remain unimplemented.
+
+All results, counts and troubleshooting instructions in the dated sections
+below describe **RTPS / FastDDS** unless explicitly stated otherwise. Their
+912/912 test and firmware size figures are historical; the fresh Linux result
+is recorded above, while hardware measurements have not been repeated.
 In particular, the WSL/FastDDS daemon and `_NODE_NAME_UNKNOWN_` observations
 must not be used to dismiss a future Zenoh discovery failure. Zenoh has its
 own graph-token and host-session contract, and requires host processes using

@@ -1,8 +1,8 @@
 # RaftROS — Native ROS 2 Node Functionality for ESP32 via the Raft Framework
 
-**Planning update:** 2026-09-17. RTPS is the only implemented backend. A native
-Zenoh alternative is planned; none of the existing validation results imply
-Zenoh support. The next milestone is defined in the
+**Implementation update:** 2026-09-17. RTPS is the only implemented backend.
+Zenoh work has started with an isolated, tested metadata codec; no Zenoh
+session or firmware backend is available yet. The next milestone is defined in the
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md).
 
 ## 1. Introduction and Motivation
@@ -1091,7 +1091,7 @@ type, SI units, and QoS profile — zero per-device code.
 **Verification:** `linux_unit_tests/main.cpp` = **911 passed, 0 failed**;
 ESP32-S3 firmware 0x1435c0 bytes, 25% free on the `app` partition.
 
-### Next Transport Milestone: Zenoh Alternative — PLANNED
+### Next Transport Milestone: Zenoh Alternative — STARTED
 
 The [Z0-Z6 implementation plan](RaftROS-zenoh-implementation-plan.md) precedes
 services/parameters without renumbering the completed RTPS phases:
@@ -1105,8 +1105,13 @@ services/parameters without renumbering the completed RTPS phases:
 4. Deliver dynamic sensor lifecycle, string-subscription and supported QoS
   parity, then hardware/resource/recovery validation and demo instructions.
 
-No Zenoh code or validation is delivered yet. Runtime dual-backend selection
-is deferred; services, parameters and actions remain separate work.
+Z0 is in progress: the pinned ROS metadata codec passes 610 Linux checks,
+including a sanitizer run, and existing RTPS unit tests pass 921/921. This is
+not live ROS interoperability evidence; standalone topology, transport and
+firmware builds remain pending. See the plan's implementation record for the
+resolved RTPS standalone build failure and still-unverified hardware checks.
+Runtime dual-backend selection is deferred; services, parameters and actions
+remain separate work.
 
 ### Phase 5: Services and Parameters — FUTURE
 
