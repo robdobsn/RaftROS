@@ -4,6 +4,22 @@
 **Scope:** Analyze current RTPS helper/runner layout and propose a cleaner modular design.
 **Constraint:** Planning only. No production code changes in this step.
 
+## Scope Update: Zenoh Planning (2026-09-17)
+
+This remains the RTPS-specific refactor history/plan. The forward transport
+work is in [RaftROS-zenoh-implementation-plan.md](RaftROS-zenoh-implementation-plan.md).
+Finish only the RTPS changes needed to establish its small backend boundary;
+the broader cleanup below is not a prerequisite for the Zenoh feasibility
+experiment.
+
+"Shared runtime" here means RTPS behavior shared by Linux and ESP32, not
+protocol behavior shared by DDS and Zenoh. Discovery, heartbeat/ACKNACK,
+GUID/locator routing and SEDP belong behind the RTPS backend. Share the
+DeviceManager lifecycle, semantic topic/type/QoS mapping and CDR pipeline
+across backends, with opaque handles rather than RTPS writer IDs. Keep
+platform I/O separate inside each backend, and verify RTPS regression and
+single-backend source/dependency exclusion after each extraction.
+
 ## Executive Summary
 
 The current RTPS runtime has improved DRY convergence, but it is now split across many very small helper files with top-level free functions. This was useful for low-risk incremental extraction, but it has reached a readability and navigation limit:
@@ -18,12 +34,15 @@ A modular refactor is now beneficial. The best path is not to collapse everythin
 ## Terminology Layering (ROS 2 vs RTPS)
 
 The user-facing ROS 2 concepts (publish/subscribe, services, actions) are higher-layer APIs.
-The modules in this plan are mostly DDS/RTPS transport-runtime modules that must be in place first.
+The modules in this plan are mostly DDS/RTPS transport-runtime modules needed
+by the DDS backend, not prerequisites for a native Zenoh backend.
 
-- ROS 2 publish/subscribe maps to DDS DataWriter/DataReader endpoint behavior.
-- ROS 2 services/actions are built on top of topic/service primitives and still depend on the same RTPS discovery/reliability/message-dispatch substrate.
+- With a DDS RMW, ROS 2 publish/subscribe maps to DataWriter/DataReader behavior.
+- Services/actions on that backend depend on its RTPS substrate; a Zenoh
+	backend uses different graph and protocol primitives.
 
-So these runtime modules are not alternatives to ROS 2 concepts; they are the lower-level implementation substrate those concepts require.
+These modules implement ROS 2 concepts for RTPS, not a universal ROS 2
+middleware substrate.
 
 ## What Exists Today
 

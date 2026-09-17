@@ -1,12 +1,25 @@
 # RaftROS Next Stages Implementation Plan
 
 **Date:** 2026-04-22
-**Status update:** 2026-04-27
+**Status update:** 2026-09-17 (Zenoh planning pointer; RTPS results unchanged)
 **Scope:** Historical implementation plan for Phases 2–4. Phase 2
 (publishing), Phase 3 (subscribing, including N-ary per-topic routing), and
 Phase 4 (DeviceManager auto-publishing) are now complete. This document is
 kept as an implementation history; use `RaftROS-development-status.md` for the
 current status and known issues.
+
+## Current Forward Work: Zenoh Alternative
+
+Use [RaftROS-zenoh-implementation-plan.md](RaftROS-zenoh-implementation-plan.md)
+for the next transport milestone. Its Z0-Z6 sequence covers feasibility under
+the existing Raft-only/source-license and standalone goals, a native ROS
+interoperability proof, common sensor/CDR extraction, mutually exclusive
+RTPS/Zenoh builds, and dynamic sensor/subscription/QoS validation.
+
+RTPS stays the default; Zenoh is not implemented. Runtime selection of both
+backends is deferred. The remaining RTPS hardening/alignment items below stay
+valid but do not block the initial Zenoh experiment. Do not reuse DDS graph,
+type-hash leniency, or heartbeat assumptions as a Zenoh design.
 
 ## Status Summary
 
@@ -20,7 +33,7 @@ current status and known issues.
 - Demo polish (2026-04-27) — **done for first demo path**: `examples/DemoSimple` dynamically discovers `/raft/...` topics, subscribes with compatible QoS, and displays live values. Foxglove Studio is documented with `foxglove_bridge` for both WSL-to-Windows and native Linux.
 - Known caveat — `ros2 topic info -v` can still show `_NODE_NAME_UNKNOWN_` on the current WSL2/Jazzy/FastDDS setup. Data subscribers, `DemoSimple`, and Foxglove Bridge work. See `RaftROS-development-status.md` for the Task D investigation and current WSL-specific assumption.
 
-## Objectives (forward)
+## Remaining RTPS Objectives (Historical Sequence)
 
 1. Finish convergence of the remaining writer-state/action-execution policy under `RTPSReliabilityAndWriterStateRuntime`.
 2. ~~Add topic subscribing (Phase 3): SEDP reader announcement, reader-side ACKNACK, CDR deserialization, message dispatch hook.~~ **DONE 2026-04-22** (Stage 6).
@@ -168,7 +181,7 @@ current status and known issues.
 - Example validation on 2026-04-27: VL6180 appears as `/raft/range_1_29` (`sensor_msgs/msg/Range`) and publishes live range samples.
 - Note: `ros2 topic list` / `ros2 topic info` remain less reliable on WSL/Jazzy because of ros2cli daemon and `_NODE_NAME_UNKNOWN_` graph-attribution behavior. Prefer `DemoSimple`/`rclpy` for validation on that host.
 
-## Recommended Immediate Implementation Order
+## Historical RTPS Implementation Order
 
 1. ~~Finish moving remaining wrapper-side writer-state/action-execution policy behind `RTPSReliabilityAndWriterStateRuntime`.~~ **DONE 2026-04-21** — shared `RTPSAckActionStandardCtx` + `_initStandardAckActionCtx`/`_standardExecuteAction`/`_standardGetChatterSeq` helpers in `RTPSRunnerAdapterHelpers`; both wrappers converted; Linux validated (108 passed). ESP on-device smoke test still pending.
 2. ~~Add a focused unit test for VOLATILE `firstSN == currentSeq` HEARTBEAT invariant (regression guard for Stage 3 Fix 15).~~ **DONE 2026-04-21** — guard in `linux_unit_tests/main.cpp`.
@@ -189,7 +202,7 @@ current status and known issues.
 - **Risk:** `ros2` CLI graph attribution reports `_NODE_NAME_UNKNOWN_` on WSL/Jazzy, making demos look broken even when data subscriptions work.
   - **Mitigation:** Use `DemoSimple`/direct `rclpy` and Foxglove Bridge as the primary demo surfaces. Treat native Linux reproduction as the next discriminator before assuming a firmware protocol defect.
 
-## Definition of Done for the Next Milestone
+## Definition of Done for the Previous RTPS Milestone
 
 - Phase 4 remains stable with hot-plug auto-published device topics.
 - `DemoSimple` remains the canonical simple demo for dynamic topic discovery.

@@ -5,6 +5,42 @@
 `examples/DemoSimple`; Foxglove Bridge instructions added to `README.md`.
 **Scope:** Demonstrations for `ExampleDiscoverable` showing hot-plug I2C devices appearing as native ROS 2 publishers.
 
+## Zenoh Demo Extension (Planned 2026-09-17)
+
+The existing demo and its recorded results use **RTPS/FastDDS**. The
+[Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) adds a
+separately built firmware profile, not a runtime switch in the current image.
+Reuse the same sensors, ROS-visible topic names, dashboard and visualizations
+after its interoperability gates pass.
+
+1. Label the firmware/backend and pinned host versions. Build RTPS or Zenoh
+  independently; do not demonstrate both from a supposedly smaller binary.
+2. For Zenoh, run all host processes with `RMW_IMPLEMENTATION=rmw_zenoh_cpp`,
+  matching domain and the verified reachable session endpoints. Stop the
+  old ros2cli daemon before changing RMW and restart it in the new environment
+  if CLI introspection is used. FastDDS configuration does not select Zenoh.
+3. Demonstrate the routerless topology validated in Z1. A separate
+  `rmw_zenohd` control demo must be labeled router-assisted, not proof of the
+  strict standalone goal. No DDS bridge or per-device host adapter is used.
+4. Show the named ROS node and publisher endpoint metadata as well as live
+  typed values. Start subscribers both before and after the firmware.
+5. Hot-plug a range sensor and a composite sensor; verify publisher counts,
+  fields/units and all endpoints on detach/replug. A dashboard subscription
+  can keep a topic in the graph, so "topic still listed" is not a detach
+  failure. Use publisher presence and sample age for removal/stale display.
+6. Demonstrate WiFi recovery, a second board with a distinct namespace, and
+  a late-started dashboard without stale publishers or duplicate dispatch.
+7. Start Foxglove Bridge in the same Zenoh RMW/session environment. Foxglove
+  Studio's WebSocket connection is unchanged; validate the bridge's pinned
+  ROS/RMW build instead of assuming the existing FastDDS result transfers.
+
+The current `run_dashboard.sh` already honors an explicit RMW override but
+still applies FastDDS-specific environment setup. Z6 should scope those
+settings to RTPS, audit discovery/removal behavior, and document the tested
+Zenoh session configuration in the example READMEs. No Zenoh demo command is
+claimed working by this planning update. The WSL/FastDDS graph caveat below
+is not a waiver for Zenoh graph correctness; validate native Linux first.
+
 ## Demo Goal
 
 Show that an ESP32 running `ExampleDiscoverable` can participate directly in ROS 2 discovery and automatically expose attached I2C devices as typed ROS 2 topics, without a micro-ROS agent or per-device host configuration.
@@ -12,12 +48,13 @@ Show that an ESP32 running `ExampleDiscoverable` can participate directly in ROS
 The strongest demonstration is the dynamic behavior:
 
 1. Start the ESP32 firmware.
-2. Show the board as a ROS 2 node / DDS participant.
+2. Show the board as a named ROS 2 node (a DDS participant for the RTPS build).
 3. Plug in sensors at runtime.
 4. Show new ROS 2 topics appear.
 5. Show typed values updating live.
 6. Unplug sensors.
-7. Show the corresponding topics disappear.
+7. Show the corresponding publishers disappear; topics may remain while
+  monitoring subscriptions exist.
 
 Target devices:
 
@@ -68,7 +105,9 @@ topic                  type                       age    latest
 /raft/angle_1_36       std_msgs/msg/Float32       0.1s   data=147.3 deg
 ```
 
-When a device is unplugged, the row should disappear after the ROS graph no longer reports the topic. When it is plugged back in, the row should reappear and values should resume.
+When a device is unplugged, use publisher presence and sample age to remove
+or mark the row stale; do not wait solely for the topic name to vanish while
+the dashboard itself holds a subscription. On replug, live values resume.
 
 ### Demo Surface 2: Foxglove Studio
 

@@ -1,6 +1,33 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-04-27
+**Last Updated:** 2026-09-17 (planning update; last recorded RTPS validation
+remains 2026-04-27)
+
+## Next Milestone: Zenoh Alternative (Planned)
+
+RTPS is still the only implemented/buildable backend. The
+[Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) defines the
+new forward work; no Zenoh firmware, build selector, interop result, or size
+measurement is claimed by this update.
+
+| Work | State / next evidence |
+| --- | --- |
+| Z0: feasibility and baseline | Not started. Pin Jazzy/RMW/Zenoh versions, measure RTPS baseline, assess a Raft-owned implementation under the existing source/dependency policy. zenoh-pico incorporation needs explicit approval. |
+| Z1: native ROS proof | Not started. Prove named-node graph visibility, typed CDR, late join and multi-process routerless operation. A router-assisted control test is not standalone acceptance. |
+| Z2-Z3: boundary and isolated builds | Not started. Common DeviceManager/CDR pipeline, RTPS adapter, then exactly-one-backend build with RTPS default and Zenoh-only alternative. |
+| Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
+
+Runtime transport switching is deferred. Services/parameters remain future
+work after this milestone. Do not treat pending RTPS cleanup or Task D as a
+prerequisite for the initial Zenoh feasibility experiment.
+
+All results, counts and troubleshooting instructions below describe **RTPS /
+FastDDS** unless explicitly stated otherwise. The 912/912 test result and
+firmware size figures are historical, not rerun for this documentation change.
+In particular, the WSL/FastDDS daemon and `_NODE_NAME_UNKNOWN_` observations
+must not be used to dismiss a future Zenoh discovery failure. Zenoh has its
+own graph-token and host-session contract, and requires host processes using
+`rmw_zenoh_cpp`.
 
 ## Current Demo / Interop Status (2026-04-27)
 
