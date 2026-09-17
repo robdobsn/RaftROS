@@ -7,6 +7,16 @@ filters and SEDP comparisons are not Zenoh tests.
 
 ## Planned Zenoh Model-Publisher Extension
 
+A first [native metadata control](RaftROS-zenoh-implementation-plan.md#native-host-metadata-control)
+now passes with C++-generated keys, graph tokens and attachments against the
+pinned Jazzy RMW. Its Docker harness checks graph/QoS attribution, typed
+String data in both directions and token withdrawal. Raft now derives the
+publisher/subscriber GIDs independently and checks them against the native
+graph; the outgoing attachment no longer borrows a host GID. It still uses
+host-generated CDR and an upstream session, so it does not replace sensor
+serializer wire comparisons or validate a Raft-owned Zenoh session. The
+capture extension below remains future work.
+
 - Run the reference publisher and typed subscriber with the pinned
    `rmw_zenoh_cpp` version, domain and session configuration used by firmware
    interop tests; do not compare a FastDDS reference with a Zenoh capture.

@@ -1,19 +1,20 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-09-17 (first Zenoh codec slice and Linux unit rerun;
+**Last Updated:** 2026-09-17 (Raft-owned Zenoh endpoint GIDs and native identity control;
 last recorded hardware/demo validation remains 2026-04-27)
 
 ## Next Milestone: Zenoh Alternative (Started)
 
 RTPS is still the only implemented/buildable backend. The
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) defines the
-new forward work. An isolated ROS metadata codec is implemented; no Zenoh
-firmware, build selector, live interop result, or size measurement is claimed.
+new forward work. ROS metadata/identity code and host-only native ROS graph/data
+control tests pass. No Raft-owned Zenoh session, firmware, build selector or
+size measurement is claimed.
 
 | Work | State / next evidence |
 | --- | --- |
 | Z0: feasibility and baseline | In progress. Metadata reference pinned to Jazzy `rmw_zenoh_cpp` 0.2.11; RTPS unit baseline rerun, isolated metadata tests passing. Host runtime/profile, hardware budgets and topology feasibility remain open. zenoh-pico incorporation still needs explicit approval. |
-| Z1: native ROS proof | Live proof not started. Attachment, topic-key and node-token codec is preparatory work only. Prove named-node graph visibility, typed CDR, late join and multi-process routerless operation; a router-assisted test is not standalone acceptance. |
+| Z1: native ROS proof | Host control passes with C++ tokens/keys/attachments and Raft-derived publisher/subscriber GIDs checked against the native graph. Upstream libraries still supply session/CDR; Raft-owned session, sensor CDR and late-join/multi-process routerless firmware proof remain open. |
 | Z2-Z3: boundary and isolated builds | Not started. Common DeviceManager/CDR pipeline, RTPS adapter, then exactly-one-backend build with RTPS default and Zenoh-only alternative. |
 | Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
 
@@ -21,16 +22,24 @@ Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
 prerequisite for the initial Zenoh feasibility experiment.
 
-### First Implementation Slice (2026-09-17)
+### Metadata and Identity Implementation (2026-09-17)
 
 - [ZenohROSCodec.h](../components/RaftROS/Zenoh/ZenohROSCodec.h): bounded,
-  allocation-free attachment encode/decode, topic keys and `NN` node tokens.
+  allocation-free attachment encode/decode, topic keys, `NN`/`MP`/`MS` tokens
+  and canonical bounded QoS metadata.
   No RTPS/Zenoh SDK dependency, no network operations and no firmware changes.
-- [Codec tests](../linux_unit_tests/zenoh_codec_tests.cpp): 610 passed, 0 failed
+- [ZenohROSIdentity.h](../components/RaftROS/Zenoh/ZenohROSIdentity.h): bounded
+  endpoint GID generation from canonical tokens using original portable
+  XXH3-128 arithmetic. No external implementation in firmware, heap allocation
+  or 128-bit integer requirement. Session/entity-ID allocation is still future work.
+- [Codec tests](../linux_unit_tests/zenoh_codec_tests.cpp): 2218 passed, 0 failed
   with strict compiler warnings and again with address/undefined-behavior
   sanitizers. Run `make zenoh-test` from `linux_unit_tests`; the target does not
   fetch RaftCore or link RTPS. Exact sanitizer command and profile provenance
   are in the [implementation record](RaftROS-zenoh-implementation-plan.md#implementation-record-2026-09-17).
+- Docker's reference-enabled suite passes 3222 checks, including 1004 direct
+  comparisons with the pinned RMW hash helper. Fixed upstream GID vectors
+  also run in the local suite without ROS dependencies.
 - Existing RTPS Linux unit tests rebuilt and passed: **921/921**. Compiler:
   g++ 13.3.0 on Ubuntu WSL; RaftCore
   `feb4f77f1778be04fbf1789bdaa6c84ec4e8fe5c`.
@@ -39,10 +48,22 @@ prerequisite for the initial Zenoh feasibility experiment.
   signature to the current runtime APIs. The executable compiles and links;
   all 921 RTPS tests still pass. Live ROS and hardware smoke tests remain
   unverified.
-- Native Jazzy ROS/RMW packages were not found by the local package query.
-  Golden metadata fixtures are specification-derived, not a substitute for
-  typed ROS data/graph tests. Session transport, `MP`/`MS` QoS tokens, GID
-  derivation, reconnection and the strict routerless gate remain unimplemented.
+- Native Jazzy packages remain absent from the WSL installation, but Docker
+  Desktop provides a working Linux reference host. The
+  [Docker test](../linux_unit_tests/Dockerfile.zenoh) builds the pinned RMW
+  commit because its 0.2.11 apt binary is unavailable in the configured repo.
+- [Native metadata control](../linux_unit_tests/zenoh_metadata_interop.py)
+  passes: named-node attribution for publisher/subscriber, sensor QoS,
+  generated publisher/subscriber GIDs matching the graph, bidirectional typed
+  String with Raft-generated attachment identity, sequence/time, and graph removal.
+  It uses direct container loopback with no router, but upstream host
+  libraries still provide session and CDR. Graph GIDs are compared, no longer
+  supplied to the fixture. This does not prove Raft transport, retained-history QoS,
+  reconnection or multi-process/ESP32 standalone operation. Commands and exact
+  version details are in the plan's native host metadata control section.
+
+Next: implement a bounded Linux Zenoh TCP session and prove its handshake,
+declarations and typed traffic against the pinned host before ESP32 integration.
 
 All results, counts and troubleshooting instructions in the dated sections
 below describe **RTPS / FastDDS** unless explicitly stated otherwise. Their

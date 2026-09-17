@@ -19,6 +19,52 @@ public:
     static constexpr size_t ATTACHMENT_SIZE = 8 + 8 + 1 + GID_SIZE;
     static constexpr size_t MAX_ROS_NAME_SIZE = 255;
     static constexpr size_t MAX_TYPE_NAME_SIZE = 128;
+    static constexpr size_t QOS_BUFFER_SIZE = 24;
+
+    enum class Reliability : uint8_t
+    {
+        Reliable = 1,
+        BestEffort = 2
+    };
+
+    enum class Durability : uint8_t
+    {
+        TransientLocal = 1,
+        Volatile = 2
+    };
+
+    struct QoS
+    {
+        Reliability reliability = Reliability::Reliable;
+        Durability durability = Durability::Volatile;
+        uint32_t depth = 42;
+    };
+
+    struct NodeIdentity
+    {
+        uint32_t domainId = 0;
+        std::string_view sessionId;
+        uint64_t nodeId = 0;
+        std::string_view enclave;
+        std::string_view nodeNamespace;
+        std::string_view nodeName;
+    };
+
+    enum class EndpointKind : uint8_t
+    {
+        Publisher,
+        Subscription
+    };
+
+    struct Endpoint
+    {
+        uint64_t entityId = 0;
+        EndpointKind kind = EndpointKind::Publisher;
+        std::string_view topic;
+        std::string_view wireType;
+        std::string_view typeHash;
+        QoS qos;
+    };
 
     struct Attachment
     {
@@ -77,9 +123,7 @@ public:
         if (!output || capacity == 0)
             return false;
         output[0] = '\0';
-        if (!isSessionId(sessionId) || !isIdentifier(nodeName) ||
-            (!enclave.empty() && !isRosPath(enclave, true)) ||
-            (!nodeNamespace.empty() && !isRosPath(nodeNamespace, true)))
+        if (!isNodeIdentityValid(sessionId, enclave, nodeNamespace, nodeName))
             return false;
         const auto mangledEnclave = manglePath(enclave);
         const auto mangledNamespace = manglePath(nodeNamespace);
@@ -93,7 +137,63 @@ public:
         return finishFormat(output, capacity, written);
     }
 
+    static bool formatQoS(char* output, size_t capacity, const QoS& qos)
+    {
+        if (!output || capacity == 0)
+            return false;
+        output[0] = '\0';
+        if ((qos.reliability != Reliability::Reliable && qos.reliability != Reliability::BestEffort) ||
+            (qos.durability != Durability::Volatile && qos.durability != Durability::TransientLocal) ||
+            qos.depth == 0)
+            return false;
+        char depth[11] = {};
+        if (qos.depth != 42)
+            std::snprintf(depth, sizeof(depth), "%u", static_cast<unsigned>(qos.depth));
+        const int written = std::snprintf(output, capacity, "%s:%s:,%s" ":," ":," ":,,",
+            qos.reliability == Reliability::Reliable ? "" : "2",
+            qos.durability == Durability::Volatile ? "" : "1", depth);
+        return finishFormat(output, capacity, written);
+    }
+
+    static bool formatEndpointToken(char* output, size_t capacity,
+                                    const NodeIdentity& node, const Endpoint& endpoint)
+    {
+        if (!output || capacity == 0)
+            return false;
+        output[0] = '\0';
+        const char* kind = endpoint.kind == EndpointKind::Publisher ? "MP" :
+                           endpoint.kind == EndpointKind::Subscription ? "MS" : nullptr;
+        if (!kind || !isNodeIdentityValid(node.sessionId, node.enclave, node.nodeNamespace, node.nodeName) ||
+            !isRosPath(endpoint.topic, false) || !isMessageType(endpoint.wireType) ||
+            !isTypeHash(endpoint.typeHash))
+            return false;
+        char qos[QOS_BUFFER_SIZE];
+        if (!formatQoS(qos, sizeof(qos), endpoint.qos))
+            return false;
+        const auto enclave = manglePath(node.enclave);
+        const auto nodeNamespace = manglePath(node.nodeNamespace);
+        const auto topic = manglePath(endpoint.topic);
+        const int written = std::snprintf(output, capacity,
+            "@ros2_lv/%u/%.*s/%llu/%llu/%s/%s/%s/%.*s/%s/%.*s/%.*s/%s",
+            static_cast<unsigned>(node.domainId),
+            static_cast<int>(node.sessionId.size()), node.sessionId.data(),
+            static_cast<unsigned long long>(node.nodeId), static_cast<unsigned long long>(endpoint.entityId),
+            kind, enclave.data(), nodeNamespace.data(),
+            static_cast<int>(node.nodeName.size()), node.nodeName.data(), topic.data(),
+            static_cast<int>(endpoint.wireType.size()), endpoint.wireType.data(),
+            static_cast<int>(endpoint.typeHash.size()), endpoint.typeHash.data(), qos);
+        return finishFormat(output, capacity, written);
+    }
+
 private:
+    static bool isNodeIdentityValid(std::string_view sessionId, std::string_view enclave,
+                                    std::string_view nodeNamespace, std::string_view nodeName)
+    {
+        return isSessionId(sessionId) && isIdentifier(nodeName) &&
+               (enclave.empty() || isRosPath(enclave, true)) &&
+               (nodeNamespace.empty() || isRosPath(nodeNamespace, true));
+    }
+
     static bool isLetter(char character)
     {
         return (character >= 'a' && character <= 'z') ||
