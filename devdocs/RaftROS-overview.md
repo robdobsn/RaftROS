@@ -1,5 +1,10 @@
 # RaftROS — Native ROS 2 Node Functionality for ESP32 via the Raft Framework
 
+**Planning update:** 2026-09-17. RTPS is the only implemented backend. A native
+Zenoh alternative is planned; none of the existing validation results imply
+Zenoh support. The next milestone is defined in the
+[Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md).
+
 ## 1. Introduction and Motivation
 
 ### 1.0 Current Implementation Status
@@ -27,7 +32,19 @@ Foxglove Bridge for functional validation. See
 
 ### 1.1 Goal
 
-RaftROS aims to make ESP32 firmware, built on the Raft framework, function as a **native ROS 2 node** — participating directly in ROS 2 discovery and data exchange without relying on micro-ROS or any external agent/bridge process.
+RaftROS aims to make ESP32 firmware, built on the Raft framework, function as a
+**native ROS 2 node**, participating in discovery and typed data exchange
+without micro-ROS, a host-side device agent, or a DDS translation bridge.
+The implemented backend is DDS/RTPS; the planned alternative targets
+`rmw_zenoh_cpp` directly. Prefer a build-time choice of exactly one backend,
+with RTPS remaining the default.
+
+The standalone goal also requires testing operation without a separate router
+process. Default `rmw_zenoh_cpp` deployments use a Zenoh router for discovery;
+that router is not a micro-ROS agent, but is still an external runtime
+dependency. Routerless ESP32-to-ROS interoperability is an early feasibility
+gate, not an assumed property of zenoh-pico. A router-required release would
+need an explicit change to this goal.
 
 ### 1.2 Why Not micro-ROS?
 
@@ -45,7 +62,7 @@ micro-ROS is the standard approach for bringing ROS 2 to microcontrollers. It us
 
 RaftROS would allow an ESP32 running Raft firmware to:
 
-1. **Appear as a native ROS 2 node** on the DDS network (discoverable by `ros2 node list`, `ros2 topic list`, etc.)
+1. **Appear as a native ROS 2 node** using the selected middleware (DDS/RTPS today, Zenoh planned), discoverable by ROS 2 graph tools
 2. **Auto-generate ROS 2 publishers** from dynamically detected devices (I2C sensors, BLE peripherals) using DeviceTypeRecords metadata
 3. **Auto-generate ROS 2 services** from device actions (servo control, LED configuration, etc.)
 4. **Subscribe to ROS 2 topics** to receive commands from the ROS ecosystem
@@ -57,7 +74,9 @@ RaftROS would allow an ESP32 running Raft firmware to:
 
 ### 2.1 ROS 2 / DDS Architecture (What We Need to Interoperate With)
 
-ROS 2 is built on top of DDS (Data Distribution Service), using the RTPS (Real-Time Publish-Subscribe) wire protocol. The key architectural layers are:
+ROS 2 selects middleware through RMW. DDS implementations use RTPS; Zenoh is
+an alternative middleware, not a DDS implementation or an RTPS transport.
+The following diagram describes the existing DDS backend only:
 
 ```
 ┌─────────────────────────────────────────────────┐
@@ -68,7 +87,7 @@ ROS 2 is built on top of DDS (Data Distribution Service), using the RTPS (Real-T
 │  RMW  (ROS Middleware Interface)                │
 ├─────────────────────────────────────────────────┤
 │  DDS Implementation                             │
-│   (Fast DDS / Cyclone DDS / Connext / Zenoh)    │
+│   (Fast DDS / Cyclone DDS / Connext)            │
 ├─────────────────────────────────────────────────┤
 │  RTPS Wire Protocol (DDSI-RTPS)                 │
 │   - UDP multicast discovery (SPDP/SEDP)         │
@@ -76,6 +95,15 @@ ROS 2 is built on top of DDS (Data Distribution Service), using the RTPS (Real-T
 │   - CDR serialization                           │
 └─────────────────────────────────────────────────┘
 ```
+
+The planned Zenoh path is ROS 2 application -> RCL -> `rmw_zenoh_cpp` ->
+Zenoh on the host, interoperating with a RaftROS ROS-compatibility adapter ->
+Raft-owned Zenoh implementation on the ESP32 under the existing dependency
+policy. A separately packaged zenoh-pico dependency is an effort-saving
+alternative only with explicit approval; see the new plan's Z0 gate.
+Neither RCL nor the host RMW is required on firmware.
+CDR sensor serialization is a reuse candidate; SPDP, SEDP, RTPS reliability,
+and `ros_discovery_info` remain specific to the RTPS backend.
 
 **Key RTPS concepts RaftROS must implement or interface with:**
 
@@ -148,11 +176,18 @@ The [esp-dds](https://github.com/KristijanPruzinac/esp-dds) project (MIT license
 - Static arrays only with very small limits (8 topics, 4 subscribers/topic)
 - No type system or message schema
 
-**Key takeaway:** esp-dds validates that a lightweight pub/sub abstraction with ROS naming conventions is implementable on ESP32, but RaftROS needs actual network interoperability, which requires implementing (a subset of) the RTPS wire protocol.
+**Key takeaway:** esp-dds validates that a lightweight pub/sub abstraction with
+ROS naming conventions is implementable on ESP32. Actual network
+interoperability additionally requires the selected middleware's wire and ROS
+discovery conventions: RTPS today, ROS-on-Zenoh in the planned alternative.
 
 ### 2.4 StatePublisher and MQTTManager — The Existing Pub/Sub Infrastructure
 
-Raft already has a mature, transport-agnostic pub/sub system. Understanding it in detail is critical because **RaftROS should integrate as another transport channel** alongside HTTP, BLE, Serial, and MQTT — not replace the existing infrastructure.
+The following describes the original integration options. Phase 4 selected
+direct DeviceManager status/data callbacks for the binary sensor path, not a
+StatePublisher CommsChannel. Keep that implemented path shared between
+backends; StatePublisher remains a possible future diagnostic integration.
+See [the auto-publishing design](RaftROS-auto-publishing-design.md).
 
 #### 2.4.1 StatePublisher (the Pub/Sub Core)
 
@@ -293,10 +328,17 @@ Implement the minimum subset of the DDSI-RTPS specification needed to:
 
 #### Option B: Zenoh Native Client
 
-ROS 2 Kilted Kaiju (2025) added Zenoh as a first-class RMW alternative. Zenoh is designed for resource-constrained and IoT scenarios with lower overhead than full RTPS.
+Target ROS 2 hosts using `rmw_zenoh_cpp`, starting with a pinned Jazzy profile.
+Implement its key expressions, ROS graph liveliness tokens, type hashes, CDR,
+and attachments, not just generic Zenoh publishing.
 
-**Pros:** Simpler protocol, designed for edge/IoT, lower resource usage, official ROS 2 support
-**Cons:** Requires Zenoh router for bridging to DDS-based ROS nodes; newer ecosystem with less deployment history
+**Pros:** Alternative discovery/network topology, constrained-device ecosystem,
+and reuse of the existing sensor/CDR pipeline.
+**Cons:** Firmware size and protocol effort must be measured; a Raft-owned
+implementation is substantial work. Default host deployments use a router,
+and routerless compatibility must be proven. A router does not translate this
+protocol into DDS; DDS-based ROS applications must change RMW or use a
+separately designed interoperability solution, outside this milestone.
 
 #### Option C: Direct UDP Protocol with ROS Bridge
 
@@ -305,9 +347,13 @@ Implement a custom lightweight protocol and provide a ROS 2 bridge node (running
 **Pros:** Simplest ESP32-side implementation
 **Cons:** Reintroduces the agent/bridge dependency that motivated this project; similar to micro-ROS
 
-#### Chosen Path: Option A (Minimal RTPS)
+#### Chosen Path: RTPS Implemented, Zenoh Alternative Planned
 
-**Option A (Minimal RTPS)** is the chosen approach. Option B (Zenoh) may be considered as a future addition given Zenoh's trajectory in the ROS ecosystem, but RTPS provides maximum compatibility with existing ROS 2 deployments. Option C defeats the purpose by reintroducing an agent dependency.
+**Option A (Minimal RTPS)** remains the implemented/default backend.
+**Option B (Zenoh)** is now the next transport milestone, built separately
+using a small common sensor/backend boundary. The dependency and standalone
+constraints are unchanged unless explicitly approved otherwise. Option C
+still defeats the purpose by reintroducing an agent dependency.
 
 The MQTTManager precedent in RaftSysMods demonstrates that implementing a custom wire protocol within Raft's SysMod architecture is feasible and well-supported — MQTT's connection state machine, keepalive logic, and channel integration provide a direct template for the RTPS implementation.
 
@@ -534,6 +580,12 @@ When a device is hot-plugged:
 ---
 
 ## 4. Data Flow Architecture
+
+The diagrams below record the initial RTPS design. The implemented Phase 4
+sensor path is DeviceManager callback -> decoded latest record -> CDR -> RTPS
+send, without StatePublisher on that hot path. The Zenoh plan extracts this
+common pipeline and adds a bounded transport handoff; it does not duplicate
+sensor discovery or move it into a host process.
 
 ### 4.1 Publishing Path (ESP32 → ROS Network)
 
@@ -1039,6 +1091,23 @@ type, SI units, and QoS profile — zero per-device code.
 **Verification:** `linux_unit_tests/main.cpp` = **911 passed, 0 failed**;
 ESP32-S3 firmware 0x1435c0 bytes, 25% free on the `app` partition.
 
+### Next Transport Milestone: Zenoh Alternative — PLANNED
+
+The [Z0-Z6 implementation plan](RaftROS-zenoh-implementation-plan.md) precedes
+services/parameters without renumbering the completed RTPS phases:
+
+1. Establish dependency/license feasibility and prove routerless native ROS
+  graph and typed-data interoperability with a pinned host profile.
+2. Extract common sensor/CDR ownership and a small backend API while keeping
+  RTPS behavior passing.
+3. Build exactly one backend: RTPS by default, or Zenoh, with unused sources
+  and dependencies excluded.
+4. Deliver dynamic sensor lifecycle, string-subscription and supported QoS
+  parity, then hardware/resource/recovery validation and demo instructions.
+
+No Zenoh code or validation is delivered yet. Runtime dual-backend selection
+is deferred; services, parameters and actions remain separate work.
+
 ### Phase 5: Services and Parameters — FUTURE
 
 **Goal:** Expose device actions as ROS 2 services and parameters
@@ -1051,7 +1120,8 @@ ESP32-S3 firmware 0x1435c0 bytes, 25% free on the `app` partition.
 
 ### Phase 6: Advanced Features
 
-- Zenoh transport as an alternative to RTPS
+- Optional dual-backend build/runtime selection, only if a concrete need and
+  measured resource budget justify it after the Zenoh milestone
 - Multi-domain support
 - ROS 2 lifecycle node support
 - Integration with `tf2` (transform broadcasting for spatial sensors)
@@ -1063,6 +1133,10 @@ ESP32-S3 firmware 0x1435c0 bytes, 25% free on the `app` partition.
 ## 6. Resource Considerations
 
 ### 6.1 ESP32 Constraints
+
+The table below contains original RTPS estimates, not Zenoh measurements or
+release budgets. Z0 must establish comparable whole-application baselines and
+absolute flash/heap/stack limits before claiming an efficiency improvement.
 
 | Resource | ESP32 Available | Estimated RaftROS Need |
 |----------|----------------|----------------------|
@@ -1094,10 +1168,16 @@ ESP32-S3 firmware 0x1435c0 bytes, 25% free on the `app` partition.
 | [Eclipse Cyclone DDS](https://github.com/eclipse-cyclonedds/cyclonedds) | C | EPL 2.0 | No (weak copyleft) | Protocol reference only |
 | [micro-CDR](https://github.com/eProsima/Micro-CDR) | C | Apache 2.0 | No (patent clause, attribution) | Reference for CDR format; RaftROS must implement its own CDR encoder from the OMG CDR spec |
 | [Micro-XRCE-DDS-Client](https://github.com/eProsima/Micro-XRCE-DDS-Client) | C | Apache 2.0 | No | Reference for how micro-ROS serializes (XRCE protocol, not directly relevant) |
-| [Zenoh-pico](https://github.com/eclipse-zenoh/zenoh-pico) | C | EPL 2.0 / Apache 2.0 | No (either license is restrictive) | Reference only if pursuing Zenoh path |
+| [Zenoh-pico](https://github.com/eclipse-zenoh/zenoh-pico) | C | EPL 2.0 / Apache 2.0 | Not allowed under the current source policy | Reference/test oracle for Zenoh; a separately licensed firmware dependency requires explicit approval in Z0 |
 | [ros2arduino](https://github.com/ROBOTIS-GIT/ros2arduino) | C++ | Apache 2.0 | No | Reference for feasibility; do not reuse code |
 
 **Implementation approach:** All RTPS, CDR, and discovery code in RaftROS will be written from scratch (clean-room) based on the OMG specifications, which are open standards. The CDR encoding format in particular is straightforward (it is essentially aligned little/big-endian binary with length-prefixed strings) and does not warrant pulling in an external library.
+
+**Zenoh planning decision:** Retain that source/dependency policy. Assess an
+original Raft-owned protocol subset first; do not copy upstream implementation
+code. Separately packaging zenoh-pico instead may reduce effort, but is a
+policy decision with its own license obligations, not an MIT relicensing of
+third-party code. See [the decision gate](RaftROS-zenoh-implementation-plan.md#11-dependency-and-licensing-decision).
 
 ### 7.2 Specifications
 
@@ -1134,7 +1214,9 @@ diagnostic_msgs/msg/DiagnosticArray  → Device/bus health
 ### 8.1 Architecture Decisions
 
 1. **RTPS vs Zenoh as primary transport?**
-   RTPS gives maximum compatibility with existing ROS 2 deployments. Zenoh is lighter and designed for exactly this use case. Could support both via a transport abstraction layer.
+  RTPS remains the default. A separately built Zenoh alternative is planned;
+  lower resource usage is a hypothesis to measure, not an established fact.
+  Runtime switching is deferred.
 
 2. **Build-time vs runtime CDR generation?**
    Build-time generation of CDR encoders from DeviceTypeRecords would be more efficient and smaller (no runtime type interpretation). Runtime generation is more flexible for dynamically-added device types.
@@ -1175,7 +1257,11 @@ RaftROS would be a standard Raft library (idf_component / PlatformIO library), d
 
 It would **not** depend on any ROS 2 host-side packages for its core functionality (no cross-compilation of rcl/rclcpp). The ESP32 firmware is fully self-contained.
 
-RaftROS fits into the transport layer alongside MQTTManager, CommandSocket, and BLEManager — all peers that register as CommsChannels and wire into StatePublisher subscriptions:
+RaftROS sits alongside MQTTManager, CommandSocket, and BLEManager, but its
+implemented sensor path uses direct DeviceManager callbacks. The original
+RTPS-oriented diagram below does not imply a StatePublisher dependency for
+sensor publishing. The planned Zenoh backend shares this DeviceManager/CDR
+pipeline and replaces only middleware-specific behavior.
 
 ```
 ┌──────────────────────────────────────────────────────────┐
@@ -1208,8 +1294,14 @@ RaftROS bridges two powerful paradigms:
 - **Raft's** automatic device discovery, self-describing data (DeviceTypeRecords), and efficient binary data pipeline
 - **ROS 2's** standardized robotics middleware with rich tool ecosystem, visualization (RViz), and computation graph
 
-By implementing a minimal RTPS stack on ESP32, RaftROS would enable Raft-based firmware to participate natively in ROS 2 networks. The key innovation is **automatic mapping** from dynamically-detected devices (with their self-describing formats and actions) to ROS 2 topics and services — eliminating the manual configuration typically required when integrating embedded sensors into a ROS system.
+RaftROS already implements native DDS/RTPS sensor publishing on ESP32. The
+next milestone adds a separately built native Zenoh alternative with the same
+automatic device-to-topic mapping. Services/actions remain future work.
 
-Critically, RaftROS does not need to reinvent Raft's pub/sub infrastructure. The existing StatePublisher + CommsCoreIF architecture — already proven with MQTT, HTTP, BLE, and Serial transports — provides the data source management, change detection, rate limiting, and backoff logic. RaftROS's unique contribution is the RTPS wire protocol layer and CDR serialization, following the same SysMod integration pattern established by MQTTManager.
+Keep DeviceManager discovery, decoding, class mapping and CDR serialization
+common. Isolate the middleware-specific graph, endpoints, wire protocol and
+connection management. Preserve the standalone/dependency goals through
+explicit feasibility gates rather than assuming that changing middleware is
+only a socket-level replacement.
 
 This approach makes Raft-based devices truly plug-and-play in ROS environments: connect a new I2C sensor, and a new ROS topic appears automatically with the correct message type, calibrated data, and discoverable metadata.

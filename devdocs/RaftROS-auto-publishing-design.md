@@ -1,15 +1,37 @@
 # RaftROS Auto-Publishing Design & Implementation Plan
 
-**Status:** DRAFT — open questions at end, awaiting user input  
+**Status:** Phase 4 implemented for RTPS; Zenoh adaptation planned separately
 **Author:** RaftROS maintainers  
-**Last Updated:** 2026-04-22  
+**Last Updated:** 2026-09-17 (planning update; historical results retained)
 **Scope:** Phase 4 of the RaftROS roadmap: automatic ROS 2 topic publishing for every
 I²C device attached to a Raft bus, with dynamic online/offline handling and
 per-`clas` message-type selection.
 
+## Current Status and Zenoh Reuse
+
+The Phase 4 slice table records completed RTPS work. Its counts/resource
+figures are historical; [development status](RaftROS-development-status.md)
+records the latest RTPS validation. Older implementation sketches and resolved
+design proposals are not proof that every optional configuration is exercised.
+
+The [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) preserves
+the DeviceManager callback mechanism, class/composite/fallback mappings,
+ROS-visible names, values and CDR serialization. Shared descriptors and opaque
+publisher handles will replace RTPS-specific state at the transport boundary.
+SPDP/SEDP, entity IDs, `ros_discovery_info` and ACKNACK/history machinery remain
+RTPS-only. Zenoh needs its own ROS graph tokens, keys/hashes, attachments and
+verified QoS implementation; it is not a new destination for RTPS packets.
+
+As built, `RaftROS::autoPubOnDeviceData` serializes the latest decoded record
+and sends RTPS data directly to peers. The bounded asynchronous handoff in
+the new plan is work to implement, not an existing queue to reuse. Preserve
+bus-task responsiveness and explicitly test ownership, detach races and
+backpressure when extracting it. The source/dependency and routerless gates
+in Z0/Z1 apply before production Zenoh integration.
+
 > Pre-requisite reading:
 > - [RaftROS-overview.md](RaftROS-overview.md) — current phase roadmap
-> - [RaftROS-development-status.md](RaftROS-development-status.md) — Phase 3 (topic subscribing) complete
+> - [RaftROS-development-status.md](RaftROS-development-status.md) — RTPS Phases 1-4 complete; Zenoh planned
 > - [RaftROS-next-stages-implementation-plan.md](RaftROS-next-stages-implementation-plan.md) — slice plan
 > - `/memories/repo/raftros-rtps-data-flags.md` — RTPS DATA flags lesson (Q-flag, dispose)
 
@@ -23,15 +45,19 @@ each online device SHALL automatically appear in the ROS 2 graph as one or
 more publishers with topic names, message types, QoS, and serialized payloads
 that a standard ROS 2 subscriber (e.g. `ros2 topic echo`) can consume without
 any host-side codegen. Devices that come online or go offline at runtime SHALL
-be reflected as matching SEDP publication ADD / DISPOSE announcements.
+be reflected as publisher creation/removal in the ROS graph. For the current
+RTPS backend this uses SEDP publication ADD / DISPOSE announcements; Zenoh
+will use its own publisher and ROS graph-liveliness lifecycle.
 
 ### 1.2 Success criteria
 1. Plugging in a supported device (e.g. `LSM6DS`, `VL53L4CD`, `AHT20`) causes a
    new topic to appear in `ros2 topic list` on the host within ≤ 2 s.
 2. `ros2 topic echo <topic>` prints decoded, human-readable values at the
    device poll rate with correct units (already scaled by `divisor`/`addend`).
-3. Unplugging the device (or bus error → offline) causes the topic to disappear
-   from `ros2 topic list` within ≤ 10 s (bounded by lease duration).
+3. Unplugging the device (or bus error → offline) removes its publisher from
+  the graph within ≤ 10 s of the offline callback. The topic can remain if
+  another publisher or a monitoring subscription still exists. Abrupt network
+  loss is a separate, backend-specific lease-expiry test.
 4. Re-plugging the same device reuses the same topic name and resumes
    publishing.
 5. A fallback path exists for devices whose `clas` has no standard ROS 2 mapping
@@ -39,7 +65,8 @@ be reflected as matching SEDP publication ADD / DISPOSE announcements.
    JSON carrier).
 6. ESP32 heap impact ≤ ~8 kB per active device-writer; total capped by a
    compile-time constant (`RAFTROS_MAX_DYNAMIC_WRITERS`).
-7. Phase 3 subscription functionality continues to pass all 388 unit tests.
+7. Existing subscription functionality and the current Linux test suite
+  remain passing; 388 was the original Phase 3 baseline, not the current count.
 
 ### 1.3 Non-goals (this phase)
 - Publishing actuator commands (servo targets, LED pixel arrays). Only sensor
@@ -55,7 +82,10 @@ be reflected as matching SEDP publication ADD / DISPOSE announcements.
 
 ## 2. ROS 2 Publishing Primer (what we actually have to emit)
 
-A ROS 2 publication is, at the wire level, an RTPS 2.2 DataWriter endpoint
+This section and sections 3/7 describe the **DDS/RTPS backend**. The Zenoh
+wire/graph contract is specified separately in the new transport plan.
+
+A DDS-backed ROS 2 publication is, at the wire level, an RTPS DataWriter endpoint
 inside a Participant. For RaftROS this has four distinct artefacts, in order
 of appearance on the wire:
 
@@ -77,7 +107,8 @@ following hold:
 
 ### 2.2 CDR serialization (the only payload format we need)
 Every standard message is serialized as **CDR** (OMG CDR) with a 4-byte
-encapsulation header: `{0x00, 0x01, 0x00, 0x00}` for little-endian PL_CDR. After
+encapsulation header: `{0x00, 0x01, 0x00, 0x00}` for little-endian plain CDR
+(CDR_LE/XCDR1, not PL_CDR). After
 that header, fields are emitted in struct order with natural alignment relative
 to the CDR cursor. For e.g. `sensor_msgs/msg/Imu`:
 
@@ -140,8 +171,9 @@ SEDP and not yet disposed.
    This is exactly the pattern we already decode silently in `onData` via the
    inline-QoS Q-flag handling fixed in Phase 3 (see
    [memory: raftros-rtps-data-flags](/memories/repo/raftros-rtps-data-flags.md)).
-3. Matched subscribers remove their reader; `ros2 topic list` no longer shows
-   the topic (if no other publisher holds it).
+3. Matched subscribers lose the remote writer endpoint; their own readers
+  remain. The topic disappears only when no publisher or subscription keeps
+  it in the graph. Validate publisher counts, not only `ros2 topic list`.
 4. RaftROS releases the `entityId` back to the free pool and destroys the
    `ReliableWriter` instance (releasing its history cache heap).
 
@@ -468,12 +500,14 @@ ESP32-S3 firmware size: `0x1435c0` (25% free on `app` partition).
 
 1. **CDR alignment bugs.** Mitigation: golden-byte tests per type from a
    `ros2 bag` capture.
-2. **Bus-task blocking.** Mitigation: writer history-cache push is O(1) +
-   memcpy; heartbeat sender is its own task.
+2. **Bus-task blocking.** The implementation still sends from the data
+  callback. The transport extraction must add a bounded handoff with explicit
+  buffer ownership; do not assume a separate history-cache sender exists.
 3. **EntityID collisions with builtin endpoints.** Mitigation: centralised
    allocator; reserve Raft range; unit test free-list.
-4. **Subscriber mismatch on type hash.** Mitigation: omit type hash (lenient
-   matching) — FastDDS accepts this for ROS 2 types.
+4. **Subscriber mismatch on type hash.** The original RTPS path relies on
+  FastDDS leniency when the hash is omitted. This is not portable to Zenoh:
+  its keys/tokens must carry the verified hash required by the pinned RMW.
 5. **Heap fragmentation under rapid attach/detach.** Mitigation: pool
    allocator for `DynamicWriterCtx`; reuse writer slots.
 6. **Silent MCP9808 clas bug** (see §5.2 note). Mitigation: add a devtype

@@ -1,5 +1,34 @@
 # RaftROS — Model-Publisher Wire-Diff Procedure
 
+**Scope update:** 2026-09-17. The commands and captures below validate the
+existing RTPS backend. The CDR reference method is reusable for the planned
+[Zenoh alternative](RaftROS-zenoh-implementation-plan.md), but RTPS packet
+filters and SEDP comparisons are not Zenoh tests.
+
+## Planned Zenoh Model-Publisher Extension
+
+- Run the reference publisher and typed subscriber with the pinned
+   `rmw_zenoh_cpp` version, domain and session configuration used by firmware
+   interop tests; do not compare a FastDDS reference with a Zenoh capture.
+- Capture the actual configured Zenoh endpoints, including TCP stream
+   reassembly where used. The existing UDP 7400-7500 filters will miss them.
+- Compare data key expressions (domain, normalized topic, type and hash),
+   ROS graph-liveliness tokens (node/publisher association, mangling and QoS),
+   attachment layout/identity/sequence/time, then the CDR payload separately.
+   Normalize expected session IDs and timestamps rather than diffing complete
+   packets as though they should be identical.
+- Build golden tests from a pinned host serializer and verify with native
+   typed deserialization for all mapped types. Never wrap RTPS DATA/SEDP bytes
+   in a Zenoh value. Verify that the four-byte CDR encapsulation is included
+   exactly once and alignment is relative to the correct origin.
+- Check graph attribution and endpoint removal as well as sample delivery.
+   Test late joiners, wrong domain/type/hash, reconnect, and malformed or absent
+   required metadata. A generic Zenoh subscriber accepting bytes is not a ROS
+   interoperability result.
+- Record direct/routerless and router-assisted runs separately. The latter is
+   a diagnostic control, not standalone acceptance. Keep the current RTPS
+   harness unchanged until a backend-specific capture extension is tested.
+
 > **Purpose.** When the ESP32 firmware announces a topic but a ROS 2
 > subscriber either (a) cannot discover it, (b) discovers it but never
 > receives samples, or (c) receives malformed samples, we need a way to
