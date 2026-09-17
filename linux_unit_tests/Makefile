@@ -83,7 +83,7 @@ standalone: $(STANDALONE_OUT)
 ZENOH_TEST_OUT = $(BUILD_DIR)/zenoh/zenoh_codec_tests
 ZENOH_TEST_CFLAGS = -std=c++17 -Wall -Wextra -Werror -pedantic -g
 
-$(ZENOH_TEST_OUT): zenoh_codec_tests.cpp ../components/RaftROS/Zenoh/ZenohROSCodec.h
+$(ZENOH_TEST_OUT): zenoh_codec_tests.cpp ../components/RaftROS/Zenoh/ZenohROSCodec.h ../components/RaftROS/Zenoh/ZenohROSIdentity.h
 	@mkdir -p $(dir $@)
 	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS $< -o $@
 

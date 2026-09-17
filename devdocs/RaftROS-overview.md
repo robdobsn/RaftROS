@@ -1,8 +1,9 @@
 # RaftROS — Native ROS 2 Node Functionality for ESP32 via the Raft Framework
 
 **Implementation update:** 2026-09-17. RTPS is the only implemented backend.
-Zenoh work has started with an isolated, tested metadata codec; no Zenoh
-session or firmware backend is available yet. The next milestone is defined in the
+Zenoh work has started with a tested endpoint/QoS metadata codec and a passing
+native host graph/data control; no Raft-owned Zenoh session or firmware backend
+is available yet. The next milestone is defined in the
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md).
 
 ## 1. Introduction and Motivation
@@ -1105,10 +1106,12 @@ services/parameters without renumbering the completed RTPS phases:
 4. Deliver dynamic sensor lifecycle, string-subscription and supported QoS
   parity, then hardware/resource/recovery validation and demo instructions.
 
-Z0 is in progress: the pinned ROS metadata codec passes 610 Linux checks,
-including a sanitizer run, and existing RTPS unit tests pass 921/921. This is
-not live ROS interoperability evidence; standalone topology, transport and
-firmware builds remain pending. See the plan's implementation record for the
+Z0 is in progress: ROS metadata and Raft-owned endpoint GID code pass 2218
+Linux checks, including a sanitizer run, plus 1004 direct upstream hash
+comparisons in Docker. The recorded RTPS baseline is 921/921. A native ROS
+control passes with our generated GIDs on direct Docker loopback; host
+libraries still supply session/CDR. Raft-owned transport and multi-process/
+ESP32 standalone proof remain pending. See the plan's implementation record for the
 resolved RTPS standalone build failure and still-unverified hardware checks.
 Runtime dual-backend selection is deferred; services, parameters and actions
 remain separate work.

@@ -1,0 +1,36 @@
+FROM ros:jazzy-ros-base@sha256:c3706ef0a0aa45413c07803cf433602f543b22e45b4855f6fca955c2d8ecc4e8
+
+SHELL ["/bin/bash", "-c"]
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    g++ git curl cmake pkg-config libclang-dev python3-venv \
+    && rm -rf /var/lib/apt/lists/*
+RUN git init /reference/src/rmw_zenoh \
+    && git -C /reference/src/rmw_zenoh remote add origin https://github.com/ros2/rmw_zenoh.git \
+    && git -C /reference/src/rmw_zenoh fetch --depth 1 origin 8c1fe8ef412bca5e6ac64f320468c70dcb03fc52 \
+    && git -C /reference/src/rmw_zenoh checkout --detach FETCH_HEAD
+RUN apt-get update && rosdep update \
+    && rosdep install --from-paths /reference/src --ignore-src --rosdistro jazzy -y \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /reference
+RUN source /opt/ros/jazzy/setup.bash \
+    && colcon build --packages-up-to rmw_zenoh_cpp --cmake-args -DCMAKE_BUILD_TYPE=Release
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup-init.sh \
+    && bash /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.93.0 \
+    && rm /tmp/rustup-init.sh
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN python3 -m venv --system-site-packages /opt/zenoh-test \
+    && /opt/zenoh-test/bin/pip install --no-cache-dir eclipse-zenoh==1.8.0
+
+WORKDIR /test
+COPY components/RaftROS/Zenoh/ZenohROSCodec.h include/Zenoh/ZenohROSCodec.h
+COPY components/RaftROS/Zenoh/ZenohROSIdentity.h include/Zenoh/ZenohROSIdentity.h
+COPY linux_unit_tests/zenoh_codec_tests.cpp .
+RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude zenoh_codec_tests.cpp -o zenoh_codec_tests \
+    && ./zenoh_codec_tests
+RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -DRAFTROS_ZENOH_GID_REFERENCE \
+    -Iinclude -I/reference/src/rmw_zenoh/rmw_zenoh_cpp/src/detail zenoh_codec_tests.cpp \
+    /reference/src/rmw_zenoh/rmw_zenoh_cpp/src/detail/simplified_xxhash3.cpp -o zenoh_gid_reference_tests \
+    && ./zenoh_gid_reference_tests
+COPY linux_unit_tests/zenoh_metadata_interop.py .
+ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp ROS_DOMAIN_ID=23 PYTHONUNBUFFERED=1
+CMD ["/bin/bash", "-c", "source /reference/install/setup.bash && exec /opt/zenoh-test/bin/python /test/zenoh_metadata_interop.py"]

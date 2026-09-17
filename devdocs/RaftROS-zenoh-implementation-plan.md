@@ -1,7 +1,7 @@
 # RaftROS Zenoh Alternative: Design and Implementation Plan
 
 **Date:** 2026-09-17
-**Status:** Z0 in progress; first isolated metadata-codec slice implemented.
+**Status:** Z0 in progress; endpoint/QoS codec, Raft-owned GID derivation and native host identity control passing.
 **Scope:** A native ROS 2 Zenoh backend for Raft ESP32 firmware, preserving
 DeviceManager-driven sensor auto-publishing and the existing RTPS backend.
 
@@ -13,7 +13,7 @@ support. See [development status](RaftROS-development-status.md), the
 
 ## Implementation Record (2026-09-17)
 
-The first preparatory slice is
+The metadata preparatory slices are implemented in
 [ZenohROSCodec.h](../components/RaftROS/Zenoh/ZenohROSCodec.h), original
 Raft-owned C++17 code with no RTPS, RaftCore, ESP-IDF or Zenoh SDK dependency:
 
@@ -23,27 +23,41 @@ Raft-owned C++17 code with no RTPS, RaftCore, ESP-IDF or Zenoh SDK dependency:
   type and `RIHS01_...` hash, without an RTPS `rt/` prefix.
 - Formats node (`NN`) graph-liveliness tokens, including namespace/enclave
   mangling and the repeated node ID.
+- Formats publisher (`MP`) and subscription (`MS`) tokens with distinct
+  node/entity IDs, fully qualified topics, types/hashes and canonical QoS.
+- Serializes a bounded QoS subset: RELIABLE/BEST_EFFORT, VOLATILE/TRANSIENT_LOCAL,
+  KEEP_LAST with positive depth, AUTOMATIC liveliness and infinite durations.
+  This describes metadata only, not implemented history or delivery guarantees.
 - Uses caller-owned output storage, no dynamic allocation, and explicit input
   and capacity checks. The isolated `make zenoh-test` target builds only the
   codec tests, without fetching RaftCore or linking RTPS.
 
-This does **not** implement a Zenoh session, publisher/subscriber (`MP`/`MS`)
-QoS token, publisher-GID derivation, graph query, transport, routerless
-topology, or firmware backend. Formatting a node token does not announce a
-node. Z0/Z1 feasibility gates remain open, and no production source extraction
-or dependency-policy change has been made.
+The next preparatory slice,
+[ZenohROSIdentity.h](../components/RaftROS/Zenoh/ZenohROSIdentity.h), derives
+publisher/subscription GIDs from our canonical endpoint tokens. Both generated
+identities match the native RMW graph, and outgoing attachments no longer
+take a graph-supplied GID as input.
+
+This does **not** implement a Raft-owned Zenoh session, graph query,
+transport, reconnection, or firmware backend. The
+host-only control below uses real ROS graph/data APIs but supplies the session
+and CDR through upstream host libraries. Z0/Z1 firmware feasibility gates
+remain open; no production source extraction or dependency-policy change has
+been made.
 
 ### Pinned Reference and Observed Baseline
 
 | Item | Evidence |
 | --- | --- |
 | Metadata reference | `rmw_zenoh_cpp` Jazzy 0.2.11, commit `8c1fe8ef412bca5e6ac64f320468c70dcb03fc52`; [immutable design document](https://github.com/ros2/rmw_zenoh/blob/8c1fe8ef412bca5e6ac64f320468c70dcb03fc52/docs/design.md). The profile is also identified in the codec header. |
-| Fixture provenance | Topic and node examples from that design, plus independently specified attachment bytes. These are specification-based tests, not captured packets or native RMW interoperability evidence. |
+| Fixture provenance | Topic/node/endpoint examples from the pinned design, independently specified attachment bytes, and QoS behavior verified against the pinned RMW's `liveliness_utils.cpp` and `qos.cpp`. Original implementations, no upstream source copied into firmware. Unit fixtures are separate from the native host control below. |
 | Compiler/environment | Ubuntu WSL, g++ 13.3.0 (`13.3.0-6ubuntu2~24.04.1`), CMake 3.28.3. Native Jazzy RMW/Zenoh vendor/FastDDS/sensor-msgs packages were not found by `dpkg-query`. |
-| Zenoh unit checks | 610 passed, 0 failed with C++17, `-Wall -Wextra -Werror -pedantic`; also passed with AddressSanitizer and UndefinedBehaviorSanitizer. Includes every short output/input length, invalid GID lengths, malformed names/hashes, maximum names and unaligned integer buffers. |
+| Zenoh unit checks | 2218 passed, 0 failed with C++17, `-Wall -Wextra -Werror -pedantic`, and again with AddressSanitizer/UndefinedBehaviorSanitizer. Includes fixed upstream GID vectors, descriptor-field changes and invalid/maximum input checks in addition to codec tests. |
+| GID reference comparisons | Docker's reference-enabled test binary passes 3222 checks: the normal suite plus 1004 direct hash comparisons with the pinned RMW helper, covering shortest tokens and the 128/129, 240/241, 64-byte stripe and 1024-byte block boundaries. |
 | RTPS unit baseline | Rebuilt and ran successfully: 921 passed, 0 failed. RaftCore revision used: `feb4f77f1778be04fbf1789bdaa6c84ec4e8fe5c`. |
 | RTPS standalone baseline | Initial build exposed stale includes and runtime API references in `raftros_standalone.cpp`. Resolved in the 2026-09-17 follow-up: current runtime include paths, discovery namespace, ACKNACK declarations and DATA flags/payload helper. Standalone compilation/linking and the 921 RTPS tests pass; live ROS smoke testing remains unverified. |
-| Still unmeasured | Host Zenoh runtime compatibility, protocol/link versions, actual ROS graph/data exchange, ESP32 flash/heap/stacks, hardware regression, and routerless multi-process operation. No Z0 resource or topology gate is satisfied by these unit results. |
+| Native metadata/identity control | Passed in Docker against pinned `rmw_zenoh_cpp` 0.2.11 and Zenoh Python 1.8.0: graph attribution/QoS, independently derived publisher/subscriber GID equality, bidirectional typed String data with Raft-generated attachment identity, endpoint withdrawal and node removal, using direct loopback with no router. |
+| Still unmeasured | Raft-owned session interoperability, serializer parity through Zenoh, ESP32 flash/heap/stacks, hardware regression, and routerless multi-process operation. No Z0 resource or firmware topology gate is satisfied by the host metadata control. |
 
 ### Initial Codec Contract
 
@@ -62,8 +76,143 @@ string; no truncated key/token may be used. Attachment encode returns 33 on
 success or zero without writing on failure. Decode requires exactly 33 bytes
 and GID length 16 and leaves its result unchanged on failure; trailing bytes
 and future profile extensions are not accepted implicitly. The codec preserves
-integer values but supplies no timestamp clock, sequence policy or identity
-generator. Those remain session/ROS-adapter responsibilities.
+integer values but supplies no timestamp clock, sequence policy or session-ID
+generator. Those remain session/ROS-adapter responsibilities; endpoint GID
+derivation from supplied identities is now implemented separately below.
+
+`NodeIdentity` and `Endpoint` borrow string views for the formatting call;
+they are not a persistent device registry. `formatEndpointToken` supports
+only `Publisher`/`Subscription` kinds and validates the same name/hash rules
+as the node and topic-key helpers. Endpoint IDs are supplied by the caller;
+uniqueness and lifecycle remain the future registry's responsibility.
+
+`QoS` is a metadata-only subset with fixed KEEP_LAST, AUTOMATIC liveliness,
+and infinite deadline/lifespan/lease values. Defaults are RELIABLE, VOLATILE,
+depth 42, as verified in the pinned RMW's actual `qos.cpp`; its general design
+prose should not override those source defaults. `formatQoS` retains all six
+colon-separated groups and their comma separators, omitting only default
+values. ROS reliability numbers are 1=RELIABLE and 2=BEST_EFFORT, not the
+opposite Zenoh transport enum order. Depth zero and invalid enum values fail;
+system-default resolution, KEEP_ALL and finite durations are not accepted by
+this API. The canonical default is `::,:,:,:,,`. Golden tests cover default,
+sensor and transient-local forms, including exact separator placement. Use
+`formatQoS`, not hand-edited strings, for production.
+
+### Raft-Owned Endpoint GIDs
+
+`ZenohROSIdentity::deriveEndpointGid(node, endpoint, output)` first validates
+and formats the complete endpoint liveliness token using `ZenohROSCodec`.
+It hashes those bytes, excluding the trailing NUL, with unseeded XXH3-128 and
+the algorithm's default 192-byte secret. The 16 output bytes are the low
+64-bit result followed by the high result, **each little-endian**, matching
+the pinned RMW on our little-endian Linux/ESP32 targets. This is not the
+big-endian hexadecimal representation used by generic xxHash tools, a DDS
+GUID, or the ROS message-type hash.
+
+The original scalar implementation follows the
+[published xxHash algorithm specification](https://github.com/Cyan4973/xxHash/blob/v0.8.2/doc/xxhash_spec.md).
+Algorithm constants are fixed inputs. Upstream's BSD-licensed implementation
+is not incorporated into Raft source; its unchanged helper is compiled only
+in the Docker reference test. The implementation uses 32-bit limb products
+and unsigned 64-bit arithmetic, with no `__int128`, SIMD, dynamic allocation,
+custom seed, or external hash library. Only input lengths reachable through
+validated endpoint descriptors are exposed; this is not a generic xxHash API.
+
+The token buffer has a compile-time bound derived from the codec's name/type/
+QoS limits (currently 1347 bytes, covering a maximum 1345-byte token plus NUL).
+Medium-input and long-input paths cover the entire descriptor range,
+including the final overlapping stripe and block scrambling. Invalid inputs
+leave the caller's GID unchanged; a truncated token is never hashed. Stack
+and performance measurements on ESP32 remain pending, despite using portable
+arithmetic and fixed storage.
+
+The native test compares both endpoint GIDs with the graph; the separate
+reference test compares 1004 valid tokens directly with
+[`simplified_XXH3_128bits` at the pinned RMW revision](https://github.com/ros2/rmw_zenoh/blob/8c1fe8ef412bca5e6ac64f320468c70dcb03fc52/rmw_zenoh_cpp/src/detail/simplified_xxhash3.cpp).
+Four captured vectors remain in the dependency-free local suite: minimum
+token, fixed publisher, fixed subscription and maximum token. Tests also
+check changes to every node/endpoint descriptor field and unchanged output
+on invalid input. The default local test does not compile the reference
+helper; only `RAFTROS_ZENOH_GID_REFERENCE` in the Docker test enables it.
+
+This is a non-cryptographic identity hash, not authentication or a guarantee
+against intentional collisions. The session-ID generator and entity-ID
+allocator must still ensure different live entities receive distinct input
+identities. Reusing the same entire token intentionally produces the same
+GID. Reboot, detach/re-attach and reconnect identity policy remain session/
+registry work, not something hashing alone solves.
+
+### Native Host Metadata Control
+
+[Dockerfile.zenoh](../linux_unit_tests/Dockerfile.zenoh) builds a host-only
+reference environment. It pins the ROS base image by digest, the RMW by
+commit, and `eclipse-zenoh==1.8.0`. The pinned RMW binary package was not
+available in the configured apt repository, so the RMW is built from source.
+Its vendor build uses apt Cargo 1.75's compatibility branch; Zenoh Python is
+built using its required Rust 1.93.0. The image is a test tool, not firmware.
+Initial builds require network access, substantial Docker disk space and
+several minutes; subsequent source/test edits reuse the toolchain layers.
+
+Observed host versions: `ros-jazzy-rclpy` 7.1.12-1noble.20260902.053513 and
+`ros-jazzy-std-msgs` 5.3.8-1noble.20260902.022418. The pinned RMW vendor selects
+zenoh-c `b31348fa7f94f44f1f7b049c111a710e970a2725` (Zenoh
+`2687c51352121f006e3a603ce07925a8ad0b295c`) with the older Cargo and zenoh-cpp
+`af381b420cc8837ac7da42c9984594ef8f110e90`. Apt/rosdep and transitive Python
+build dependencies are not a fully frozen package snapshot; the test checks
+the RMW version at runtime and records the tested tuple rather than claiming
+bit-for-bit reproducible images.
+
+[zenoh_metadata_interop.py](../linux_unit_tests/zenoh_metadata_interop.py)
+starts a native ROS RMW peer on `tcp/127.0.0.1:17447`, with multicast scouting
+disabled and no router connection, and attaches an upstream Python Zenoh
+client directly. `zenoh_codec_tests --fixture <session-id>` provides the
+actual C++ node/publisher/subscription tokens and data key; the Python test
+also receives both Raft-derived endpoint GIDs and does not independently
+rebuild those strings or identities. `--attachment <session-id> <sequence>`
+derives the fixture publisher's identity again inside C++; it no longer
+accepts a GID returned by the host graph. Domain 23 and `/raft_test` keep
+the fixture identifiable. Docker's `--network none` confines the test to its
+own loopback, with no host ROS daemon or external router required.
+
+Passing checks:
+
+- Native RMW attributes both endpoint kinds to `/raft_test/raft_fixture` and
+  decodes `std_msgs/msg/String`, BEST_EFFORT, VOLATILE, KEEP_LAST depth 5.
+- Raft-derived publisher and subscription GIDs match the native graph's
+  endpoint GIDs. The graph is an assertion oracle only, not a source of IDs
+  fed back into attachment generation.
+- A typed ROS subscription receives data with our key and C++-encoded
+  attachment using the Raft-generated GID. Source timestamp zero and
+  publication sequence are checked.
+- A native ROS publisher delivers a typed String to the Python subscriber
+  using the same C++ key.
+- Undeclaring endpoint tokens removes the fixture's publishers/subscriptions
+  even while a monitoring subscription remains. Removing the node token
+  removes its named node from the graph.
+
+Limits: CDR is generated/deserialized by host ROS libraries. GID derivation is
+now verified against both the pinned helper and native graph. This rclpy
+callback exposes sequence/timestamps as a dictionary but no publisher GID,
+so callback-level GID equality is not asserted. Only live volatile
+String traffic and one native RMW context are exercised; retained history,
+late-started independent processes, all sensor serializers, raw Zenoh framing,
+and ESP32 operation remain separate gates. No claim of Z1 completion follows.
+
+Run from the repository root (Docker Desktop/Linux engine required):
+
+```bash
+docker build --progress=plain -f linux_unit_tests/Dockerfile.zenoh -t raftros-zenoh-metadata-test .
+docker run --rm --init --network none raftros-zenoh-metadata-test timeout 90s /bin/bash -c 'source /reference/install/setup.bash; exec /opt/zenoh-test/bin/python /test/zenoh_metadata_interop.py'
+```
+
+The container exits nonzero on an unmet assertion or timeout and is removed.
+No workstation ROS installation, firmware SDK, or source bind mount is needed.
+
+Next implementation step: a bounded Raft-owned Linux Zenoh TCP session
+(framing/handshake, keepalive and declarations), validated against this pinned
+host before moving the existing RTPS implementation behind a backend API.
+Keep the current host-library control test as a separate discriminator for
+metadata defects versus session protocol defects.
 
 ## 1. Decisions and Constraints
 
@@ -326,9 +475,10 @@ Nothing in the small common API requires that feature now.
 ## 6. Implementation Slices and Gates
 
 **Z0 is in progress.** The isolated metadata preparatory slice above is
-complete; Z1's live proof has not started and Z2-Z6 remain unstarted. Work in
-order; keep each extraction small and validate RTPS before continuing. Z0/Z1
-can use a native harness without restructuring production RaftROS.
+complete, and Z1 has a passing native host metadata control, not a Raft-owned
+session proof. Z2-Z6 remain unstarted. Work in order; keep each extraction
+small and validate RTPS before continuing. Z0/Z1 can use a native harness
+without restructuring production RaftROS.
 
 | Slice | Deliverables | Exit gate |
 | --- | --- | --- |
