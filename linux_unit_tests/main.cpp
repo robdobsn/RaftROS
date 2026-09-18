@@ -40,6 +40,8 @@
 #include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
 #include "AutoPub/AutoPubSampleRunner.h"
 #include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
+#include "AutoPub/AutoPubPublisherPool.h"
+#include "autopub_pool_test_lock.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -3630,6 +3632,149 @@ int main()
                             detached.sequence == 0 && calls == 3,
                         "RTPS emitter: absent or released writer never sends");
         }
+    }
+
+    {
+        printf("Test: publisher pool generation-safe handles and latest-only mailboxes\n");
+        using namespace RaftRuntime::AutoPub;
+        using Pool = AutoPubPublisherPool<AutoPubTestLock, 3, 8>;
+        Pool pool;
+        int users[4] = {};
+        auto fillWith = [](uint8_t value, uint32_t length, int* pCalls = nullptr) {
+            return [=](void*, uint8_t* scratch, uint32_t recordSize) -> uint32_t {
+                if (pCalls)
+                    ++*pCalls;
+                std::memset(scratch, value, recordSize);
+                return length;
+            };
+        };
+
+        // Handle encoding
+        AutoPubPublisherHandle none;
+        TEST_ASSERT(!none.isValid() && none.toCallbackInfo() == nullptr &&
+                        !AutoPubPublisherHandle::fromCallbackInfo(nullptr).isValid(),
+                    "publisher pool: invalid handle encodes as null and null decodes invalid");
+
+        // Acquire validation and capacity
+        TEST_ASSERT(!pool.acquire(nullptr, 4).isValid() && !pool.acquire(&users[0], 0).isValid() &&
+                        !pool.acquire(&users[0], 9).isValid() && pool.inUseCount() == 0,
+                    "publisher pool: rejects null user, empty and oversized records");
+        const AutoPubPublisherHandle h0 = pool.acquire(&users[0], 4);
+        const AutoPubPublisherHandle h1 = pool.acquire(&users[1], 8);
+        const AutoPubPublisherHandle h2 = pool.acquire(&users[2], 2);
+        TEST_ASSERT(h0.isValid() && h1.isValid() && h2.isValid() &&
+                        h0.slot != h1.slot && h1.slot != h2.slot && h0.slot != h2.slot &&
+                        !pool.acquire(&users[3], 4).isValid() && pool.inUseCount() == 3,
+                    "publisher pool: distinct slots up to capacity, then full");
+        const AutoPubPublisherHandle h0Decoded = AutoPubPublisherHandle::fromCallbackInfo(h0.toCallbackInfo());
+        TEST_ASSERT(h0.toCallbackInfo() != nullptr && h0Decoded.slot == h0.slot &&
+                        h0Decoded.generation == h0.generation,
+                    "publisher pool: handle round-trips through callback info");
+
+        // Store, drain, latest-only overwrite
+        struct Drained { AutoPubPublisherHandle handle; void* pUser; std::vector<uint8_t> bytes;
+                         uint32_t produced; uint32_t overwritten; };
+        std::vector<Drained> drained;
+        auto collect = [&](const AutoPubDrainedSample& s) {
+            drained.push_back({s.handle, s.pUser, std::vector<uint8_t>(s.record, s.record + s.length),
+                               s.produced, s.overwritten});
+        };
+        TEST_ASSERT(pool.drain(collect) == 0 && drained.empty(), "publisher pool: nothing pending initially");
+        TEST_ASSERT(pool.produce(h0, fillWith(0x11, 4), 2) == AutoPubProduceResult::Stored &&
+                        pool.produce(h0, fillWith(0x22, 4), 2) == AutoPubProduceResult::Overwritten &&
+                        pool.produce(h1, fillWith(0x33, 8), 2) == AutoPubProduceResult::Stored,
+                    "publisher pool: store then overwrite undrained sample");
+        TEST_ASSERT(pool.drain(collect) == 2 && drained.size() == 2, "publisher pool: drains every pending slot once");
+        bool latestOnly = false;
+        bool secondSlot = false;
+        for (const auto& d : drained)
+        {
+            if (d.handle.slot == h0.slot)
+                latestOnly = d.pUser == &users[0] && d.handle.generation == h0.generation &&
+                             d.bytes == std::vector<uint8_t>(4, 0x22) && d.produced == 2 && d.overwritten == 1;
+            if (d.handle.slot == h1.slot)
+                secondSlot = d.pUser == &users[1] && d.bytes == std::vector<uint8_t>(8, 0x33) &&
+                             d.produced == 1 && d.overwritten == 0;
+        }
+        TEST_ASSERT(latestOnly, "publisher pool: latest record, user and counters delivered");
+        TEST_ASSERT(secondSlot, "publisher pool: independent slot delivered with its own record size");
+        drained.clear();
+        TEST_ASSERT(pool.drain(collect) == 0, "publisher pool: drained sample is not repeated");
+
+        // Empty or oversized fills never disturb a pending sample
+        TEST_ASSERT(pool.produce(h0, fillWith(0x44, 4), 2) == AutoPubProduceResult::Stored &&
+                        pool.produce(h0, fillWith(0x55, 0), 2) == AutoPubProduceResult::Empty &&
+                        pool.produce(h0, fillWith(0x66, 5), 2) == AutoPubProduceResult::Empty,
+                    "publisher pool: empty and over-length fills are rejected");
+        pool.drain(collect);
+        TEST_ASSERT(drained.size() == 1 && drained[0].bytes == std::vector<uint8_t>(4, 0x44) &&
+                        drained[0].produced == 3 && drained[0].overwritten == 1,
+                    "publisher pool: rejected fill leaves pending record and counters intact");
+        drained.clear();
+
+        // A producer may run while the consumer handles a sample (lock not held)
+        pool.produce(h2, fillWith(0x77, 2), 2);
+        AutoPubProduceResult reentrant = AutoPubProduceResult::Busy;
+        pool.drain([&](const AutoPubDrainedSample& s) {
+            reentrant = pool.produce(s.handle, fillWith(0x78, 2), 2);
+            collect(s);
+        });
+        TEST_ASSERT(reentrant == AutoPubProduceResult::Stored && drained.size() == 1 &&
+                        drained[0].bytes == std::vector<uint8_t>(2, 0x77),
+                    "publisher pool: consumer runs outside the lock on a stable copy");
+        drained.clear();
+        pool.drain(collect);
+        TEST_ASSERT(drained.size() == 1 && drained[0].bytes == std::vector<uint8_t>(2, 0x78),
+                    "publisher pool: sample stored during consume is drained next pass");
+        drained.clear();
+
+        // Busy lock drops the sample without calling fill
+        int fillCalls = 0;
+        AutoPubTestLock::failNextTimedLocks = 1;
+        TEST_ASSERT(pool.produce(h0, fillWith(0x88, 4, &fillCalls), 2) == AutoPubProduceResult::Busy &&
+                        fillCalls == 0 && pool.counters().busyDrops == 1,
+                    "publisher pool: busy lock drops sample and counts it");
+
+        // Release invalidates in-flight/stale handles and discards pending data
+        pool.produce(h0, fillWith(0x99, 4), 2);
+        TEST_ASSERT(pool.release(h0) && !pool.release(h0) && pool.inUseCount() == 2,
+                    "publisher pool: release succeeds once");
+        TEST_ASSERT(pool.produce(h0, fillWith(0xAA, 4, &fillCalls), 2) == AutoPubProduceResult::Stale &&
+                        fillCalls == 0,
+                    "publisher pool: stale handle rejected before user state is reached");
+        pool.drain(collect);
+        TEST_ASSERT(drained.empty(), "publisher pool: release discards undrained sample");
+
+        // Slot reuse gets a new generation; the old handle stays dead
+        const AutoPubPublisherHandle h0Reused = pool.acquire(&users[3], 4);
+        TEST_ASSERT(h0Reused.isValid() && h0Reused.slot == h0.slot &&
+                        h0Reused.generation != h0.generation,
+                    "publisher pool: reused slot gets a fresh generation");
+        TEST_ASSERT(pool.produce(h0, fillWith(0xBB, 4, &fillCalls), 2) == AutoPubProduceResult::Stale &&
+                        fillCalls == 0 && !pool.release(h0) && pool.inUseCount() == 3,
+                    "publisher pool: old handle cannot produce into or release the new owner");
+        void* reusedUser = nullptr;
+        TEST_ASSERT(pool.produce(h0Reused, [&](void* pUser, uint8_t* scratch, uint32_t) -> uint32_t {
+                            reusedUser = pUser;
+                            std::memset(scratch, 0xCC, 4);
+                            return 4;
+                        }, 2) == AutoPubProduceResult::Stored && reusedUser == &users[3],
+                    "publisher pool: new owner receives its own user pointer");
+        pool.drain(collect);
+        TEST_ASSERT(drained.size() == 1 && drained[0].pUser == &users[3] && drained[0].produced == 1,
+                    "publisher pool: reused slot counters restart");
+        drained.clear();
+
+        AutoPubPublisherHandle forged;
+        forged.slot = 7;
+        forged.generation = 1;
+        TEST_ASSERT(pool.produce(forged, fillWith(0, 1), 2) == AutoPubProduceResult::Stale &&
+                        pool.produce(none, fillWith(0, 1), 2) == AutoPubProduceResult::Stale &&
+                        !pool.release(forged),
+                    "publisher pool: out-of-range and invalid handles rejected");
+        const auto counters = pool.counters();
+        TEST_ASSERT(counters.staleDrops == 4 && counters.busyDrops == 1 && counters.emptyFills == 2,
+                    "publisher pool: diagnostic counters");
     }
 
     //=================================================================
