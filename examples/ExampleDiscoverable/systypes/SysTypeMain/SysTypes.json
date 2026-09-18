@@ -6,8 +6,8 @@
         {
           "name": "I2CA",
           "type": "I2C",
-          "sdaPin": 7,
-          "sclPin": 6,
+          "sdaPin": 8,
+          "sclPin": 9,
           "i2cFreq": 100000
         }
       ]

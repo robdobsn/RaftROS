@@ -75,7 +75,7 @@ DEST_DIR=./RaftCore
 # GIT_TAG=v1.0  # Optional: Specify a tag if needed
 
 # Ensure raft_core is executed every time by making it .PHONY
-.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline
+.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline autopub-pool-stress
 
 all: $(OUTPUT)
 
@@ -121,6 +121,18 @@ zenoh-storage-test: $(ZENOH_SESSION_PROBE_OUT) $(ZENOH_ALLOCATION_FAILURE_OUT)
 
 zenoh-wire-test: $(ZENOH_SESSION_PROBE_OUT)
 	python3 zenoh_wire_interop.py --probe $(ZENOH_SESSION_PROBE_OUT)
+
+# Threaded AutoPubPublisherPool stress test; SAN=thread (default) or SAN=address.
+SAN ?= thread
+AUTOPUB_POOL_STRESS_OUT = $(BUILD_DIR)/autopub/autopub_pool_stress_$(SAN)
+
+$(AUTOPUB_POOL_STRESS_OUT): autopub_pool_stress.cpp autopub_pool_test_lock.h ../components/RaftROS/AutoPub/AutoPubPublisherPool.h
+	@mkdir -p $(dir $@)
+	$(CC) -std=c++17 -Wall -Wextra -Werror -pedantic -g -O1 -fsanitize=$(SAN) -fno-omit-frame-pointer -I../components/RaftROS $< -o $@ -pthread
+
+# TSan needs ASLR disabled on kernels with high mmap randomisation.
+autopub-pool-stress: $(AUTOPUB_POOL_STRESS_OUT)
+	setarch $$(uname -m) -R ./$(AUTOPUB_POOL_STRESS_OUT)
 
 RESOURCE_DIR = $(BUILD_DIR)/resources
 RESOURCE_CFLAGS = -std=c++20 -Wall -Os -DNDEBUG -ffunction-sections -fdata-sections -fstack-usage -DRAFT_CORE -DRAFTROS_ACK_HEX_DUMP_ENABLE=0 -DRAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE=0

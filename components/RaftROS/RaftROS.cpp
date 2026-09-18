@@ -233,6 +233,12 @@ void RaftROS::loop()
     if (!_isEnabled)
         return;
 
+    // Emit the latest auto-published sample of every device whose bus
+    // callback has stored one since the previous pass.  Runs in every state,
+    // as the bus-task path did: with no discovered peers nothing is sent but
+    // the writer sequence still advances once per sample.
+    autoPubDrainSamples();
+
     // State machine on connection state
     switch (_connState)
     {
@@ -335,12 +341,16 @@ void RaftROS::loop()
             // can see registry occupancy + ros_discovery_info seq across time
             // even on release builds while investigating the graph-visibility
             // regression.
+            const auto poolCounters = _autoPubPool.counters();
             LOG_I(MODULE_PREFIX,
-                  "autoPubStatus slots=%u/%u discovered=%u rosDiscSeq=%u state=%d",
+                  "autoPubStatus slots=%u/%u devices=%u discovered=%u rosDiscSeq=%u state=%d stale=%u busy=%u empty=%u",
                   (unsigned)_autoPubLifecycle.inUseCount(),
                   (unsigned)RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY,
+                  (unsigned)_autoPubPool.inUseCount(),
                   (unsigned)_discovered.size(),
-                  (unsigned)_rosDiscSeqNum, (int)_connState);
+                  (unsigned)_rosDiscSeqNum, (int)_connState,
+                  (unsigned)poolCounters.staleDrops, (unsigned)poolCounters.busyDrops,
+                  (unsigned)poolCounters.emptyFills);
             _lastDiscoveredHealthLogMs = now;
         }
         break;
@@ -2615,14 +2625,22 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
     }
 
     // Slice 4.5 — cache the ROS 2 message kind so the hot path skips the
-    // class-map lookup, and pre-allocate a CDR payload buffer sized for the
-    // largest ROS 2 message this serialiser emits (sensor_msgs/Imu ≈ 320 B +
-    // frame_id margin).  Buffer lives on the device context and is freed in
-    // ~DynamicWriterCtx().
+    // class-map lookup.  CDR payload buffers are shared (loop task only).
     pCtx->msgKind = mapping.primaryKind;
-    static constexpr uint32_t CDR_BUF_SIZE = 512;
-    pCtx->cdrBufSize = CDR_BUF_SIZE;
-    pCtx->pCDRBuf = new uint8_t[CDR_BUF_SIZE];
+
+    // Z2 — claim a generation-safe mailbox handle for the bus data callback.
+    // Without one the writer is still announced but publishes nothing.
+    if (pCtx->pDecodeBuf)
+    {
+        pCtx->handle = _autoPubPool.acquire(pCtx, pCtx->structSize);
+        if (!pCtx->handle.isValid())
+        {
+            LOG_W(MODULE_PREFIX, "autoPubAttach no mailbox devID=%s structSize=%u (max %u, devices %u/%u) — writer will not publish",
+                  devID.toString().c_str(), (unsigned)pCtx->structSize,
+                  (unsigned)AUTOPUB_MAILBOX_RECORD_SIZE,
+                  (unsigned)_autoPubPool.inUseCount(), (unsigned)_autoPubPool.capacity());
+        }
+    }
 
     _autoPubCtxs[slot] = pCtx;
 
@@ -2691,8 +2709,6 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
                 {
                     pCtx->secondarySlot = (uint8_t)secSlot;
                     pCtx->secondaryMsgKind = mapping.secondaryKind;
-                    pCtx->secondaryCDRBufSize = CDR_BUF_SIZE;
-                    pCtx->pSecondaryCDRBuf = new uint8_t[CDR_BUF_SIZE];
                     LOG_I(MODULE_PREFIX,
                           "autoPubAttach secondary devID=%s slot=%d topic=%s type=%s eid=%02x%02x%02x%02x qos=%s",
                           devID.toString().c_str(), secSlot, secTopicBuf, pSecType,
@@ -2705,9 +2721,11 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
 
     // Install the per-device data callback.  DeviceManager forwards this to the
     // underlying bus; callbacks run on the bus polling task (limited stack).
+    // The callback info is the encoded pool handle, never the ctx pointer, so
+    // a callback that races with (or outlives) detach cannot reach freed state.
     SysManagerIF* pSysMan = getSysManager();
     DeviceManager* pDevMan = pSysMan ? pSysMan->getDeviceManager() : nullptr;
-    if (pDevMan)
+    if (pDevMan && pCtx->handle.isValid())
     {
         pDevMan->registerForDeviceData(
             devID,
@@ -2715,7 +2733,7 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
                 this->autoPubOnDeviceData(deviceTypeIdx, std::move(data), pCallbackInfo);
             },
             /*minTimeBetweenReportsMs=*/0,
-            /*pCallbackInfo=*/pCtx,
+            /*pCallbackInfo=*/pCtx->handle.toCallbackInfo(),
             /*unregister=*/false);
     }
 
@@ -2759,15 +2777,21 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     DynamicWriterCtx* pCtx = _autoPubCtxs[slot];
     _autoPubCtxs[slot] = nullptr;
 
-    // Unregister the bus data callback first so no further callbacks can fire
-    // on pCtx before we delete it.  DeviceManager::registerForDeviceData with
-    // unregister=true clears the matching entry.
+    // Drop the DeviceManager data registration.  This only removes the pending
+    // request: a registration already forwarded to the bus is not withdrawn,
+    // and a callback may be in flight on the bus task right now.  Releasing
+    // the pool handle is what makes freeing pCtx safe — it waits for any
+    // producer holding the lock, and every later callback carrying the old
+    // handle is dropped as stale without touching pCtx.
     SysManagerIF* pSysMan = getSysManager();
     DeviceManager* pDevMan = pSysMan ? pSysMan->getDeviceManager() : nullptr;
-    if (pDevMan && pCtx)
+    if (pDevMan && pCtx && pCtx->handle.isValid())
     {
-        pDevMan->registerForDeviceData(devID, nullptr, 0, pCtx, /*unregister=*/true);
+        pDevMan->registerForDeviceData(devID, nullptr, 0, pCtx->handle.toCallbackInfo(),
+                                       /*unregister=*/true);
     }
+    if (pCtx)
+        _autoPubPool.release(pCtx->handle);
 
     // Slice 4.8 — emit an SEDP dispose to every currently-discovered peer so
     // they drop the matching writer within a few hundred ms (rather than
@@ -2832,137 +2856,141 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     delete pCtx;
 }
 
-void RaftROS::autoPubOnDeviceData(uint16_t deviceTypeIdx, std::vector<uint8_t> data, const void* pCallbackInfo)
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Bus data callback — runs on the bus worker task.  Decodes under the pool
+// lock and stores only the latest record; no serialisation or network I/O.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void RaftROS::autoPubOnDeviceData(uint16_t /*deviceTypeIdx*/, std::vector<uint8_t> data, const void* pCallbackInfo)
+{
+    using RaftRuntime::AutoPub::AutoPubPublisherHandle;
+
+    // The callback info is an encoded handle; a stale one (device detached,
+    // slot reused) is rejected by the pool before pCtx is ever reached.
+    const AutoPubPublisherHandle handle = AutoPubPublisherHandle::fromCallbackInfo(pCallbackInfo);
+    _autoPubPool.produce(handle,
+        [&](void* pUser, uint8_t* pRecord, uint32_t recordSize) -> uint32_t {
+            DynamicWriterCtx* pCtx = static_cast<DynamicWriterCtx*>(pUser);
+            pCtx->sampleCount++;
+            if (!(pCtx->decodeFn && pCtx->pDecodeBuf && pCtx->structSize > 0 &&
+                  pCtx->structSize == recordSize))
+                return 0;
+
+            // Pad up to the expected fixed record stride used by the generated decoder.
+            const uint32_t expectedRecordSize = pCtx->pollDataSizeBytes
+                                              + DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE;
+            if (data.size() < expectedRecordSize)
+                data.resize(expectedRecordSize, 0);
+
+            const uint32_t numRecords = pCtx->decodeFn(data.data(), data.size(),
+                                                       pCtx->pDecodeBuf, pCtx->decodeBufSize,
+                                                       pCtx->maxDecodeRecords, pCtx->decodeState);
+            // Keep only the latest record (FIFO latest-only default, design
+            // doc §13); check the decoder's count before forming the pointer.
+            if (numRecords == 0 || numRecords > pCtx->decodeBufSize / pCtx->structSize)
+                return 0;
+            std::memcpy(pRecord, pCtx->pDecodeBuf + (numRecords - 1) * pCtx->structSize,
+                        pCtx->structSize);
+            return pCtx->structSize;
+        },
+        AUTOPUB_PRODUCER_LOCK_TIMEOUT_MS);
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Mailbox drain — runs on the loop task, which also owns attach/detach,
+// _discovered, the writer registry and the sockets.
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void RaftROS::autoPubDrainSamples()
 {
     using namespace RaftRuntime::RTPS::Runtime::AutoPub;
-
-    if (!pCallbackInfo)
-        return;
-    DynamicWriterCtx* pCtx = const_cast<DynamicWriterCtx*>(
-        static_cast<const DynamicWriterCtx*>(pCallbackInfo));
-    pCtx->sampleCount++;
-
-    if (!(pCtx->decodeFn && pCtx->pDecodeBuf && pCtx->decodeBufSize > 0 && pCtx->structSize > 0))
-    {
-        if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
-        {
-            LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u dataLen=%u (no-decode, sample #%u)",
-                  pCtx->deviceID.toString().c_str(), (unsigned)deviceTypeIdx,
-                  (unsigned)pCtx->slot, (unsigned)data.size(),
-                  (unsigned)pCtx->sampleCount);
-        }
-        return;
-    }
-
-    // Pad up to the expected fixed record stride used by the generated decoder.
-    const uint32_t expectedRecordSize = pCtx->pollDataSizeBytes
-                                      + DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE;
-    if (data.size() < expectedRecordSize)
-        data.resize(expectedRecordSize, 0);
-
-    const uint32_t numRecords = pCtx->decodeFn(data.data(), data.size(),
-                                               pCtx->pDecodeBuf, pCtx->decodeBufSize,
-                                               pCtx->maxDecodeRecords, pCtx->decodeState);
-    if (numRecords == 0 || !pCtx->pCDRBuf || pCtx->cdrBufSize == 0 ||
-        pCtx->msgKind == RTPSAutoPubMsgKind::Unknown ||
-        !pCtx->pFieldDescs || pCtx->fieldCount == 0)
-    {
-        // Nothing to serialise (yet) — log for diagnostics and bail.
-        if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
-        {
-            LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u dataLen=%u decoded=%u (no-serialise, sample #%u)",
-                  pCtx->deviceID.toString().c_str(), (unsigned)deviceTypeIdx,
-                  (unsigned)pCtx->slot, (unsigned)data.size(),
-                  (unsigned)numRecords, (unsigned)pCtx->sampleCount);
-        }
-        return;
-    }
-
-    // Serialise only the latest decoded record (FIFO latest-only default,
-    // design doc §13) and emit it with VOLATILE best-effort QoS to every
-    // currently-discovered peer (design doc §7.2).  Composite devices
-    // (AHT20, BMP280, ...) serialise the same record a second time with
-    // `secondaryMsgKind` and emit on the secondary registry slot.
     using namespace RaftRuntime::AutoPub;
-    AutoPubDecodedBatch batch;
-    batch.data = pCtx->pDecodeBuf;
-    batch.capacity = pCtx->decodeBufSize;
-    batch.recordSize = pCtx->structSize;
-    batch.recordCount = numRecords;
-    batch.fields = reinterpret_cast<const AutoPubAttrFieldDesc*>(pCtx->pFieldDescs);
-    batch.fieldCount = pCtx->fieldCount;
-    const AutoPubSampleOutput outputs[] = {
-        {pCtx->msgKind, pCtx->pCDRBuf, pCtx->cdrBufSize},
-        {pCtx->secondaryMsgKind,
-         pCtx->secondarySlot == 0xFF ? nullptr : pCtx->pSecondaryCDRBuf,
-         pCtx->secondaryCDRBufSize}
-    };
-    AutoPubSampleResult results[2];
-    RTPSAutoPubSampleEmission emissions[2];
-    auto publish = [&](uint8_t outputIndex, const uint8_t* payload, uint32_t length, uint32_t) {
-        const uint8_t slot = outputIndex == 0 ? pCtx->slot : pCtx->secondarySlot;
-        emissions[outputIndex] = RTPSAutoPubSampleEmitter_emit(
-            _autoPubLifecycle.getMutable(slot), payload, length, _discovered,
-            [&](const auto& remote, const auto& entry, const uint8_t* sample,
-                uint32_t sampleLength, uint64_t sequence) {
-                const uint32_t msgLen = _sedpHandler.buildUserDataMessage(
-                    _autoPubSendBuf, sizeof(_autoPubSendBuf),
-                    _participant, remote.guidPrefix,
-                    entry.entityId, sample, sampleLength,
-                    sequence, /*heartbeatCount=*/0,
-                    /*firstSN=*/sequence);
-                if (msgLen == 0)
-                    return AutoPubPublishResult::Oversized;
-                struct sockaddr_in dest = {};
-                dest.sin_family = AF_INET;
-                dest.sin_port = htons(remote.userDataPort);
-                dest.sin_addr.s_addr = remote.ipAddr;
-                const int sent = sendto(_userDataSock, _autoPubSendBuf, msgLen, 0,
-                                        (struct sockaddr*)&dest, sizeof(dest));
-                return sent > 0 ? AutoPubPublishResult::Accepted : AutoPubPublishResult::SendFailed;
-            });
-        return emissions[outputIndex].result;
-    };
 
-    if (!AutoPubSampleRunner::run(batch, outputs, 2, results, publish))
-    {
-        if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
+    _autoPubPool.drain([&](const AutoPubDrainedSample& sample) {
+        // Safe: release() and delete of the ctx also run on this task.
+        const DynamicWriterCtx* pCtx = static_cast<const DynamicWriterCtx*>(sample.pUser);
+
+        // Serialise the latest decoded record and emit it with VOLATILE
+        // best-effort QoS to every currently-discovered peer (design doc
+        // §7.2).  Composite devices (AHT20, BMP280, ...) serialise the same
+        // record a second time with `secondaryMsgKind` and emit on the
+        // secondary registry slot.
+        AutoPubDecodedBatch batch;
+        batch.data = sample.record;
+        batch.capacity = sample.length;
+        batch.recordSize = pCtx->structSize;
+        batch.recordCount = 1;
+        batch.fields = reinterpret_cast<const AutoPubAttrFieldDesc*>(pCtx->pFieldDescs);
+        batch.fieldCount = pCtx->fieldCount;
+        const AutoPubSampleOutput outputs[] = {
+            {pCtx->msgKind, _autoPubCDRBufs[0], AUTOPUB_CDR_BUF_SIZE},
+            {pCtx->secondaryMsgKind,
+             pCtx->secondarySlot == 0xFF ? nullptr : _autoPubCDRBufs[1],
+             AUTOPUB_CDR_BUF_SIZE}
+        };
+        AutoPubSampleResult results[2];
+        RTPSAutoPubSampleEmission emissions[2];
+        auto publish = [&](uint8_t outputIndex, const uint8_t* payload, uint32_t length, uint32_t) {
+            const uint8_t slot = outputIndex == 0 ? pCtx->slot : pCtx->secondarySlot;
+            emissions[outputIndex] = RTPSAutoPubSampleEmitter_emit(
+                _autoPubLifecycle.getMutable(slot), payload, length, _discovered,
+                [&](const auto& remote, const auto& entry, const uint8_t* cdr,
+                    uint32_t cdrLength, uint64_t sequence) {
+                    const uint32_t msgLen = _sedpHandler.buildUserDataMessage(
+                        _autoPubSendBuf, sizeof(_autoPubSendBuf),
+                        _participant, remote.guidPrefix,
+                        entry.entityId, cdr, cdrLength,
+                        sequence, /*heartbeatCount=*/0,
+                        /*firstSN=*/sequence);
+                    if (msgLen == 0)
+                        return AutoPubPublishResult::Oversized;
+                    struct sockaddr_in dest = {};
+                    dest.sin_family = AF_INET;
+                    dest.sin_port = htons(remote.userDataPort);
+                    dest.sin_addr.s_addr = remote.ipAddr;
+                    const int sent = sendto(_userDataSock, _autoPubSendBuf, msgLen, 0,
+                                            (struct sockaddr*)&dest, sizeof(dest));
+                    return sent > 0 ? AutoPubPublishResult::Accepted : AutoPubPublishResult::SendFailed;
+                });
+            return emissions[outputIndex].result;
+        };
+
+        const bool batchOK = AutoPubSampleRunner::run(batch, outputs, 2, results, publish);
+
+        // Rate-limit on the mailbox's stored-record count.
+        if (sample.produced > 3 && (sample.produced % 100) != 0)
+            return;
+        if (!batchOK)
         {
-            LOG_W(MODULE_PREFIX, "autoPubData invalid decoded batch records=%u stride=%u capacity=%u (sample #%u)",
-                  (unsigned)numRecords, (unsigned)pCtx->structSize, (unsigned)pCtx->decodeBufSize,
-                  (unsigned)pCtx->sampleCount);
+            LOG_W(MODULE_PREFIX, "autoPubData devID=%s invalid mailbox record len=%u stride=%u fields=%u (sample #%u)",
+                  pCtx->deviceID.toString().c_str(), (unsigned)sample.length,
+                  (unsigned)pCtx->structSize, (unsigned)pCtx->fieldCount,
+                  (unsigned)sample.produced);
         }
-        return;
-    }
-
-    if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
-    {
-        if (pCtx->secondarySlot == 0xFF)
+        else if (pCtx->secondarySlot == 0xFF)
         {
             LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u dataLen=%u decoded=%u cdrBytes=%u serOK=%d seq=%u peers=%u pub=%u (sample #%u)",
-                  pCtx->deviceID.toString().c_str(), (unsigned)deviceTypeIdx,
-                  (unsigned)pCtx->slot, (unsigned)data.size(),
-                  (unsigned)numRecords, (unsigned)results[0].bytesWritten, (int)results[0].serialized,
+                  "autoPubData devID=%s typeIdx=%u slot=%u cdrBytes=%u serOK=%d seq=%u peers=%u pub=%u overwritten=%u (sample #%u)",
+                  pCtx->deviceID.toString().c_str(), (unsigned)pCtx->deviceTypeIndex,
+                  (unsigned)pCtx->slot,
+                  (unsigned)results[0].bytesWritten, (int)results[0].serialized,
                   (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
                   (unsigned)results[0].publishResult,
-                  (unsigned)pCtx->sampleCount);
+                  (unsigned)sample.overwritten, (unsigned)sample.produced);
         }
         else
         {
             LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u/%u decoded=%u priCDR=%u serOK=%d seq=%u peers=%u pub=%u | secCDR=%u secOK=%d secSeq=%u secPeers=%u pub=%u (sample #%u)",
-                  pCtx->deviceID.toString().c_str(), (unsigned)deviceTypeIdx,
+                  "autoPubData devID=%s typeIdx=%u slot=%u/%u priCDR=%u serOK=%d seq=%u peers=%u pub=%u | secCDR=%u secOK=%d secSeq=%u secPeers=%u pub=%u overwritten=%u (sample #%u)",
+                  pCtx->deviceID.toString().c_str(), (unsigned)pCtx->deviceTypeIndex,
                   (unsigned)pCtx->slot, (unsigned)pCtx->secondarySlot,
-                  (unsigned)numRecords, (unsigned)results[0].bytesWritten, (int)results[0].serialized,
+                  (unsigned)results[0].bytesWritten, (int)results[0].serialized,
                   (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
                   (unsigned)results[0].publishResult,
                   (unsigned)results[1].bytesWritten, (int)results[1].serialized,
                   (unsigned)emissions[1].sequence, (unsigned)emissions[1].peersSent,
                   (unsigned)results[1].publishResult,
-                  (unsigned)pCtx->sampleCount);
+                  (unsigned)sample.overwritten, (unsigned)sample.produced);
         }
-    }
+    });
 }
