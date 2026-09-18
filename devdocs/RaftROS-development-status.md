@@ -1,21 +1,27 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-09-17 (Raft-owned Zenoh endpoint GIDs and native identity control;
-last recorded hardware/demo validation remains 2026-04-27)
+**Last Updated:** 2026-09-18 (shared sample dispatch and RTPS emitter closed out;
+first ESP32-S3 firmware compile of the modified wrapper; last recorded
+hardware/demo validation remains 2026-04-27). Resume commands are in the
+[agent handoff](RaftROS-WSL-agent-handoff.md).
 
 ## Next Milestone: Zenoh Alternative (Started)
 
 RTPS is still the only implemented/buildable backend. The
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) defines the
 new forward work. ROS metadata/identity code and host-only native ROS graph/data
-control tests pass. No Raft-owned Zenoh session, firmware, build selector or
-size measurement is claimed.
+control tests pass. The connected Linux probe now sends ROS node/publisher
+declarations, Raft-CDR String or Range samples and token withdrawals over its own TCP
+session. A late independent ROS process also discovers and receives samples.
+Host release sizes and fixed storage are now measured; there is still no
+Zenoh firmware backend, build selector or measured ESP32 footprint.
 
 | Work | State / next evidence |
 | --- | --- |
-| Z0: feasibility and baseline | In progress. Metadata reference pinned to Jazzy `rmw_zenoh_cpp` 0.2.11; RTPS unit baseline rerun, isolated metadata tests passing. Host runtime/profile, hardware budgets and topology feasibility remain open. zenoh-pico incorporation still needs explicit approval. |
-| Z1: native ROS proof | Host control passes with C++ tokens/keys/attachments and Raft-derived publisher/subscriber GIDs checked against the native graph. Upstream libraries still supply session/CDR; Raft-owned session, sensor CDR and late-join/multi-process routerless firmware proof remain open. |
-| Z2-Z3: boundary and isolated builds | Not started. Common DeviceManager/CDR pipeline, RTPS adapter, then exactly-one-backend build with RTPS default and Zenoh-only alternative. |
+| Z0: feasibility and baseline | In progress. Pinned host profile, release executable/stack baseline and provisional firmware review budgets recorded. Actual ESP32 app/heap/stack measurements remain open. zenoh-pico incorporation still needs explicit approval. |
+| Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
+| Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. DeviceManager lifecycle, generation-safe handles, bounded handoff and endpoint operations remain pending. |
+| Z3: isolated firmware builds | Not started. Exactly-one-backend build with RTPS default and Zenoh-only alternative, followed by ESP session integration. |
 | Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
 
 Runtime transport switching is deferred. Services/parameters remain future
@@ -62,13 +68,190 @@ prerequisite for the initial Zenoh feasibility experiment.
   reconnection or multi-process/ESP32 standalone operation. Commands and exact
   version details are in the plan's native host metadata control section.
 
-Next: implement a bounded Linux Zenoh TCP session and prove its handshake,
-declarations and typed traffic against the pinned host before ESP32 integration.
+### TCP Control Implementation (2026-09-17)
+
+- [ZenohTCPSession.h](../components/RaftROS/Zenoh/ZenohTCPSession.h) and
+  [ZenohStreamFramer.h](../components/RaftROS/Zenoh/ZenohStreamFramer.h) add
+  allocation-free control parsing, bounded cookie/batch negotiation,
+  partial TX ownership and handshake/lease/stalled-send deadlines.
+- [Session tests](../linux_unit_tests/zenoh_session_tests.cpp): **1245 passed**
+  with strict C++17 warnings and again under address/undefined-behavior
+  sanitizers. `make zenoh-session-test zenoh-session-probe` builds locally
+  without RaftCore, an RTPS wire runtime or a Zenoh library. The probe now
+  links the existing RTPS-named sensor serializer, which contains no RTPS transport.
+- [Linux probe](../linux_unit_tests/zenoh_session_probe.cpp) establishes its
+  own POSIX TCP connection to pinned `rmw_zenoh_cpp` 0.2.11. Native loopback
+  test passed for 12000 ms with 4096-byte negotiated batches, four-second
+  leases and 12 received peer keepalives. No router or Python Zenoh client
+  provides this connection; the peer runs in the native ROS host process.
+- The FRAME discard path is removed. Discovery messages have explicit
+  boundaries/callbacks and per-channel sequence checks. Incoming user data,
+  request/response, fragmentation, full key-table resolution and reconnect
+  remain unsupported. No ESP32 resource/hardware result is claimed.
+- The existing native metadata/identity test also passed again, separately.
+  Commands and the exact bounded profile are in the
+  [TCP control record](RaftROS-zenoh-implementation-plan.md#raft-owned-tcp-handshake-control).
+
+### Connected String Proof (2026-09-17)
+
+- [ZenohNetworkMessage.h](../components/RaftROS/Zenoh/ZenohNetworkMessage.h)
+  builds bounded declarations/removals/finals and PUTs with attachments;
+  parses discovery messages without owning their borrowed key strings.
+- `zenoh_session_probe --publish` uses Raft's CDR encoder, canonical tokens,
+  generated GID, and reliable transport FRAMEs on its own POSIX socket. Native
+  ROS sees `/raft_test/raft_fixture` publishing `/raft_test/chatter` as String
+  with sensor QoS, receives live values/sequences, then sees token withdrawal.
+- `zenoh_metadata_interop.py --tcp-publish` passes, including a second ROS
+  process joining after publishing starts. It also passed with the C++ probe
+  under ASan/UBSan. Final run queued 22 samples over 12 seconds with 12 peer
+  keepalives. No upstream client library generates this wire traffic.
+- Limits of String mode: one fixed String publisher; a separate Range mode
+  is recorded below. No live sensors/subscriptions/reconnect yet.
+  The later ROS client uses the first ROS peer's routing/cache, not a separate
+  router process. No inbound frames were observed in this native topology;
+  direct responder traffic is now covered by the separate scripted test below,
+  not inferred from this cached-graph run. This is not general discovery or ESP32 validation.
+- Handshake-only and upstream-session metadata controls both pass separately.
+  See the [connected proof](RaftROS-zenoh-implementation-plan.md#raft-owned-discovery-and-string-publishing)
+  for limits and commands.
+
+### Connected Range Proof (2026-09-17)
+
+- `zenoh_session_probe --publish-range` reuses the unchanged sensor class map
+  and Range CDR serializer with synthetic decoded `dist` records. Attribute
+  divisor scaling and mm-to-m conversion produce 0, 0.184, 1 and 2 m; every
+  sample has a known header timestamp, frame ID, radiation/FOV/limits/variance.
+- `zenoh_metadata_interop.py --tcp-range` passes native graph/QoS/GID/hash,
+  typed and raw Range delivery, a late independent Range observer, and token
+  withdrawal. Final run queued 22 samples over 12 seconds, with 12 peer
+  keepalives, 5282 transmitted bytes and 118 received bytes.
+- Six fixture CDR payloads and all collected raw samples match native ROS
+  fields/length after normalizing only three unspecified reference alignment
+  bytes. Raft's padding must remain zero. The sensor serializer was not changed.
+- The compiled Range hash matches installed Jazzy `sensor_msgs` 5.3.8 type
+  metadata, including `variance`. The entire Range flow passed with probe and
+  serializer under ASan/UBSan; the String regression also passes.
+- Limits: one synthetic Range publisher per run, not I2C hot-plug or poll
+  decoding. The late ROS client still uses the first peer's routing/cache.
+  No direct interest frames were observed in this native run; see the separate
+  scripted responder coverage below. No ESP32/resource or general QoS claim is made.
+  See [the Range proof](RaftROS-zenoh-implementation-plan.md#raft-owned-range-publishing)
+  for the exact hash, inputs and commands.
+
+### Direct Discovery and Explicit Restarts (2026-09-17)
+
+- [Scripted wire peer](../linux_unit_tests/zenoh_wire_interop.py) drives actual
+  INIT/OPEN and incoming INTEREST frames through the C++ socket. Current/
+  current-future replies, exact/prefix/no-match filters, non-token/future-only
+  behavior, correlation/finals, cancellation, four-entry capacity/reuse and
+  absence after withdrawal pass. Run `make zenoh-wire-test` locally.
+- Six additional connections verify expected bounded failures for EOF, peer
+  silence, unsupported scope/pattern, queue overflow and CLOSE. Fresh processes
+  get fresh session identities and reset transport sequences. This peer is
+  scripted protocol evidence, not native RMW discovery interoperability.
+- `zenoh_metadata_interop.py --tcp-restart` passes three native Range rounds:
+  publisher SIGKILL removes graph entries, peer/context shutdown terminates
+  the probe, and fresh publisher/peer processes recover the topic with new
+  GIDs and sample sequence one. No automatic reconnect was added.
+- Both suites pass with probe/serializer under ASan/UBSan, and normal Range
+  publication/late-observer regression passes. Native killed-process cases
+  do not establish leak-free teardown. No C++ implementation repair was needed.
+- See [lifecycle evidence](RaftROS-zenoh-implementation-plan.md#direct-discovery-and-restart-evidence)
+  for commands, deadlines and the distinction between scripted/native checks.
+
+### Host Release Resources (2026-09-17)
+
+- `make resource-baseline` creates isolated `-Os -DNDEBUG` builds with section
+  GC, linker maps, `.su` stack files and a JSON report from
+  [resource_report.py](../linux_unit_tests/resource_report.py). Normal debug
+  build outputs are preserved; flags, revisions and artifact hashes are recorded.
+- Measured x86-64 `text+data`: RTPS standalone **41023 B**, Zenoh probe
+  **33008 B** after ownership changes (previously 32117 B). These programs differ in features and storage layout; the
+  values are not firmware footprints or a finished-backend efficiency ratio.
+- Zenoh host fixed objects: session **8344 B**, publication probe **8800 B**,
+  plus **2048 B** socket scratch, now in one non-copyable **19192 B** owner
+  allocated once before connection. Main's measured frame falls from
+  **19568 B to 400 B**, without removing those bytes from total RAM use.
+- Removed the measured **8400 B** temporary in session `start()` by resetting
+  lifecycle metadata in place. The function is now inlined with no separate
+  `.su` frame; owner relocation subsequently shrinks main. Nine same-object reset checks raise
+  the session suite to **1245**, passing normally and under ASan/UBSan.
+- The measured release probe passes direct wire/lifecycle checks; a native
+  Range run with the same optimization policy passes too. RTPS release help
+  startup passes. No live CPU/RSS/ESP32 heap measurement is claimed.
+- The [resource record and budgets](RaftROS-zenoh-implementation-plan.md#release-resource-baseline)
+  propose a 1.5 MiB whole-image ceiling in each existing 1.6875 MiB OTA slot,
+  64 KiB initial direct-RAM budget and target stack/heap headroom. These are
+  review targets, not achieved device numbers or firmware configuration changes.
+  No firmware build artifact is present, and the example Compose entry points
+  to an absent build script; actual Raft CLI/IDF build and board results remain gates.
+
+### Owned Probe Workspace (2026-09-17)
+
+- `ProbeStorage` owns all three persistent buffers/state objects behind one
+  checked nothrow allocation, bounded to **24 KiB** at compile time. The socket
+  closes before owner destruction. Offline resource/CDR commands do not allocate it.
+- `make zenoh-storage-test` verifies allocation failure in handshake, String
+  and Range modes before any network connection, using an independently linked
+  test allocator. Docker runs that gate too; it is never linked into the normal probe.
+- Resource reporting accounts for the allocation separately from stack/BSS
+  and enforces a **4096 B** host main-frame limit. Constructor frame is **8 B**;
+  nested identity/serializer frames remain subject to target measurement.
+- Native Range/late join, scripted discovery/error exits and explicit native
+  restart tests all pass with sanitizer-instrumented owned storage. No production
+  RTPS or session wire behavior changed in this slice.
+- This remains Linux probe-level ownership. A 19192-byte contiguous allocation
+  plus overhead must be provisioned on target, especially at restart; it is not
+  proven by the provisional heap budget. See
+  [owned storage](RaftROS-zenoh-implementation-plan.md#owned-probe-storage).
+
+### Shared Sensor Layer (2026-09-17)
+
+- Common [class mapping](../components/RaftROS/AutoPub/AutoPubClassMap.h) and
+  [CDR serializer](../components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp) now
+  live outside RTPS in `RaftRuntime::AutoPub`. Algorithms and descriptor layouts
+  are unchanged. Old RTPS headers preserve source APIs with aliases/forwarders;
+  precompiled ABI and external source-list compatibility are not promised.
+- ESP-IDF, Linux and Docker source lists use the single common implementation.
+  The Zenoh probe uses neutral APIs and builds in Docker without RTPS headers.
+- Linux tests: **929 passed, 0 failed**, including eight new compatibility
+  assertions; RTPS standalone builds. Native typed/raw Range, late observation
+  and withdrawal pass with ASan/UBSan. Session **1245/1245** and allocation-failure
+  checks pass in the isolated Docker build.
+- Host text+data remains **41023 B RTPS / 33008 B Zenoh**, main frame **400 B**
+  and owner **19192 B**. Resource reporting now checks the neutral symbol and
+  clears stale generated stack records when sources move. No ESP32 build or
+  hardware validation has been repeated.
+
+### Shared Sample Dispatch and First Firmware Compile (2026-09-18)
+
+- [AutoPubSampleRunner.h](../components/RaftROS/AutoPub/AutoPubSampleRunner.h)
+  serializes the latest decoded record into one or two borrowed outputs and calls
+  a synchronous publish callable;
+  [RTPSAutoPubSampleEmitter.h](../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubSampleEmitter.h)
+  fans a payload out to RTPS peers with one sequence number per sample.
+  `RaftROS::autoPubOnDeviceData` now delegates to both; RTPS wire behavior,
+  packet arguments and primary-before-secondary order are unchanged. Ownership
+  and failure contracts are documented in the headers and the
+  [Zenoh plan](RaftROS-zenoh-implementation-plan.md#shared-sample-dispatch-2026-09-18).
+- Linux tests: **979 passed, 0 failed** (33 runner + 17 emitter checks added),
+  also under ASan/UBSan. Host text+data **41023 B RTPS / 33062 B Zenoh**.
+- ExampleDiscoverable builds for ESP32-S3 with ESP-IDF 6.0.2 via
+  `raft build --no-docker -e ~/esp/esp-idf-v6.0.2`: app image **1257619 B**
+  (29% free in each `0x1b0000` OTA slot), `libRaftROS.a` 40042 B. This is the
+  first compile of the modified wrapper; it has not been flashed or run.
+- Not addressed: raw decoding, decoder allocation, attach/detach and transport
+  lifecycle remain in RaftROS; the writer pointer is not generation-safe.
+
+Next: extract the shared DeviceManager ownership/backend boundary using these
+measurements, starting from attach/detach and `DynamicWriterCtx`. General discovery,
+automatic reconnect, actual target budgets and live DeviceManager/ESP32
+validation remain pending; same-object reset tests do not implement reconnect.
 
 All results, counts and troubleshooting instructions in the dated sections
 below describe **RTPS / FastDDS** unless explicitly stated otherwise. Their
-912/912 test and firmware size figures are historical; the fresh Linux result
-is recorded above, while hardware measurements have not been repeated.
+912/912 test and firmware size figures are historical; the fresh Linux and
+firmware-compile results are recorded above, while hardware measurements have not been repeated.
 In particular, the WSL/FastDDS daemon and `_NODE_NAME_UNKNOWN_` observations
 must not be used to dismiss a future Zenoh discovery failure. Zenoh has its
 own graph-token and host-session contract, and requires host processes using

@@ -18,7 +18,7 @@ idf_component_register(
       "components/RaftROS/RTPS/runtime/reliability/RTPSReaderRuntime.cpp"
       "components/RaftROS/RTPS/runtime/reliability/RTPSReaderRunner.cpp"
       "components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp"
-      "components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp"
+      "components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp"
       "components/RaftROS/CDR/CDREncoder.cpp"
       "components/RaftROS/CDR/CDRDecoder.cpp"
     INCLUDE_DIRS

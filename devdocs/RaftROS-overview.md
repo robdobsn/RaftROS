@@ -1,9 +1,15 @@
 # RaftROS — Native ROS 2 Node Functionality for ESP32 via the Raft Framework
 
-**Implementation update:** 2026-09-17. RTPS is the only implemented backend.
-Zenoh work has started with a tested endpoint/QoS metadata codec and a passing
-native host graph/data control; no Raft-owned Zenoh session or firmware backend
-is available yet. The next milestone is defined in the
+**Implementation update:** 2026-09-18. RTPS is the only implemented backend.
+Zenoh's Linux prototype now discovers and publishes typed String or Range data over
+Raft-owned TCP, including delivery to a late ROS process and token withdrawal.
+It reuses Raft CDR, the shared sensor Range serializer and generated GIDs;
+Range input is synthetic, and no Zenoh firmware backend is available.
+Mapping/CDR and synchronous sample dispatch now have transport-neutral
+ownership, with legacy RTPS source adapters and an RTPS emission adapter;
+979 Linux regression checks pass and the ESP32-S3 firmware compiles. The
+remaining DeviceManager/backend boundary and build selector are still pending.
+The next milestone is defined in the
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md).
 
 ## 1. Introduction and Motivation
@@ -1108,10 +1114,23 @@ services/parameters without renumbering the completed RTPS phases:
 
 Z0 is in progress: ROS metadata and Raft-owned endpoint GID code pass 2218
 Linux checks, including a sanitizer run, plus 1004 direct upstream hash
-comparisons in Docker. The recorded RTPS baseline is 921/921. A native ROS
+comparisons in Docker. After shared mapping/CDR extraction and the common
+sample runner, RTPS/common tests pass 979/979 (929 before the runner) and the
+standalone and ESP32-S3 firmware build. A native ROS
 control passes with our generated GIDs on direct Docker loopback; host
-libraries still supply session/CDR. Raft-owned transport and multi-process/
-ESP32 standalone proof remain pending. See the plan's implementation record for the
+libraries still supply session/CDR in that diagnostic mode. A separate
+connected String and Range proofs use Raft TCP, tokens, GIDs and CDR throughout:
+discovery, late-process delivery and removal pass, also under sanitizers.
+Range type hash and CDR fields/length are checked against native ROS.
+Session/network tests pass 1245 checks. Scripted direct interests and native
+explicit publisher/peer restarts now pass, also with sanitized probe builds.
+Host release resources are measured and provisional firmware budgets recorded;
+an 8400-byte reset temporary was removed, and probe main's frame fell from
+19568 to 400 bytes by relocating persistent storage into one bounded 19192-byte
+allocation. This is stack relief, not reduced total RAM or proven target heap
+headroom. General discovery/subscriptions, automatic
+reconnect, measured ESP32 resource gates and standalone firmware proof
+remain pending. See the plan's implementation record for the
 resolved RTPS standalone build failure and still-unverified hardware checks.
 Runtime dual-backend selection is deferred; services, parameters and actions
 remain separate work.

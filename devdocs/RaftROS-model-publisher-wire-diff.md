@@ -17,6 +17,22 @@ host-generated CDR and an upstream session, so it does not replace sensor
 serializer wire comparisons or validate a Raft-owned Zenoh session. The
 capture extension below remains future work.
 
+The separate [Raft TCP String proof](RaftROS-zenoh-implementation-plan.md#raft-owned-discovery-and-string-publishing)
+now connects our session, tokens, GID, attachments and CDR encoder without an
+upstream client library. Native graph/data and a late ROS process pass, as
+does token withdrawal. The new
+[Range proof](RaftROS-zenoh-implementation-plan.md#raft-owned-range-publishing)
+also checks the unchanged sensor serializer, Jazzy type hash, every Range
+field, raw CDR and late delivery using synthetic decoded records.
+
+Range comparison exposed unspecified native alignment bytes at offsets
+33-35 of this 56-byte fixture. The test zeroes only those reference padding
+bytes, then compares every field byte and the exact length, requiring Raft
+padding to remain zero. Field corruption/truncation/trailing-byte negative
+tests prevent overbroad normalization. A raw buffer mismatch is not proof of
+a field-layout defect until padding is excluded. Other sensor types, live
+I2C input, broader discovery and packet-capture tooling remain pending.
+
 - Run the reference publisher and typed subscriber with the pinned
    `rmw_zenoh_cpp` version, domain and session configuration used by firmware
    interop tests; do not compare a FastDDS reference with a Zenoh capture.
@@ -206,7 +222,8 @@ encap header — that is what the per-type layouts below describe.
 ## 4. CDR layouts per supported type
 
 The auto-publisher's serialisers live in
-[RTPSAutoPubCDRSerializer.cpp](../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp).
+[AutoPubCDRSerializer.cpp](../components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp),
+shared by RTPS and the Zenoh host probe with unchanged encoding behavior.
 All payloads are **XCDR1 little-endian**. Every string is
 `{uint32 length incl. NUL, bytes..., NUL}` with 4-byte alignment applied
 before subsequent primitive fields. `std_msgs/Header` is always:
@@ -339,7 +356,7 @@ string data       ← uint32 length incl. NUL + bytes + NUL
 ```
 
 Content is the device's JSON-attribute blob as emitted by
-[RTPSAutoPubCDRSerializer_serializeString](../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp).
+[AutoPubCDRSerializer_serializeString](../components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp).
 
 ---
 

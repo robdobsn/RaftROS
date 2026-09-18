@@ -16,8 +16,23 @@ the existing Raft-only/source-license and standalone goals, a native ROS
 interoperability proof, common sensor/CDR extraction, mutually exclusive
 RTPS/Zenoh builds, and dynamic sensor/subscription/QoS validation.
 
-RTPS stays the default. Z0 has started with a pinned ROS metadata codec and
-isolated Linux tests; the Zenoh session/firmware backend is not implemented.
+RTPS stays the default. Z0/Z1 now include Raft-owned TCP String and synthetic
+Range publication proofs with native fields/hash/graph/data, a late ROS
+process and token withdrawal passing. Scripted direct interests and native
+explicit restart tests also pass. Live DeviceManager/sensors, general
+discovery/automatic reconnect/target-resource gates and the Zenoh firmware backend are
+still pending; Z1 is not declared complete.
+Host release size/stack baselines and provisional firmware budgets are now
+recorded in the Zenoh plan. The probe's persistent storage now has one bounded
+off-stack owner with allocation-failure coverage; main's host frame is 400 B.
+These are not device footprint measurements or a completed shared backend.
+The first preparatory Z2 extraction now owns mapping and CDR in
+`RaftRuntime::AutoPub`, with legacy RTPS source adapters. The Zenoh probe builds
+without RTPS headers; 929 Linux checks and sanitized native Range/late-join
+proofs pass. A common synchronous sample runner and RTPS emission adapter
+followed (979 checks; ESP32-S3 firmware compiles, not yet run on a board).
+DeviceManager ownership, endpoint operations, generation-safe handles and
+firmware build selection remain pending.
 Fresh results and the resolution of the standalone build failure are recorded in
 the new plan and development-status document, not in the historical counts
 below. Runtime selection of both backends is deferred. The remaining RTPS hardening/alignment items below stay

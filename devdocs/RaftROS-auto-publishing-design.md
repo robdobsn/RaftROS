@@ -2,7 +2,7 @@
 
 **Status:** Phase 4 implemented for RTPS; Zenoh adaptation planned separately
 **Author:** RaftROS maintainers  
-**Last Updated:** 2026-09-17 (planning update; historical results retained)
+**Last Updated:** 2026-09-17 (shared mapping/CDR extraction; historical results retained)
 **Scope:** Phase 4 of the RaftROS roadmap: automatic ROS 2 topic publishing for every
 I²C device attached to a Raft bus, with dynamic online/offline handling and
 per-`clas` message-type selection.
@@ -22,8 +22,23 @@ SPDP/SEDP, entity IDs, `ros_discovery_info` and ACKNACK/history machinery remain
 RTPS-only. Zenoh needs its own ROS graph tokens, keys/hashes, attachments and
 verified QoS implementation; it is not a new destination for RTPS packets.
 
+**Reuse evidence (2026-09-17):** class mapping and CDR ownership now reside in
+the shared [AutoPub layer](../components/RaftROS/AutoPub/AutoPubCDRSerializer.h),
+with legacy RTPS source APIs preserved through aliases/forwarders. The isolated
+Linux Zenoh Range probe uses the neutral API; mapping and encoding algorithms
+are unchanged. The Linux regression suite passed 929 checks at that point
+(979 after the sample runner below). Synthetic decoded
+records reach native ROS over Raft-owned TCP with verified units, stamps,
+frame ID, full Jazzy Range fields, type hash and CDR layout. Early/late
+observers and endpoint withdrawal pass, including a sanitizer run. See
+[the Range proof](RaftROS-zenoh-implementation-plan.md#raft-owned-range-publishing).
+This does not implement DeviceManager callbacks or physical hot-plug on
+Zenoh; the firmware path below is still RTPS-only.
+
 As built, `RaftROS::autoPubOnDeviceData` serializes the latest decoded record
-and sends RTPS data directly to peers. The bounded asynchronous handoff in
+and sends RTPS data directly to peers. Since 2026-09-18 it does so through the
+common [AutoPubSampleRunner](../components/RaftROS/AutoPub/AutoPubSampleRunner.h)
+and an RTPS emission adapter, both synchronous and borrowing all storage. The bounded asynchronous handoff in
 the new plan is work to implement, not an existing queue to reuse. Preserve
 bus-task responsiveness and explicitly test ownership, detach races and
 backpressure when extracting it. The source/dependency and routerless gates

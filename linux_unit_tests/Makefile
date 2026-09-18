@@ -1,5 +1,6 @@
 # Compiler
 CC = g++
+SIZE ?= size
 
 # Build artifact directories
 BUILD_DIR = build
@@ -15,7 +16,7 @@ INCLUDES = -I../components/RaftROS -I../components/RaftROS/RTPS -I../components/
 SOURCES = main.cpp utils.cpp \
 	../components/RaftROS/CDR/CDREncoder.cpp \
 	../components/RaftROS/CDR/CDRDecoder.cpp \
-	../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp \
+	../components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp \
 	../components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp \
@@ -51,7 +52,7 @@ STANDALONE_OUT = raftros_linux
 PROTO_SOURCES = utils.cpp \
 	../components/RaftROS/CDR/CDREncoder.cpp \
 	../components/RaftROS/CDR/CDRDecoder.cpp \
-	../components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.cpp \
+	../components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp \
 	../components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp \
 	../components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp \
 	../components/RaftROS/RTPS/runtime/discovery/SPDPHandler.cpp \
@@ -74,7 +75,7 @@ DEST_DIR=./RaftCore
 # GIT_TAG=v1.0  # Optional: Specify a tag if needed
 
 # Ensure raft_core is executed every time by making it .PHONY
-.PHONY: raft_core clean all standalone zenoh-test
+.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline
 
 all: $(OUTPUT)
 
@@ -89,6 +90,49 @@ $(ZENOH_TEST_OUT): zenoh_codec_tests.cpp ../components/RaftROS/Zenoh/ZenohROSCod
 
 zenoh-test: $(ZENOH_TEST_OUT)
 	./$(ZENOH_TEST_OUT)
+
+ZENOH_SESSION_TEST_OUT = $(BUILD_DIR)/zenoh/zenoh_session_tests
+
+$(ZENOH_SESSION_TEST_OUT): zenoh_session_tests.cpp ../components/RaftROS/Zenoh/ZenohStreamFramer.h ../components/RaftROS/Zenoh/ZenohTCPSession.h ../components/RaftROS/Zenoh/ZenohNetworkMessage.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS $< -o $@
+
+zenoh-session-test: $(ZENOH_SESSION_TEST_OUT)
+	./$(ZENOH_SESSION_TEST_OUT)
+
+ZENOH_SESSION_PROBE_OUT = $(BUILD_DIR)/zenoh/zenoh_session_probe
+ZENOH_PROBE_LDFLAGS ?=
+ZENOH_SENSOR_DIR = ../components/RaftROS/AutoPub
+ZENOH_PROBE_SERIALIZERS = ../components/RaftROS/CDR/CDREncoder.cpp $(ZENOH_SENSOR_DIR)/AutoPubCDRSerializer.cpp
+
+$(ZENOH_SESSION_PROBE_OUT): zenoh_session_probe.cpp ../components/RaftROS/Zenoh/ZenohStreamFramer.h ../components/RaftROS/Zenoh/ZenohTCPSession.h ../components/RaftROS/Zenoh/ZenohNetworkMessage.h ../components/RaftROS/Zenoh/ZenohROSCodec.h ../components/RaftROS/Zenoh/ZenohROSIdentity.h ../components/RaftROS/CDR/CDREncoder.h $(ZENOH_PROBE_SERIALIZERS) $(ZENOH_SENSOR_DIR)/AutoPubCDRSerializer.h $(ZENOH_SENSOR_DIR)/AutoPubClassMap.h $(ZENOH_SENSOR_DIR)/AutoPubSampleRunner.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS -I../components/RaftROS/CDR $< $(ZENOH_PROBE_SERIALIZERS) $(ZENOH_PROBE_LDFLAGS) -o $@
+
+zenoh-session-probe: $(ZENOH_SESSION_PROBE_OUT)
+
+ZENOH_ALLOCATION_FAILURE_OUT = $(BUILD_DIR)/zenoh/zenoh_probe_allocation_failure
+
+$(ZENOH_ALLOCATION_FAILURE_OUT): $(ZENOH_SESSION_PROBE_OUT) zenoh_probe_allocation_failure.cpp
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS -I../components/RaftROS/CDR zenoh_session_probe.cpp $(ZENOH_PROBE_SERIALIZERS) zenoh_probe_allocation_failure.cpp -o $@
+
+zenoh-storage-test: $(ZENOH_SESSION_PROBE_OUT) $(ZENOH_ALLOCATION_FAILURE_OUT)
+	python3 zenoh_wire_interop.py --probe $(ZENOH_SESSION_PROBE_OUT) --allocation-failure-probe $(ZENOH_ALLOCATION_FAILURE_OUT) --allocation-failure-only
+
+zenoh-wire-test: $(ZENOH_SESSION_PROBE_OUT)
+	python3 zenoh_wire_interop.py --probe $(ZENOH_SESSION_PROBE_OUT)
+
+RESOURCE_DIR = $(BUILD_DIR)/resources
+RESOURCE_CFLAGS = -std=c++20 -Wall -Os -DNDEBUG -ffunction-sections -fdata-sections -fstack-usage -DRAFT_CORE -DRAFTROS_ACK_HEX_DUMP_ENABLE=0 -DRAFTROS_ACK_VERBOSE_LOG_LABELS_ENABLE=0
+
+resource-baseline: raft_core
+	@mkdir -p $(RESOURCE_DIR)
+	find $(RESOURCE_DIR) -name '*.su' -type f -delete
+	$(MAKE) -B -o raft_core BUILD_DIR=$(RESOURCE_DIR)/rtps STANDALONE_OUT=$(RESOURCE_DIR)/rtps/raftros_linux CFLAGS="$(RESOURCE_CFLAGS)" LDFLAGS="-Wl,--gc-sections,-Map=$(RESOURCE_DIR)/rtps/raftros_linux.map" standalone
+	$(MAKE) -B BUILD_DIR=$(RESOURCE_DIR)/zenoh ZENOH_TEST_CFLAGS="$(RESOURCE_CFLAGS)" ZENOH_PROBE_LDFLAGS="-Wl,--gc-sections,-Map=$(RESOURCE_DIR)/zenoh/zenoh/zenoh_session_probe.map" zenoh-session-probe
+	$(SIZE) -B $(RESOURCE_DIR)/rtps/raftros_linux $(RESOURCE_DIR)/zenoh/zenoh/zenoh_session_probe
+	python3 resource_report.py --root $(RESOURCE_DIR) --compiler "$(CC)" --size-tool "$(SIZE)" --compile-flags="$(RESOURCE_CFLAGS)" > $(RESOURCE_DIR)/report.json
+	@echo "Host resource report: $(RESOURCE_DIR)/report.json"
 
 raft_core:
 	@echo "Fetching RaftCore repository..."
@@ -107,12 +151,12 @@ $(foreach src,$(sort $(SOURCES) $(PROTO_SOURCES) $(STANDALONE_SRC)),$(eval $(cal
 # Ensure $(OUTPUT) depends on raft_core
 $(OUTPUT): $(OBJECTS) raft_core
 	@echo "Building $(OUTPUT)..."
-	$(CC) $(CFLAGS) $(INCLUDES) -o $(OUTPUT) $(OBJECTS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(OUTPUT) $(OBJECTS) $(LDFLAGS)
 
 # Standalone ROS 2 participant
 $(STANDALONE_OUT): $(STANDALONE_OBJ) $(PROTO_OBJECTS) raft_core
 	@echo "Building $(STANDALONE_OUT)..."
-	$(CC) $(CFLAGS) $(INCLUDES) -o $(STANDALONE_OUT) $(STANDALONE_OBJ) $(PROTO_OBJECTS)
+	$(CC) $(CFLAGS) $(INCLUDES) -o $(STANDALONE_OUT) $(STANDALONE_OBJ) $(PROTO_OBJECTS) $(LDFLAGS)
 
 clean:
 	@echo "Cleaning up..."

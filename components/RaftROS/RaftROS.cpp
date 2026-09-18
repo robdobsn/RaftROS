@@ -12,6 +12,7 @@
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
 #include "runtime/autopub/RTPSAutoPubQoSProfile.h"
+#include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 #include "RaftJson.h"
 #include "RestAPIEndpointManager.h"
 #include "RTPSTypes.h"
@@ -2841,9 +2842,6 @@ void RaftROS::autoPubOnDeviceData(uint16_t deviceTypeIdx, std::vector<uint8_t> d
         static_cast<const DynamicWriterCtx*>(pCallbackInfo));
     pCtx->sampleCount++;
 
-    // Slice 4.3 produced the decoded struct; Slice 4.5 now runs the CDR
-    // serialiser against the latest record.  RTPS emission is wired up in
-    // Slice 4.7 — for now we just build the payload and rate-limit-log it.
     if (!(pCtx->decodeFn && pCtx->pDecodeBuf && pCtx->decodeBufSize > 0 && pCtx->structSize > 0))
     {
         if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
@@ -2882,97 +2880,61 @@ void RaftROS::autoPubOnDeviceData(uint16_t deviceTypeIdx, std::vector<uint8_t> d
         return;
     }
 
-    // Serialise only the most recent record — FIFO latest-only default
-    // documented in the design doc §13 (Phase-4 QoS) applies here.
-    const uint8_t* pLatestStruct = pCtx->pDecodeBuf
-                                 + (numRecords - 1) * pCtx->structSize;
-
-    // Extract the timestamp (first field is `timeMs` by code-generator
-    // convention) so the ROS 2 Header stamp matches the sample time rather
-    // than the wall-clock moment we happen to serialise.
-    uint32_t timestampMs = 0;
-    if (pCtx->structSize >= sizeof(uint32_t))
-        std::memcpy(&timestampMs, pLatestStruct, sizeof(uint32_t));
-
-    RTPSAutoPubCDRContext cdrCtx;
-    cdrCtx.pFieldDescs =
-        reinterpret_cast<const RTPSAutoPubAttrFieldDesc*>(pCtx->pFieldDescs);
-    cdrCtx.fieldCount  = pCtx->fieldCount;
-    cdrCtx.pStruct     = pLatestStruct;
-    cdrCtx.structSize  = pCtx->structSize;
-    cdrCtx.timestampMs = timestampMs;
-    cdrCtx.frameId     = "raft";
-
-    uint32_t cdrBytesWritten = 0;
-    const bool serOK = RTPSAutoPubCDRSerializer_serialize(
-        pCtx->msgKind, cdrCtx, pCtx->pCDRBuf, pCtx->cdrBufSize, cdrBytesWritten);
-
-    // Slice 4.7 — push the CDR sample onto the wire.  VOLATILE QoS for the
-    // default "fast_sensor" profile (design doc §7.2): no history-cache
-    // replay, fire-and-forget to every currently-discovered peer.  Reliable
-    // QoS with history + ACKNACK handling is part of Slice 4.11.
-    //
-    // Slice 4.10 — for composite devices (AHT20, BMP280, ...) we run the
-    // serialiser a second time with `secondaryMsgKind` against the same
-    // decoded struct and emit on the secondary registry slot's entityId.
-    int peersSent = 0;
-    uint64_t thisSeq = 0;
-
-    auto emitSlotSample = [&](uint8_t slotIdx,
-                              const uint8_t* pPayload, uint32_t payloadLen,
-                              uint64_t& outSeq) -> int
-    {
-        outSeq = 0;
-        if (slotIdx == 0xFF || payloadLen == 0 || !pPayload)
-            return 0;
-        auto* pRegEntry = _autoPubLifecycle.getMutable(slotIdx);
-        if (!pRegEntry || !pRegEntry->inUse)
-            return 0;
-        pRegEntry->seqNum++;
-        outSeq = pRegEntry->seqNum;
-        int sentCount = 0;
-        for (const auto& remote : _discovered)
-        {
-            const uint32_t msgLen = _sedpHandler.buildUserDataMessage(
-                _autoPubSendBuf, sizeof(_autoPubSendBuf),
-                _participant, remote.guidPrefix,
-                pRegEntry->entityId,
-                pPayload, payloadLen,
-                outSeq, /*heartbeatCount=*/0,
-                /*firstSN=*/outSeq);
-            if (msgLen == 0)
-                continue;
-            struct sockaddr_in dest = {};
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(remote.userDataPort);
-            dest.sin_addr.s_addr = remote.ipAddr;
-            const int sent = sendto(_userDataSock, _autoPubSendBuf, msgLen, 0,
-                                    (struct sockaddr*)&dest, sizeof(dest));
-            if (sent > 0)
-                sentCount++;
-        }
-        return sentCount;
+    // Serialise only the latest decoded record (FIFO latest-only default,
+    // design doc §13) and emit it with VOLATILE best-effort QoS to every
+    // currently-discovered peer (design doc §7.2).  Composite devices
+    // (AHT20, BMP280, ...) serialise the same record a second time with
+    // `secondaryMsgKind` and emit on the secondary registry slot.
+    using namespace RaftRuntime::AutoPub;
+    AutoPubDecodedBatch batch;
+    batch.data = pCtx->pDecodeBuf;
+    batch.capacity = pCtx->decodeBufSize;
+    batch.recordSize = pCtx->structSize;
+    batch.recordCount = numRecords;
+    batch.fields = reinterpret_cast<const AutoPubAttrFieldDesc*>(pCtx->pFieldDescs);
+    batch.fieldCount = pCtx->fieldCount;
+    const AutoPubSampleOutput outputs[] = {
+        {pCtx->msgKind, pCtx->pCDRBuf, pCtx->cdrBufSize},
+        {pCtx->secondaryMsgKind,
+         pCtx->secondarySlot == 0xFF ? nullptr : pCtx->pSecondaryCDRBuf,
+         pCtx->secondaryCDRBufSize}
+    };
+    AutoPubSampleResult results[2];
+    RTPSAutoPubSampleEmission emissions[2];
+    auto publish = [&](uint8_t outputIndex, const uint8_t* payload, uint32_t length, uint32_t) {
+        const uint8_t slot = outputIndex == 0 ? pCtx->slot : pCtx->secondarySlot;
+        emissions[outputIndex] = RTPSAutoPubSampleEmitter_emit(
+            _autoPubLifecycle.getMutable(slot), payload, length, _discovered,
+            [&](const auto& remote, const auto& entry, const uint8_t* sample,
+                uint32_t sampleLength, uint64_t sequence) {
+                const uint32_t msgLen = _sedpHandler.buildUserDataMessage(
+                    _autoPubSendBuf, sizeof(_autoPubSendBuf),
+                    _participant, remote.guidPrefix,
+                    entry.entityId, sample, sampleLength,
+                    sequence, /*heartbeatCount=*/0,
+                    /*firstSN=*/sequence);
+                if (msgLen == 0)
+                    return AutoPubPublishResult::Oversized;
+                struct sockaddr_in dest = {};
+                dest.sin_family = AF_INET;
+                dest.sin_port = htons(remote.userDataPort);
+                dest.sin_addr.s_addr = remote.ipAddr;
+                const int sent = sendto(_userDataSock, _autoPubSendBuf, msgLen, 0,
+                                        (struct sockaddr*)&dest, sizeof(dest));
+                return sent > 0 ? AutoPubPublishResult::Accepted : AutoPubPublishResult::SendFailed;
+            });
+        return emissions[outputIndex].result;
     };
 
-    if (serOK && cdrBytesWritten > 0)
-        peersSent = emitSlotSample(pCtx->slot, pCtx->pCDRBuf, cdrBytesWritten, thisSeq);
-
-    // Secondary composite writer (Slice 4.10): reuse the same decoded struct
-    // with a different msgKind → second ROS 2 topic.
-    uint32_t secBytes = 0;
-    uint64_t secSeq = 0;
-    int secPeers = 0;
-    bool secOK = false;
-    if (pCtx->secondarySlot != 0xFF && pCtx->pSecondaryCDRBuf &&
-        pCtx->secondaryCDRBufSize > 0 &&
-        pCtx->secondaryMsgKind != RTPSAutoPubMsgKind::Unknown)
+    if (!AutoPubSampleRunner::run(batch, outputs, 2, results, publish))
     {
-        secOK = RTPSAutoPubCDRSerializer_serialize(
-            pCtx->secondaryMsgKind, cdrCtx,
-            pCtx->pSecondaryCDRBuf, pCtx->secondaryCDRBufSize, secBytes);
-        if (secOK && secBytes > 0)
-            secPeers = emitSlotSample(pCtx->secondarySlot,
-                                      pCtx->pSecondaryCDRBuf, secBytes, secSeq);
+        if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
+        {
+            LOG_W(MODULE_PREFIX, "autoPubData invalid decoded batch records=%u stride=%u capacity=%u (sample #%u)",
+                  (unsigned)numRecords, (unsigned)pCtx->structSize, (unsigned)pCtx->decodeBufSize,
+                  (unsigned)pCtx->sampleCount);
+        }
+        return;
     }
 
     if (pCtx->sampleCount <= 3 || (pCtx->sampleCount % 100) == 0)
@@ -2980,22 +2942,26 @@ void RaftROS::autoPubOnDeviceData(uint16_t deviceTypeIdx, std::vector<uint8_t> d
         if (pCtx->secondarySlot == 0xFF)
         {
             LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u dataLen=%u decoded=%u cdrBytes=%u serOK=%d seq=%u peers=%d (sample #%u)",
+                  "autoPubData devID=%s typeIdx=%u slot=%u dataLen=%u decoded=%u cdrBytes=%u serOK=%d seq=%u peers=%u pub=%u (sample #%u)",
                   pCtx->deviceID.toString().c_str(), (unsigned)deviceTypeIdx,
                   (unsigned)pCtx->slot, (unsigned)data.size(),
-                  (unsigned)numRecords, (unsigned)cdrBytesWritten, (int)serOK,
-                  (unsigned)thisSeq, peersSent,
+                  (unsigned)numRecords, (unsigned)results[0].bytesWritten, (int)results[0].serialized,
+                  (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
+                  (unsigned)results[0].publishResult,
                   (unsigned)pCtx->sampleCount);
         }
         else
         {
             LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u/%u decoded=%u priCDR=%u serOK=%d seq=%u peers=%d | secCDR=%u secOK=%d secSeq=%u secPeers=%d (sample #%u)",
+                  "autoPubData devID=%s typeIdx=%u slot=%u/%u decoded=%u priCDR=%u serOK=%d seq=%u peers=%u pub=%u | secCDR=%u secOK=%d secSeq=%u secPeers=%u pub=%u (sample #%u)",
                   pCtx->deviceID.toString().c_str(), (unsigned)deviceTypeIdx,
                   (unsigned)pCtx->slot, (unsigned)pCtx->secondarySlot,
-                  (unsigned)numRecords, (unsigned)cdrBytesWritten, (int)serOK,
-                  (unsigned)thisSeq, peersSent,
-                  (unsigned)secBytes, (int)secOK, (unsigned)secSeq, secPeers,
+                  (unsigned)numRecords, (unsigned)results[0].bytesWritten, (int)results[0].serialized,
+                  (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
+                  (unsigned)results[0].publishResult,
+                  (unsigned)results[1].bytesWritten, (int)results[1].serialized,
+                  (unsigned)emissions[1].sequence, (unsigned)emissions[1].peersSent,
+                  (unsigned)results[1].publishResult,
                   (unsigned)pCtx->sampleCount);
         }
     }
