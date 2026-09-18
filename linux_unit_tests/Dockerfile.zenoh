@@ -31,6 +31,19 @@ RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -DRAFTROS_ZENOH_GID_REFERENCE
     -Iinclude -I/reference/src/rmw_zenoh/rmw_zenoh_cpp/src/detail zenoh_codec_tests.cpp \
     /reference/src/rmw_zenoh/rmw_zenoh_cpp/src/detail/simplified_xxhash3.cpp -o zenoh_gid_reference_tests \
     && ./zenoh_gid_reference_tests
-COPY linux_unit_tests/zenoh_metadata_interop.py .
+COPY linux_unit_tests/zenoh_metadata_interop.py linux_unit_tests/zenoh_wire_interop.py ./
+COPY components/RaftROS/Zenoh/ZenohStreamFramer.h components/RaftROS/Zenoh/ZenohTCPSession.h components/RaftROS/Zenoh/ZenohNetworkMessage.h include/Zenoh/
+COPY components/RaftROS/CDR/CDREncoder.h components/RaftROS/CDR/CDREncoder.cpp include/CDR/
+COPY components/RaftROS/AutoPub/AutoPubCDRSerializer.h components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp components/RaftROS/AutoPub/AutoPubClassMap.h components/RaftROS/AutoPub/AutoPubSampleRunner.h include/AutoPub/
+COPY linux_unit_tests/zenoh_session_tests.cpp linux_unit_tests/zenoh_session_probe.cpp ./
+RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude zenoh_session_tests.cpp -o zenoh_session_tests \
+    && ./zenoh_session_tests \
+    && g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude -Iinclude/CDR zenoh_session_probe.cpp include/CDR/CDREncoder.cpp include/AutoPub/AutoPubCDRSerializer.cpp -o zenoh_session_probe
+COPY linux_unit_tests/zenoh_probe_allocation_failure.cpp ./
+RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude -Iinclude/CDR \
+    zenoh_session_probe.cpp include/CDR/CDREncoder.cpp include/AutoPub/AutoPubCDRSerializer.cpp \
+    zenoh_probe_allocation_failure.cpp -o zenoh_probe_allocation_failure \
+    && /opt/zenoh-test/bin/python zenoh_wire_interop.py --probe /test/zenoh_session_probe \
+    --allocation-failure-probe /test/zenoh_probe_allocation_failure --allocation-failure-only
 ENV RMW_IMPLEMENTATION=rmw_zenoh_cpp ROS_DOMAIN_ID=23 PYTHONUNBUFFERED=1
 CMD ["/bin/bash", "-c", "source /reference/install/setup.bash && exec /opt/zenoh-test/bin/python /test/zenoh_metadata_interop.py"]

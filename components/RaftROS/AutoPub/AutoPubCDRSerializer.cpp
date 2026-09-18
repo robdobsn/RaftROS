@@ -1,8 +1,8 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 //
-// RTPSAutoPubCDRSerializer — XCDR1 serialisers per RTPSAutoPubMsgKind
+// AutoPubCDRSerializer — XCDR1 serialisers per AutoPubMsgKind
 //
-// See RTPSAutoPubCDRSerializer.h for API and design notes.
+// See AutoPubCDRSerializer.h for API and design notes.
 //
 // All serialisers emit little-endian XCDR1 with the standard 4-byte
 // encapsulation header (CDR_LE).  Alignment is computed from the start of the
@@ -13,16 +13,14 @@
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "RTPSAutoPubCDRSerializer.h"
-#include "CDREncoder.h"
+#include "AutoPubCDRSerializer.h"
+#include "../CDR/CDREncoder.h"
 
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 
 namespace RaftRuntime {
-namespace RTPS {
-namespace Runtime {
 namespace AutoPub {
 
 // ---------------------------------------------------------------------------
@@ -48,14 +46,14 @@ static constexpr float   RANGE_MAX_DIST_DEFAULT   = 2.0f;       // ~2 m for VL61
 // Field lookup helpers
 // ---------------------------------------------------------------------------
 
-static const RTPSAutoPubAttrFieldDesc* findField(
-        const RTPSAutoPubCDRContext& ctx, const char* name)
+static const AutoPubAttrFieldDesc* findField(
+        const AutoPubCDRContext& ctx, const char* name)
 {
     if (!ctx.pFieldDescs || !name)
         return nullptr;
     for (uint16_t i = 0; i < ctx.fieldCount; i++)
     {
-        const RTPSAutoPubAttrFieldDesc& d = ctx.pFieldDescs[i];
+        const AutoPubAttrFieldDesc& d = ctx.pFieldDescs[i];
         if (d.name && std::strcmp(d.name, name) == 0)
             return &d;
     }
@@ -64,7 +62,7 @@ static const RTPSAutoPubAttrFieldDesc* findField(
 
 /// Copy `n` bytes from the struct at the given offset, respecting
 /// the buffer bound.  Returns false if out-of-range.
-static bool readBytesFromStruct(const RTPSAutoPubCDRContext& ctx,
+static bool readBytesFromStruct(const AutoPubCDRContext& ctx,
                                 uint16_t offset, uint32_t n, void* pOut)
 {
     if (!ctx.pStruct)
@@ -75,67 +73,67 @@ static bool readBytesFromStruct(const RTPSAutoPubCDRContext& ctx,
     return true;
 }
 
-bool RTPSAutoPubCDRSerializer_readFieldDouble(
-        const RTPSAutoPubCDRContext& ctx, const char* name,
+bool AutoPubCDRSerializer_readFieldDouble(
+        const AutoPubCDRContext& ctx, const char* name,
         double& out, bool applyScale)
 {
-    const RTPSAutoPubAttrFieldDesc* pDesc = findField(ctx, name);
+    const AutoPubAttrFieldDesc* pDesc = findField(ctx, name);
     if (!pDesc)
         return false;
 
     double raw = 0.0;
     switch (pDesc->type)
     {
-        case RTPSAutoPubAttrType::Float:
+        case AutoPubAttrType::Float:
         {
             float v = 0.0f;
             if (!readBytesFromStruct(ctx, pDesc->offset, 4, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Int32:
+        case AutoPubAttrType::Int32:
         {
             int32_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 4, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Uint32:
+        case AutoPubAttrType::Uint32:
         {
             uint32_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 4, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Int16:
+        case AutoPubAttrType::Int16:
         {
             int16_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 2, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Uint16:
+        case AutoPubAttrType::Uint16:
         {
             uint16_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 2, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Int8:
+        case AutoPubAttrType::Int8:
         {
             int8_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Uint8:
+        case AutoPubAttrType::Uint8:
         {
             uint8_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v)) return false;
             raw = (double)v;
             break;
         }
-        case RTPSAutoPubAttrType::Bool:
+        case AutoPubAttrType::Bool:
         {
             uint8_t v = 0;
             if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v)) return false;
@@ -157,12 +155,12 @@ bool RTPSAutoPubCDRSerializer_readFieldDouble(
     return true;
 }
 
-bool RTPSAutoPubCDRSerializer_readFieldInt32(
-        const RTPSAutoPubCDRContext& ctx, const char* name,
+bool AutoPubCDRSerializer_readFieldInt32(
+        const AutoPubCDRContext& ctx, const char* name,
         int32_t& out, bool applyScale)
 {
     double v = 0.0;
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, name, v, applyScale))
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, name, v, applyScale))
         return false;
     // Truncate toward zero (standard C cast semantics).
     if (v >  (double)INT32_MAX) { out = INT32_MAX; return true; }
@@ -171,15 +169,15 @@ bool RTPSAutoPubCDRSerializer_readFieldInt32(
     return true;
 }
 
-bool RTPSAutoPubCDRSerializer_readFieldBool(
-        const RTPSAutoPubCDRContext& ctx, const char* name, bool& out)
+bool AutoPubCDRSerializer_readFieldBool(
+        const AutoPubCDRContext& ctx, const char* name, bool& out)
 {
-    const RTPSAutoPubAttrFieldDesc* pDesc = findField(ctx, name);
+    const AutoPubAttrFieldDesc* pDesc = findField(ctx, name);
     if (!pDesc)
         return false;
-    if (pDesc->type == RTPSAutoPubAttrType::Bool ||
-        pDesc->type == RTPSAutoPubAttrType::Uint8 ||
-        pDesc->type == RTPSAutoPubAttrType::Int8)
+    if (pDesc->type == AutoPubAttrType::Bool ||
+        pDesc->type == AutoPubAttrType::Uint8 ||
+        pDesc->type == AutoPubAttrType::Int8)
     {
         uint8_t v = 0;
         if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v))
@@ -188,7 +186,7 @@ bool RTPSAutoPubCDRSerializer_readFieldBool(
         return true;
     }
     double v = 0.0;
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, name, v, false))
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, name, v, false))
         return false;
     out = (v != 0.0);
     return true;
@@ -231,51 +229,51 @@ static bool writeCovarianceZero9(CDREncoder& enc)
 // Per-kind serialisers
 // ---------------------------------------------------------------------------
 
-static bool serializeTemperature(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeTemperature(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
     double temperature = 0.0;
-    (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "temperature", temperature);
+    (void)AutoPubCDRSerializer_readFieldDouble(ctx, "temperature", temperature);
     if (!enc.writeFloat64(temperature)) return false;
     if (!enc.writeFloat64(0.0)) return false; // variance unknown
     return true;
 }
 
-static bool serializeRelativeHumidity(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeRelativeHumidity(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
     double humidity = 0.0;
-    (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "humidity", humidity);
+    (void)AutoPubCDRSerializer_readFieldDouble(ctx, "humidity", humidity);
     humidity *= PERCENT_TO_UNIT; // % → 0..1
     if (!enc.writeFloat64(humidity)) return false;
     if (!enc.writeFloat64(0.0)) return false;
     return true;
 }
 
-static bool serializeFluidPressure(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeFluidPressure(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
     double pressure = 0.0;
-    (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "pressure", pressure);
+    (void)AutoPubCDRSerializer_readFieldDouble(ctx, "pressure", pressure);
     pressure *= HPA_TO_PA;
     if (!enc.writeFloat64(pressure)) return false;
     if (!enc.writeFloat64(0.0)) return false;
     return true;
 }
 
-static bool serializeIlluminance(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeIlluminance(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
     double lux = 0.0;
     // Prefer `als` (VCNL/VEML) then `illuminance`.
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "als", lux))
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "illuminance", lux);
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, "als", lux))
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "illuminance", lux);
     if (!enc.writeFloat64(lux)) return false;
     if (!enc.writeFloat64(0.0)) return false;
     return true;
 }
 
-static bool serializeRange(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeRange(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
     if (!enc.writeUint8(RANGE_RADIATION_INFRARED)) return false;
@@ -284,12 +282,12 @@ static bool serializeRange(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
 
     double rangeVal = 0.0;
     float  maxRange = RANGE_MAX_DIST_DEFAULT;
-    if (RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "dist", rangeVal))
+    if (AutoPubCDRSerializer_readFieldDouble(ctx, "dist", rangeVal))
     {
         rangeVal *= MM_TO_M;   // mm → m
         maxRange = RANGE_MAX_DIST_DEFAULT;
     }
-    else if (RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "prox", rangeVal))
+    else if (AutoPubCDRSerializer_readFieldDouble(ctx, "prox", rangeVal))
     {
         // VCNL proximity count divisor already normalised via AttrFieldDesc;
         // if not divided it's in raw counts (0-65535).  Normalise to 0..1.
@@ -303,7 +301,7 @@ static bool serializeRange(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     return true;
 }
 
-static bool serializeImu(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx, bool accelOnly)
+static bool serializeImu(CDREncoder& enc, const AutoPubCDRContext& ctx, bool accelOnly)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
 
@@ -318,9 +316,9 @@ static bool serializeImu(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx, bool
     double gx = 0.0, gy = 0.0, gz = 0.0;
     if (!accelOnly)
     {
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "gx", gx);
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "gy", gy);
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "gz", gz);
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "gx", gx);
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "gy", gy);
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "gz", gz);
         gx *= DEG_TO_RAD; gy *= DEG_TO_RAD; gz *= DEG_TO_RAD;
     }
     if (!enc.writeFloat64(gx)) return false;
@@ -337,12 +335,12 @@ static bool serializeImu(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx, bool
 
     // linear_acceleration (m/s²).  g → m/s².  Accept x/y/z or ax/ay/az.
     double ax = 0.0, ay = 0.0, az = 0.0;
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "ax", ax))
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "x", ax);
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "ay", ay))
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "y", ay);
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "az", az))
-        (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "z", az);
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, "ax", ax))
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "x", ax);
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, "ay", ay))
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "y", ay);
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, "az", az))
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, "z", az);
     ax *= GRAVITY_MPS2; ay *= GRAVITY_MPS2; az *= GRAVITY_MPS2;
     if (!enc.writeFloat64(ax)) return false;
     if (!enc.writeFloat64(ay)) return false;
@@ -352,14 +350,14 @@ static bool serializeImu(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx, bool
     return true;
 }
 
-static bool serializeFloat32(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeFloat32(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     // Try common scalar names in priority order.
     double v = 0.0;
-    if (!RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "angle", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "moisture", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "value", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "data", v))
+    if (!AutoPubCDRSerializer_readFieldDouble(ctx, "angle", v) &&
+        !AutoPubCDRSerializer_readFieldDouble(ctx, "moisture", v) &&
+        !AutoPubCDRSerializer_readFieldDouble(ctx, "value", v) &&
+        !AutoPubCDRSerializer_readFieldDouble(ctx, "data", v))
     {
         // Fall back to the first non-timestamp field.
         for (uint16_t i = 0; i < ctx.fieldCount; i++)
@@ -367,7 +365,7 @@ static bool serializeFloat32(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
             const auto& d = ctx.pFieldDescs[i];
             if (d.name && std::strcmp(d.name, "timeMs") != 0)
             {
-                (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, d.name, v);
+                (void)AutoPubCDRSerializer_readFieldDouble(ctx, d.name, v);
                 break;
             }
         }
@@ -375,20 +373,20 @@ static bool serializeFloat32(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     return enc.writeFloat32((float)v);
 }
 
-static bool serializeInt32(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeInt32(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     int32_t v = 0;
-    if (!RTPSAutoPubCDRSerializer_readFieldInt32(ctx, "rotation", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldInt32(ctx, "count", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldInt32(ctx, "value", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldInt32(ctx, "data", v))
+    if (!AutoPubCDRSerializer_readFieldInt32(ctx, "rotation", v) &&
+        !AutoPubCDRSerializer_readFieldInt32(ctx, "count", v) &&
+        !AutoPubCDRSerializer_readFieldInt32(ctx, "value", v) &&
+        !AutoPubCDRSerializer_readFieldInt32(ctx, "data", v))
     {
         for (uint16_t i = 0; i < ctx.fieldCount; i++)
         {
             const auto& d = ctx.pFieldDescs[i];
             if (d.name && std::strcmp(d.name, "timeMs") != 0)
             {
-                (void)RTPSAutoPubCDRSerializer_readFieldInt32(ctx, d.name, v);
+                (void)AutoPubCDRSerializer_readFieldInt32(ctx, d.name, v);
                 break;
             }
         }
@@ -396,20 +394,20 @@ static bool serializeInt32(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     return enc.writeInt32(v);
 }
 
-static bool serializeBool(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeBool(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     bool v = false;
-    if (!RTPSAutoPubCDRSerializer_readFieldBool(ctx, "press", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldBool(ctx, "state", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldBool(ctx, "value", v) &&
-        !RTPSAutoPubCDRSerializer_readFieldBool(ctx, "data", v))
+    if (!AutoPubCDRSerializer_readFieldBool(ctx, "press", v) &&
+        !AutoPubCDRSerializer_readFieldBool(ctx, "state", v) &&
+        !AutoPubCDRSerializer_readFieldBool(ctx, "value", v) &&
+        !AutoPubCDRSerializer_readFieldBool(ctx, "data", v))
     {
         for (uint16_t i = 0; i < ctx.fieldCount; i++)
         {
             const auto& d = ctx.pFieldDescs[i];
             if (d.name && std::strcmp(d.name, "timeMs") != 0)
             {
-                (void)RTPSAutoPubCDRSerializer_readFieldBool(ctx, d.name, v);
+                (void)AutoPubCDRSerializer_readFieldBool(ctx, d.name, v);
                 break;
             }
         }
@@ -417,7 +415,7 @@ static bool serializeBool(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     return enc.writeBool(v);
 }
 
-static bool serializeByteMultiArray(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeByteMultiArray(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     // std_msgs/ByteMultiArray:
     //   MultiArrayLayout layout          { MultiArrayDimension[] dim; uint32 data_offset; }
@@ -434,9 +432,9 @@ static bool serializeByteMultiArray(CDREncoder& enc, const RTPSAutoPubCDRContext
         const auto& d = ctx.pFieldDescs[i];
         if (!d.name) continue;
         if (std::strcmp(d.name, "timeMs") == 0) continue;
-        if (d.type == RTPSAutoPubAttrType::Bool ||
-            d.type == RTPSAutoPubAttrType::Uint8 ||
-            d.type == RTPSAutoPubAttrType::Int8)
+        if (d.type == AutoPubAttrType::Bool ||
+            d.type == AutoPubAttrType::Uint8 ||
+            d.type == AutoPubAttrType::Int8)
             count++;
     }
     if (!enc.writeSequenceLength(count)) return false;
@@ -445,18 +443,18 @@ static bool serializeByteMultiArray(CDREncoder& enc, const RTPSAutoPubCDRContext
         const auto& d = ctx.pFieldDescs[i];
         if (!d.name) continue;
         if (std::strcmp(d.name, "timeMs") == 0) continue;
-        if (d.type != RTPSAutoPubAttrType::Bool &&
-            d.type != RTPSAutoPubAttrType::Uint8 &&
-            d.type != RTPSAutoPubAttrType::Int8)
+        if (d.type != AutoPubAttrType::Bool &&
+            d.type != AutoPubAttrType::Uint8 &&
+            d.type != AutoPubAttrType::Int8)
             continue;
         bool b = false;
-        RTPSAutoPubCDRSerializer_readFieldBool(ctx, d.name, b);
+        AutoPubCDRSerializer_readFieldBool(ctx, d.name, b);
         if (!enc.writeUint8(b ? 1 : 0)) return false;
     }
     return true;
 }
 
-static bool serializeFloat32MultiArray(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeFloat32MultiArray(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     // MultiArrayLayout (empty) + float32 data[]
     if (!enc.writeSequenceLength(0)) return false; // dim[]
@@ -482,18 +480,18 @@ static bool serializeFloat32MultiArray(CDREncoder& enc, const RTPSAutoPubCDRCont
         if (std::strcmp(d.name, "status") == 0) continue;
         if (std::strcmp(d.name, "valid")  == 0) continue;
         double v = 0.0;
-        RTPSAutoPubCDRSerializer_readFieldDouble(ctx, d.name, v);
+        AutoPubCDRSerializer_readFieldDouble(ctx, d.name, v);
         if (!enc.writeFloat32((float)v)) return false;
     }
     return true;
 }
 
-static bool serializeWrench(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeWrench(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     // geometry_msgs/Wrench: Vector3 force, Vector3 torque (all float64).
     // HX711 → force.z = "force" field (N).  Valid flag gates the caller.
     double f = 0.0;
-    (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, "force", f);
+    (void)AutoPubCDRSerializer_readFieldDouble(ctx, "force", f);
     if (!enc.writeFloat64(0.0)) return false; // force.x
     if (!enc.writeFloat64(0.0)) return false; // force.y
     if (!enc.writeFloat64(f)) return false;   // force.z
@@ -503,7 +501,7 @@ static bool serializeWrench(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     return true;
 }
 
-static bool serializeJoy(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
+static bool serializeJoy(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     // sensor_msgs/Joy: Header header, float32[] axes, int32[] buttons.
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
@@ -517,7 +515,7 @@ static bool serializeJoy(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
     {
         if (!findField(ctx, an)) continue;
         double v = 0.0;
-        RTPSAutoPubCDRSerializer_readFieldDouble(ctx, an, v);
+        AutoPubCDRSerializer_readFieldDouble(ctx, an, v);
         if (!enc.writeFloat32((float)v)) return false;
     }
 
@@ -539,7 +537,7 @@ static bool serializeJoy(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
         if (std::strcmp(d.name, "timeMs") == 0) continue;
         if (std::strcmp(d.name, "x") == 0 || std::strcmp(d.name, "y") == 0) continue;
         int32_t v = 0;
-        RTPSAutoPubCDRSerializer_readFieldInt32(ctx, d.name, v);
+        AutoPubCDRSerializer_readFieldInt32(ctx, d.name, v);
         if (!enc.writeInt32(v)) return false;
     }
     return true;
@@ -549,7 +547,7 @@ static bool serializeJoy(CDREncoder& enc, const RTPSAutoPubCDRContext& ctx)
 // Public entry points
 // ---------------------------------------------------------------------------
 
-bool RTPSAutoPubCDRSerializer_serializeString(
+bool AutoPubCDRSerializer_serializeString(
         const char* pText,
         uint8_t* pOutBuf, uint32_t outBufLen,
         uint32_t& outBytesWritten)
@@ -565,9 +563,9 @@ bool RTPSAutoPubCDRSerializer_serializeString(
     return true;
 }
 
-bool RTPSAutoPubCDRSerializer_serialize(
-        RTPSAutoPubMsgKind kind,
-        const RTPSAutoPubCDRContext& ctx,
+bool AutoPubCDRSerializer_serialize(
+        AutoPubMsgKind kind,
+        const AutoPubCDRContext& ctx,
         uint8_t* pOutBuf, uint32_t outBufLen,
         uint32_t& outBytesWritten)
 {
@@ -582,21 +580,21 @@ bool RTPSAutoPubCDRSerializer_serialize(
     bool ok = false;
     switch (kind)
     {
-        case RTPSAutoPubMsgKind::Temperature:       ok = serializeTemperature(enc, ctx); break;
-        case RTPSAutoPubMsgKind::RelativeHumidity:  ok = serializeRelativeHumidity(enc, ctx); break;
-        case RTPSAutoPubMsgKind::FluidPressure:     ok = serializeFluidPressure(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Illuminance:       ok = serializeIlluminance(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Range:             ok = serializeRange(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Imu:               ok = serializeImu(enc, ctx, /*accelOnly=*/false); break;
-        case RTPSAutoPubMsgKind::Accel:             ok = serializeImu(enc, ctx, /*accelOnly=*/true);  break;
-        case RTPSAutoPubMsgKind::Float32:           ok = serializeFloat32(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Int32:             ok = serializeInt32(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Bool:              ok = serializeBool(enc, ctx); break;
-        case RTPSAutoPubMsgKind::ByteMultiArray:    ok = serializeByteMultiArray(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Float32MultiArray: ok = serializeFloat32MultiArray(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Wrench:            ok = serializeWrench(enc, ctx); break;
-        case RTPSAutoPubMsgKind::Joy:               ok = serializeJoy(enc, ctx); break;
-        case RTPSAutoPubMsgKind::String:
+        case AutoPubMsgKind::Temperature:       ok = serializeTemperature(enc, ctx); break;
+        case AutoPubMsgKind::RelativeHumidity:  ok = serializeRelativeHumidity(enc, ctx); break;
+        case AutoPubMsgKind::FluidPressure:     ok = serializeFluidPressure(enc, ctx); break;
+        case AutoPubMsgKind::Illuminance:       ok = serializeIlluminance(enc, ctx); break;
+        case AutoPubMsgKind::Range:             ok = serializeRange(enc, ctx); break;
+        case AutoPubMsgKind::Imu:               ok = serializeImu(enc, ctx, /*accelOnly=*/false); break;
+        case AutoPubMsgKind::Accel:             ok = serializeImu(enc, ctx, /*accelOnly=*/true);  break;
+        case AutoPubMsgKind::Float32:           ok = serializeFloat32(enc, ctx); break;
+        case AutoPubMsgKind::Int32:             ok = serializeInt32(enc, ctx); break;
+        case AutoPubMsgKind::Bool:              ok = serializeBool(enc, ctx); break;
+        case AutoPubMsgKind::ByteMultiArray:    ok = serializeByteMultiArray(enc, ctx); break;
+        case AutoPubMsgKind::Float32MultiArray: ok = serializeFloat32MultiArray(enc, ctx); break;
+        case AutoPubMsgKind::Wrench:            ok = serializeWrench(enc, ctx); break;
+        case AutoPubMsgKind::Joy:               ok = serializeJoy(enc, ctx); break;
+        case AutoPubMsgKind::String:
         {
             // Slice 4.9 — generic JSON body.  Iterates every attribute in
             // the field-desc list (skipping the synthetic `timeMs` header
@@ -625,7 +623,7 @@ bool RTPSAutoPubCDRSerializer_serialize(
             }
             for (uint16_t i = 0; i < ctx.fieldCount; i++)
             {
-                const RTPSAutoPubAttrFieldDesc& d = ctx.pFieldDescs[i];
+                const AutoPubAttrFieldDesc& d = ctx.pFieldDescs[i];
                 if (!d.name || !*d.name)
                     continue;
                 if (std::strcmp(d.name, "timeMs") == 0)
@@ -637,16 +635,16 @@ bool RTPSAutoPubCDRSerializer_serialize(
                 emit("\":");
 
                 char val[40];
-                if (d.type == RTPSAutoPubAttrType::Bool)
+                if (d.type == AutoPubAttrType::Bool)
                 {
                     bool bv = false;
-                    (void)RTPSAutoPubCDRSerializer_readFieldBool(ctx, d.name, bv);
+                    (void)AutoPubCDRSerializer_readFieldBool(ctx, d.name, bv);
                     std::snprintf(val, sizeof(val), "%s", bv ? "true" : "false");
                 }
                 else
                 {
                     double dv = 0.0;
-                    (void)RTPSAutoPubCDRSerializer_readFieldDouble(ctx, d.name, dv, true);
+                    (void)AutoPubCDRSerializer_readFieldDouble(ctx, d.name, dv, true);
                     std::snprintf(val, sizeof(val), "%.4g", dv);
                 }
                 emit(val);
@@ -662,7 +660,7 @@ bool RTPSAutoPubCDRSerializer_serialize(
             ok = enc.writeString(body);
             break;
         }
-        case RTPSAutoPubMsgKind::Unknown:
+        case AutoPubMsgKind::Unknown:
         default:
             return false;
     }
@@ -674,6 +672,4 @@ bool RTPSAutoPubCDRSerializer_serialize(
 }
 
 } // namespace AutoPub
-} // namespace Runtime
-} // namespace RTPS
 } // namespace RaftRuntime

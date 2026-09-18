@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <cmath>
+#include <type_traits>
 #include <vector>
 #include <arpa/inet.h>
 #include "utils.h"
@@ -37,6 +38,8 @@
 #include "runtime/autopub/RTPSAutoPubTopicNaming.h"
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
+#include "AutoPub/AutoPubSampleRunner.h"
+#include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
 
@@ -2892,6 +2895,54 @@ int main()
         printf("Test: RTPSAutoPubCDRSerializer (Phase 4 Slice 4.5)\n");
         using namespace RaftRuntime::RTPS::Runtime::AutoPub;
 
+        namespace Common = RaftRuntime::AutoPub;
+        static_assert(std::is_same_v<RTPSAutoPubMsgKind, Common::AutoPubMsgKind>);
+        static_assert(std::is_same_v<RTPSAutoPubClassMapping, Common::AutoPubClassMapping>);
+        static_assert(std::is_same_v<RTPSAutoPubAttrType, Common::AutoPubAttrType>);
+        static_assert(std::is_same_v<RTPSAutoPubAttrFieldDesc, Common::AutoPubAttrFieldDesc>);
+        static_assert(std::is_same_v<RTPSAutoPubCDRContext, Common::AutoPubCDRContext>);
+
+        {
+            const char* classes[] = {"DIST"};
+            const auto mapping = Common::AutoPubClassMap_lookup(classes, 1, "VL6180");
+            TEST_ASSERT(mapping.primaryKind == RTPSAutoPubMsgKind::Range,
+                        "shared mapping: Range kind usable by legacy callers");
+            TEST_ASSERT(std::strcmp(mapping.primaryTopicSlug, "range") == 0,
+                        "shared mapping: Range topic slug unchanged");
+            const uint16_t distanceRaw = 368;
+            const Common::AutoPubAttrFieldDesc field{
+                "dist", 0, Common::AutoPubAttrType::Uint16, "%u", 2.0f, 0.0f
+            };
+            Common::AutoPubCDRContext context;
+            context.pFieldDescs = &field;
+            context.fieldCount = 1;
+            context.pStruct = reinterpret_cast<const uint8_t*>(&distanceRaw);
+            context.structSize = sizeof(distanceRaw);
+            context.timestampMs = 1234;
+            context.frameId = "raft_range_1_29";
+            uint8_t commonBytes[128]{};
+            uint8_t legacyBytes[128]{};
+            uint32_t commonLength = 0;
+            uint32_t legacyLength = 0;
+            TEST_ASSERT(Common::AutoPubCDRSerializer_serialize(
+                            mapping.primaryKind, context, commonBytes, sizeof(commonBytes), commonLength),
+                        "shared serializer: Range payload succeeds");
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            mapping.primaryKind, context, legacyBytes, sizeof(legacyBytes), legacyLength),
+                        "legacy serializer: shared Range context accepted");
+            TEST_ASSERT(commonLength == 56 && commonLength == legacyLength &&
+                            std::memcmp(commonBytes, legacyBytes, commonLength) == 0,
+                        "shared serializer: legacy forwarding preserves exact Range bytes");
+            TEST_ASSERT(!Common::AutoPubCDRSerializer_serialize(
+                            mapping.primaryKind, context, commonBytes, 8, commonLength),
+                        "shared serializer: short output buffer rejected");
+            TEST_ASSERT(!RTPSAutoPubCDRSerializer_serialize(
+                            mapping.primaryKind, context, legacyBytes, 8, legacyLength),
+                        "legacy serializer: short output buffer rejected");
+            TEST_ASSERT(commonLength == 0 && legacyLength == 0,
+                        "shared serializer: failure clears both output lengths");
+        }
+
         // Generated-struct mirrors (layout matches
         // RaftI2C/linux_unit_tests/DevicePollRecords_generated.h).
         struct pollAHT20    { uint32_t timeMs; uint8_t status; float humidity; float temperature; };
@@ -3393,6 +3444,191 @@ int main()
             TEST_ASSERT(!RTPSAutoPubCDRSerializer_serialize(
                             RTPSAutoPubMsgKind::Temperature, ctx, tiny, sizeof(tiny), written),
                         "Temperature: rejects 8-byte buffer");
+        }
+    }
+
+    {
+        printf("Test: common decoded-sample runner and synchronous backend handoff\n");
+        using namespace RaftRuntime::AutoPub;
+        struct PollRecord { uint32_t timeMs; float temperature; float humidity; };
+        const PollRecord records[] = {{1000, 10.0f, 20.0f}, {2345, 23.5f, 56.0f}};
+        const AutoPubAttrFieldDesc fields[] = {
+            {"temperature", offsetof(PollRecord, temperature), AutoPubAttrType::Float, "", 1.0f, 0.0f},
+            {"humidity", offsetof(PollRecord, humidity), AutoPubAttrType::Float, "", 1.0f, 0.0f}
+        };
+        AutoPubDecodedBatch batch;
+        batch.data = reinterpret_cast<const uint8_t*>(records);
+        batch.capacity = sizeof(records);
+        batch.recordSize = sizeof(PollRecord);
+        batch.recordCount = 2;
+        batch.fields = fields;
+        batch.fieldCount = 2;
+        uint8_t payloads[2][128]{};
+        AutoPubSampleOutput outputs[] = {
+            {AutoPubMsgKind::Temperature, payloads[0], sizeof(payloads[0])},
+            {AutoPubMsgKind::RelativeHumidity, payloads[1], sizeof(payloads[1])}
+        };
+        AutoPubSampleResult results[2];
+        unsigned calls = 0;
+        std::vector<uint8_t> copiedPayloads[2];
+        auto publish = [&](uint8_t outputIndex, const uint8_t* data, uint32_t length,
+                           uint32_t timestampMs) {
+            TEST_ASSERT(outputIndex == calls, "sample runner: primary precedes secondary");
+            TEST_ASSERT(timestampMs == 2345, "sample runner: latest record timestamp");
+            TEST_ASSERT(data == outputs[outputIndex].data, "sample runner: borrows caller output");
+            copiedPayloads[outputIndex].assign(data, data + length);
+            ++calls;
+            return outputIndex == 0 ? AutoPubPublishResult::Accepted : AutoPubPublishResult::QueueFull;
+        };
+        TEST_ASSERT(AutoPubSampleRunner::run(batch, outputs, 2, results, publish),
+                    "sample runner: valid composite batch");
+        TEST_ASSERT(calls == 2 && results[0].serialized && results[1].serialized,
+                    "sample runner: emits both composite outputs");
+        TEST_ASSERT(results[0].publishResult == AutoPubPublishResult::Accepted &&
+                        results[1].publishResult == AutoPubPublishResult::QueueFull,
+                    "sample runner: preserves independent backend outcomes");
+        AutoPubCDRContext expectedContext;
+        expectedContext.pFieldDescs = fields;
+        expectedContext.fieldCount = 2;
+        expectedContext.pStruct = reinterpret_cast<const uint8_t*>(&records[1]);
+        expectedContext.structSize = sizeof(PollRecord);
+        expectedContext.timestampMs = 2345;
+        uint8_t expected[128]{};
+        uint32_t expectedLength = 0;
+        for (uint8_t outputIndex = 0; outputIndex < 2; ++outputIndex)
+        {
+            TEST_ASSERT(AutoPubCDRSerializer_serialize(outputs[outputIndex].kind, expectedContext,
+                            expected, sizeof(expected), expectedLength),
+                        "sample runner: reference serialization succeeds");
+            TEST_ASSERT(results[outputIndex].bytesWritten == expectedLength &&
+                            copiedPayloads[outputIndex].size() == expectedLength &&
+                            std::memcmp(copiedPayloads[outputIndex].data(), expected, expectedLength) == 0,
+                        "sample runner: latest-record bytes match serializer");
+            std::memset(payloads[outputIndex], 0xff, sizeof(payloads[outputIndex]));
+            TEST_ASSERT(std::memcmp(copiedPayloads[outputIndex].data(), expected, expectedLength) == 0,
+                        "sample runner: backend copy survives caller buffer reuse");
+        }
+        calls = 0;
+        auto publishSecondary = [&](uint8_t outputIndex, const uint8_t*, uint32_t, uint32_t) {
+            TEST_ASSERT(outputIndex == 1, "sample runner: failed primary is not published");
+            ++calls;
+            return AutoPubPublishResult::Disconnected;
+        };
+        outputs[0].capacity = 8;
+        TEST_ASSERT(AutoPubSampleRunner::run(batch, outputs, 2, results, publishSecondary),
+                    "sample runner: output failure does not invalidate batch");
+        TEST_ASSERT(calls == 1 && !results[0].serialized && results[0].bytesWritten == 0 &&
+                        results[0].publishResult == AutoPubPublishResult::NotAttempted &&
+                        results[1].publishResult == AutoPubPublishResult::Disconnected,
+                    "sample runner: secondary continues after primary serialization failure");
+        auto noPublish = [&](uint8_t, const uint8_t*, uint32_t, uint32_t) {
+            ++calls;
+            return AutoPubPublishResult::Accepted;
+        };
+        calls = 0;
+        const uint32_t invalidCounts[] = {0, 3, UINT32_MAX};
+        for (uint32_t recordCount : invalidCounts)
+        {
+            batch.recordCount = recordCount;
+            TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                        "sample runner: rejects empty or out-of-bounds decoded batch");
+            TEST_ASSERT(results[0].bytesWritten == 0 && !results[1].serialized &&
+                            results[1].publishResult == AutoPubPublishResult::NotAttempted,
+                        "sample runner: invalid batch clears prior results");
+        }
+        batch.recordCount = 2;
+        batch.recordSize = 0;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: rejects zero stride");
+        batch.recordSize = UINT32_MAX;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: rejects oversized stride without multiplication overflow");
+        batch.recordSize = sizeof(PollRecord);
+        batch.capacity = sizeof(records) - 1;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: rejects truncated last record");
+        batch.capacity = sizeof(records);
+        batch.data = nullptr;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: rejects null decoded storage");
+        batch.data = reinterpret_cast<const uint8_t*>(records);
+        batch.fields = nullptr;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: rejects missing field descriptors");
+        batch.fields = fields;
+        batch.fieldCount = 0;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: rejects empty field descriptors");
+        batch.fieldCount = 2;
+        TEST_ASSERT(!AutoPubSampleRunner::run(batch, nullptr, 2, results, noPublish) &&
+                        !AutoPubSampleRunner::run(batch, outputs, 2, nullptr, noPublish) &&
+                        !AutoPubSampleRunner::run(batch, outputs, 0, results, noPublish) &&
+                        !AutoPubSampleRunner::run(batch, outputs, 3, results, noPublish),
+                    "sample runner: validates output and result bounds");
+        outputs[0].kind = AutoPubMsgKind::Unknown;
+        outputs[1].data = nullptr;
+        TEST_ASSERT(AutoPubSampleRunner::run(batch, outputs, 2, results, noPublish),
+                    "sample runner: disabled outputs are skipped");
+        TEST_ASSERT(calls == 0 && results[0].publishResult == AutoPubPublishResult::NotAttempted &&
+                        results[1].publishResult == AutoPubPublishResult::NotAttempted,
+                    "sample runner: no publish on invalid batches or disabled outputs");
+    }
+
+    {
+        printf("Test: RTPS sample emitter adapter\n");
+        using namespace RaftRuntime::RTPS::Runtime::AutoPub;
+        using RaftRuntime::AutoPub::AutoPubPublishResult;
+        RTPSDynamicWriterRegistry registry;
+        const int slot = registry.allocate({1, 0x29, 0}, "rt/raft/range", "sensor_msgs::msg::dds_::Range_");
+        auto* entry = registry.getMutable(static_cast<uint8_t>(slot));
+        TEST_ASSERT(entry != nullptr, "RTPS emitter: test writer allocated");
+        if (entry)
+        {
+            const uint8_t payload[] = {0, 1, 0, 0, 42};
+            const std::vector<unsigned> peers{0, 1, 2};
+            unsigned calls = 0;
+            auto sendToPeer = [&](unsigned peer, const RTPSDynamicWriterEntry& writer,
+                                  const uint8_t* data, uint32_t length, uint64_t sequence) {
+                TEST_ASSERT(peer == calls, "RTPS emitter: all peers attempted in order");
+                TEST_ASSERT(&writer == entry && sequence == 1 && writer.seqNum == sequence,
+                            "RTPS emitter: one sequence shared by all peer sends");
+                TEST_ASSERT(data == payload && length == sizeof(payload),
+                            "RTPS emitter: CDR bytes passed without modification");
+                ++calls;
+                return peer == 1 ? AutoPubPublishResult::Accepted : AutoPubPublishResult::SendFailed;
+            };
+            const auto emission = RTPSAutoPubSampleEmitter_emit(entry, payload, sizeof(payload), peers, sendToPeer);
+            TEST_ASSERT(calls == 3 && emission.sequence == 1 && emission.peersSent == 1 &&
+                            emission.result == AutoPubPublishResult::Accepted,
+                        "RTPS emitter: partial peer success remains accepted");
+            const auto noPeers = RTPSAutoPubSampleEmitter_emit(
+                entry, payload, sizeof(payload), std::vector<unsigned>{}, sendToPeer);
+            TEST_ASSERT(noPeers.sequence == 2 && noPeers.peersSent == 0 && entry->seqNum == 2 &&
+                            noPeers.result == AutoPubPublishResult::Disconnected && calls == 3,
+                        "RTPS emitter: no peers still advances sequence exactly once");
+            const auto empty = RTPSAutoPubSampleEmitter_emit(entry, payload, 0, peers, sendToPeer);
+            const auto nullPayload = RTPSAutoPubSampleEmitter_emit(entry, nullptr, sizeof(payload), peers, sendToPeer);
+            TEST_ASSERT(empty.result == AutoPubPublishResult::NotAttempted &&
+                            nullPayload.result == AutoPubPublishResult::NotAttempted && entry->seqNum == 2,
+                        "RTPS emitter: empty payload does not consume sequence");
+            for (auto failure : {AutoPubPublishResult::Oversized, AutoPubPublishResult::SendFailed})
+            {
+                const auto failed = RTPSAutoPubSampleEmitter_emit(entry, payload, sizeof(payload), peers,
+                    [&](unsigned, const RTPSDynamicWriterEntry&, const uint8_t*, uint32_t, uint64_t) {
+                        return failure;
+                    });
+                TEST_ASSERT(failed.result == failure && failed.peersSent == 0 &&
+                                failed.sequence == entry->seqNum,
+                            "RTPS emitter: failed sends report outcome without successful peers");
+            }
+            TEST_ASSERT(entry->seqNum == 4, "RTPS emitter: one sequence per sample, including failed sends");
+            registry.releaseSlot(static_cast<uint8_t>(slot));
+            const auto detached = RTPSAutoPubSampleEmitter_emit(entry, payload, sizeof(payload), peers, sendToPeer);
+            const auto invalid = RTPSAutoPubSampleEmitter_emit(nullptr, payload, sizeof(payload), peers, sendToPeer);
+            TEST_ASSERT(detached.result == AutoPubPublishResult::InvalidHandle &&
+                            invalid.result == AutoPubPublishResult::InvalidHandle &&
+                            detached.sequence == 0 && calls == 3,
+                        "RTPS emitter: absent or released writer never sends");
         }
     }
 
