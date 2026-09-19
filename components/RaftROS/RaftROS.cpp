@@ -33,6 +33,7 @@
 #include "BusAddrStatus.h"
 #include "RaftBus.h"
 #include "RaftDevice.h"
+#include "esp_timer.h"
 
 // Socket / network headers (ESP-IDF / lwIP)
 #include <sys/socket.h>
@@ -343,14 +344,17 @@ void RaftROS::loop()
             // regression.
             const auto poolCounters = _autoPubPool.counters();
             LOG_I(MODULE_PREFIX,
-                  "autoPubStatus slots=%u/%u devices=%u discovered=%u rosDiscSeq=%u state=%d stale=%u busy=%u empty=%u",
+                  "autoPubStatus slots=%u/%u devices=%u discovered=%u rosDiscSeq=%u state=%d stale=%u busy=%u empty=%u drainSkips=%u drainGapMax=%ums drainGaps>150ms=%u",
                   (unsigned)_autoPubLifecycle.inUseCount(),
                   (unsigned)RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY,
                   (unsigned)_autoPubPool.inUseCount(),
                   (unsigned)_discovered.size(),
                   (unsigned)_rosDiscSeqNum, (int)_connState,
                   (unsigned)poolCounters.staleDrops, (unsigned)poolCounters.busyDrops,
-                  (unsigned)poolCounters.emptyFills);
+                  (unsigned)poolCounters.emptyFills, (unsigned)poolCounters.drainBusySkips,
+                  (unsigned)(_autoPubDrainGapMaxUs / 1000), (unsigned)_autoPubDrainGapsOver150ms);
+            _autoPubDrainGapMaxUs = 0;
+            _autoPubDrainGapsOver150ms = 0;
             _lastDiscoveredHealthLogMs = now;
         }
         break;
@@ -2872,6 +2876,16 @@ void RaftROS::autoPubOnDeviceData(uint16_t /*deviceTypeIdx*/, std::vector<uint8_
         [&](void* pUser, uint8_t* pRecord, uint32_t recordSize) -> uint32_t {
             DynamicWriterCtx* pCtx = static_cast<DynamicWriterCtx*>(pUser);
             pCtx->sampleCount++;
+
+            // Diagnostics: gap since this device's previous data callback
+            const int64_t nowUs = esp_timer_get_time();
+            if (pCtx->lastCallbackUs != 0)
+            {
+                const int64_t gapMs = (nowUs - pCtx->lastCallbackUs) / 1000;
+                const uint8_t bucket = gapMs < 50 ? 0 : gapMs < 150 ? 1 : gapMs < 250 ? 2 : gapMs < 400 ? 3 : 4;
+                pCtx->cbGapHist[bucket].fetch_add(1, std::memory_order_relaxed);
+            }
+            pCtx->lastCallbackUs = nowUs;
             if (!(pCtx->decodeFn && pCtx->pDecodeBuf && pCtx->structSize > 0 &&
                   pCtx->structSize == recordSize))
                 return 0;
@@ -2905,6 +2919,19 @@ void RaftROS::autoPubDrainSamples()
 {
     using namespace RaftRuntime::RTPS::Runtime::AutoPub;
     using namespace RaftRuntime::AutoPub;
+
+    // Diagnostics: gap between drain passes (an overwrite needs no drain for
+    // a whole poll interval, or a burst of callbacks on the bus task)
+    const int64_t nowUs = esp_timer_get_time();
+    if (_autoPubLastDrainUs != 0)
+    {
+        const uint32_t gapUs = (uint32_t)(nowUs - _autoPubLastDrainUs);
+        if (gapUs > _autoPubDrainGapMaxUs)
+            _autoPubDrainGapMaxUs = gapUs;
+        if (gapUs > 150000)
+            _autoPubDrainGapsOver150ms++;
+    }
+    _autoPubLastDrainUs = nowUs;
 
     _autoPubPool.drain([&](const AutoPubDrainedSample& sample) {
         // Safe: release() and delete of the ctx also run on this task.
@@ -2970,13 +2997,19 @@ void RaftROS::autoPubDrainSamples()
         else if (pCtx->secondarySlot == 0xFF)
         {
             LOG_I(MODULE_PREFIX,
-                  "autoPubData devID=%s typeIdx=%u slot=%u cdrBytes=%u serOK=%d seq=%u peers=%u pub=%u overwritten=%u (sample #%u)",
+                  "autoPubData devID=%s typeIdx=%u slot=%u cdrBytes=%u serOK=%d seq=%u peers=%u pub=%u overwritten=%u cbGaps<50/150/250/400/+=%u/%u/%u/%u/%u (sample #%u)",
                   pCtx->deviceID.toString().c_str(), (unsigned)pCtx->deviceTypeIndex,
                   (unsigned)pCtx->slot,
                   (unsigned)results[0].bytesWritten, (int)results[0].serialized,
                   (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
                   (unsigned)results[0].publishResult,
-                  (unsigned)sample.overwritten, (unsigned)sample.produced);
+                  (unsigned)sample.overwritten,
+                  (unsigned)pCtx->cbGapHist[0].load(std::memory_order_relaxed),
+                  (unsigned)pCtx->cbGapHist[1].load(std::memory_order_relaxed),
+                  (unsigned)pCtx->cbGapHist[2].load(std::memory_order_relaxed),
+                  (unsigned)pCtx->cbGapHist[3].load(std::memory_order_relaxed),
+                  (unsigned)pCtx->cbGapHist[4].load(std::memory_order_relaxed),
+                  (unsigned)sample.produced);
         }
         else
         {

@@ -1528,6 +1528,26 @@ interval.
 | `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubCDRSerializer.h/.cpp` | Per-kind CDR encoders with REP-103 unit scaling |
 | `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubQoSProfile.h` | 4 built-in profiles + override resolver |
 
+## Raft Library Follow-ups — TODO
+
+Found while bench-testing RaftROS on a UM ProS3 (2026-09-18). These are
+changes to RaftCore/RaftSysMods, not RaftROS.
+
+- **WiFi STA: connect by signal, not fast scan.** `NetworkSystem::configWifiSTA`
+  leaves `sta.scan_method` at `WIFI_FAST_SCAN`, which joins the first
+  matching AP heard. On a multi-AP SSID this picked -82 to -93 dBm APs while
+  a -62/-66 dBm AP was available. Set `WIFI_ALL_CHANNEL_SCAN` +
+  `WIFI_CONNECT_AP_BY_SIGNAL` (possibly configurable). Note: this alone did
+  not fix the ProS3's `rdiot` auth failures (reason 2 even when BSSID-locked
+  to the strong AP with WPA3 disabled).
+- **DeviceManager data-callback unregister does not reach the bus.**
+  `registerForDeviceData(..., unregister=true)` only removes the pending
+  request; the registration already forwarded to `RaftBusDevicesIF` stays.
+  RaftROS is now safe regardless (generation-checked pool handles).
+- **`configWifiSTA` can block the loop task for up to 2 s** (`vTaskDelay`
+  retry loop around `esp_wifi_set_config`), exceeding the 50 ms SysMod
+  budget when a connect attempt is in progress.
+
 ## Phase 5: Integration with Raft — TODO
 
 - ROS 2 actions / service servers.
