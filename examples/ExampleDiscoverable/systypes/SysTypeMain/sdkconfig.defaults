@@ -18,6 +18,11 @@ CONFIG_PARTITION_TABLE_CUSTOM_FILENAME="build/raft/partitions.csv"
 # Common ESP-related
 CONFIG_ESP_MAIN_TASK_STACK_SIZE=10000
 
+# Run the main task (all SysMod loops) on CPU1.  The WiFi driver task is
+# pinned to CPU0 at a much higher priority and stalls CPU0 for ~275 ms per
+# STA auth attempt, which breaks the SysMod loop-time contract.
+CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y
+
 # FreeRTOS
 CONFIG_FREERTOS_HZ=1000
 

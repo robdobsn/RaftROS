@@ -3735,6 +3735,17 @@ int main()
                         fillCalls == 0 && pool.counters().busyDrops == 1,
                     "publisher pool: busy lock drops sample and counts it");
 
+        // Drain never waits: a held lock skips the slot, keeping its sample
+        TEST_ASSERT(h0.slot == 0 && pool.produce(h0, fillWith(0xDD, 4), 2) == AutoPubProduceResult::Stored,
+                    "publisher pool: sample pending in first slot");
+        AutoPubTestLock::failNextTimedLocks = 1;
+        TEST_ASSERT(pool.drain(collect) == 0 && drained.empty() && pool.counters().drainBusySkips == 1,
+                    "publisher pool: drain skips a busy slot without waiting");
+        TEST_ASSERT(pool.drain(collect) == 1 && drained.size() == 1 &&
+                        drained[0].bytes == std::vector<uint8_t>(4, 0xDD),
+                    "publisher pool: skipped sample drained on the next pass");
+        drained.clear();
+
         // Release invalidates in-flight/stale handles and discards pending data
         pool.produce(h0, fillWith(0x99, 4), 2);
         TEST_ASSERT(pool.release(h0) && !pool.release(h0) && pool.inUseCount() == 2,

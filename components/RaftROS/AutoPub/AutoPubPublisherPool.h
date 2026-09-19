@@ -97,6 +97,7 @@ struct AutoPubPoolCounters
     uint32_t staleDrops = 0;
     uint32_t busyDrops = 0;
     uint32_t emptyFills = 0;
+    uint32_t drainBusySkips = 0;  ///< Drain passes deferred because a producer held the lock
 };
 
 template<typename Lock, uint8_t Capacity, uint32_t MaxRecordSize>
@@ -136,6 +137,7 @@ public:
             entry.overwritten = 0;
             handle.slot = slot;
             handle.generation = entry.generation;
+            _inUseCount.fetch_add(1, std::memory_order_relaxed);
             break;
         }
         _lock.unlock();
@@ -159,6 +161,7 @@ public:
             entry.inUse = false;
             entry.pending = false;
             entry.pUser = nullptr;
+            _inUseCount.fetch_sub(1, std::memory_order_relaxed);
         }
         _lock.unlock();
         return matched;
@@ -206,7 +209,11 @@ public:
     }
 
     /// @brief Hand every pending record to `consume(const AutoPubDrainedSample&)`
-    /// (loop task). The lock is held only while copying each record out.
+    /// (loop task). The lock is held only while copying each record out, and
+    /// is never waited for: if a producer holds it (possibly preempted on
+    /// another core), the rest of this pass is deferred — remaining samples
+    /// stay pending for the next pass — so the loop task cannot inherit a
+    /// bus-task stall. Each deferred pass is counted once.
     /// @return number of records consumed
     template<typename Consume>
     uint32_t drain(Consume&& consume)
@@ -215,8 +222,11 @@ public:
         for (uint8_t slot = 0; slot < Capacity; ++slot)
         {
             AutoPubDrainedSample sample;
-            if (!_lock.lock(WAIT_FOREVER))
-                return drained;
+            if (!_lock.lock(0))
+            {
+                _drainBusySkips.fetch_add(1, std::memory_order_relaxed);
+                break;
+            }
             Entry& entry = _entries[slot];
             const bool ready = entry.inUse && entry.pending;
             if (ready)
@@ -241,16 +251,7 @@ public:
         return drained;
     }
 
-    uint8_t inUseCount()
-    {
-        uint8_t count = 0;
-        if (!_lock.lock(WAIT_FOREVER))
-            return count;
-        for (const Entry& entry : _entries)
-            count += entry.inUse ? 1 : 0;
-        _lock.unlock();
-        return count;
-    }
+    uint8_t inUseCount() const { return _inUseCount.load(std::memory_order_relaxed); }
 
     AutoPubPoolCounters counters() const
     {
@@ -258,6 +259,7 @@ public:
         snapshot.staleDrops = _staleDrops.load(std::memory_order_relaxed);
         snapshot.busyDrops = _busyDrops.load(std::memory_order_relaxed);
         snapshot.emptyFills = _emptyFills.load(std::memory_order_relaxed);
+        snapshot.drainBusySkips = _drainBusySkips.load(std::memory_order_relaxed);
         return snapshot;
     }
 
@@ -297,6 +299,8 @@ private:
     std::atomic<uint32_t> _staleDrops{0};
     std::atomic<uint32_t> _busyDrops{0};
     std::atomic<uint32_t> _emptyFills{0};
+    std::atomic<uint32_t> _drainBusySkips{0};
+    std::atomic<uint8_t> _inUseCount{0};
 };
 
 }

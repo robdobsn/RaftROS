@@ -29,5 +29,6 @@ idf_component_register(
       RaftCore
       esp_hw_support
       esp_netif
+      esp_timer
       lwip
     )

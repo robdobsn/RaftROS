@@ -355,6 +355,13 @@ private:
         // lock; read on the loop task only after the handle is released).
         uint32_t sampleCount = 0;
 
+        // Diagnostics: histogram of gaps between consecutive data callbacks
+        // (<50, <150, <250, <400, >=400 ms).  Written by the bus task under
+        // the pool lock; atomics so the loop task can read them for logging.
+        static constexpr uint8_t CB_GAP_BUCKETS = 5;
+        int64_t lastCallbackUs = 0;
+        std::atomic<uint32_t> cbGapHist[CB_GAP_BUCKETS] = {};
+
         ~DynamicWriterCtx() { delete[] pDecodeBuf; }
     };
 
@@ -434,6 +441,12 @@ private:
 
     // Serialise and emit every pending mailbox sample (loop task).
     void autoPubDrainSamples();
+
+    // Diagnostics: gaps between drain passes (loop task only), reset each
+    // periodic status log.
+    int64_t _autoPubLastDrainUs = 0;
+    uint32_t _autoPubDrainGapMaxUs = 0;
+    uint32_t _autoPubDrainGapsOver150ms = 0;
 
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
