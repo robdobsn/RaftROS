@@ -11,6 +11,7 @@
 #include <cmath>
 #include <type_traits>
 #include <vector>
+#include <string>
 #include <arpa/inet.h>
 #include "utils.h"
 #include "CDREncoder.h"
@@ -41,6 +42,7 @@
 #include "AutoPub/AutoPubSampleRunner.h"
 #include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 #include "AutoPub/AutoPubPublisherPool.h"
+#include "AutoPub/AutoPubAttachPlan.h"
 #include "autopub_pool_test_lock.h"
 
 #define TEST_ASSERT(cond, msg) if (!(cond)) { printf("  FAIL: %s\n", msg); failCount++; } else { passCount++; }
@@ -3812,6 +3814,83 @@ int main()
         const auto counters = pool.counters();
         TEST_ASSERT(counters.staleDrops == 4 && counters.busyDrops == 1 && counters.emptyFills == 2,
                     "publisher pool: diagnostic counters");
+    }
+
+    {
+        printf("Test: shared auto-pub attach plan (device -> endpoints)\n");
+        using namespace RaftRuntime::AutoPub;
+        // Record what the plan asks about so override resolution is verifiable
+        std::vector<std::string> askedAliases;
+        auto resolveQoS = [&](const char* alias, const char* const*, size_t, const char*) {
+            askedAliases.push_back(std::string(alias));
+            return std::string(alias).rfind("humidity", 0) == 0 ? AutoPubQoSProfileId::SlowSensor
+                                                                : AutoPubQoSProfileId::FastSensor;
+        };
+        const AutoPubDeviceId devId{1, 0x29, 0};
+
+        // Single-endpoint device (DIST -> Range)
+        const char* distClas[] = {"DIST"};
+        auto plan = AutoPubAttachPlan_build(devId, distClas, 1, "VL6180", resolveQoS);
+        TEST_ASSERT(!plan.excluded && plan.endpointCount == 1, "attach plan: single endpoint for DIST");
+        TEST_ASSERT(std::string(plan.endpoints[0].topic) == "rt/raft/range_1_29" &&
+                        std::string(plan.endpoints[0].type) == "sensor_msgs::msg::dds_::Range_" &&
+                        plan.endpoints[0].msgKind == AutoPubMsgKind::Range,
+                    "attach plan: DIST topic/type/kind");
+        TEST_ASSERT(plan.endpoints[0].deviceId.busNum == 1 && plan.endpoints[0].deviceId.address == 0x29 &&
+                        plan.endpoints[0].deviceId.subIndex == 0,
+                    "attach plan: primary carries device identity with subIndex 0");
+        TEST_ASSERT(plan.endpoints[0].qosProfileId == AutoPubQoSProfileId::FastSensor &&
+                        askedAliases.size() == 1 && askedAliases[0] == std::string("range_1_29"),
+                    "attach plan: QoS resolved using the topic alias");
+
+        // Composite device (TEMP+RH -> Temperature + RelativeHumidity)
+        askedAliases.clear();
+        const char* compositeClas[] = {"TEMP", "RH"};
+        const AutoPubDeviceId compositeId{1, 0x38, 0};
+        auto composite = AutoPubAttachPlan_build(compositeId, compositeClas, 2, "AHT20", resolveQoS);
+        TEST_ASSERT(composite.endpointCount == 2, "attach plan: composite yields two endpoints");
+        TEST_ASSERT(composite.endpoints[0].msgKind == AutoPubMsgKind::Temperature &&
+                        composite.endpoints[1].msgKind == AutoPubMsgKind::RelativeHumidity,
+                    "attach plan: composite kinds in primary/secondary order");
+        TEST_ASSERT(composite.endpoints[1].deviceId.subIndex == 1 &&
+                        composite.endpoints[0].deviceId.subIndex == 0,
+                    "attach plan: composite endpoints get distinct subIndex");
+        TEST_ASSERT(std::string(composite.endpoints[0].topic) != std::string(composite.endpoints[1].topic),
+                    "attach plan: composite endpoints get distinct topics");
+        TEST_ASSERT(composite.endpoints[1].qosProfileId == AutoPubQoSProfileId::SlowSensor &&
+                        askedAliases.size() == 2,
+                    "attach plan: each endpoint resolves its own QoS");
+
+        // Actuators publish nothing
+        const char* actuatorClas[] = {"SRVO"};
+        auto excluded = AutoPubAttachPlan_build(devId, actuatorClas, 1, "SERVO", resolveQoS);
+        TEST_ASSERT(excluded.excluded && excluded.endpointCount == 0,
+                    "attach plan: actuator excluded with no endpoints");
+
+        // Unknown class falls back to std_msgs/String
+        const char* unknownClas[] = {"ZZZZ"};
+        auto fallback = AutoPubAttachPlan_build(devId, unknownClas, 1, "MysteryDev", resolveQoS);
+        TEST_ASSERT(fallback.endpointCount == 1 &&
+                        std::string(fallback.endpoints[0].type) == "std_msgs::msg::dds_::String_" &&
+                        std::string(fallback.endpoints[0].topic) == "rt/raft/raw_1_29",
+                    "attach plan: unknown class falls back to raw String topic");
+
+        // No class tags at all still yields the fallback endpoint
+        auto noClas = AutoPubAttachPlan_build(devId, nullptr, 0, nullptr, resolveQoS);
+        TEST_ASSERT(noClas.endpointCount == 1 && noClas.endpoints[0].isValid(),
+                    "attach plan: missing class tags still produce a valid endpoint");
+
+        // Descriptor rejects names that would truncate
+        AutoPubEndpointDesc desc;
+        std::string longTopic(AUTOPUB_TOPIC_MAX_LEN + 4, 'x');
+        TEST_ASSERT(!desc.setNames(longTopic.c_str(), "t") && !desc.isValid(),
+                    "endpoint desc: rejects over-long topic");
+        TEST_ASSERT(!desc.setNames(nullptr, nullptr) && !desc.setNames("", "t") &&
+                        !desc.setNames("t", ""),
+                    "endpoint desc: rejects null/empty names");
+        TEST_ASSERT(desc.setNames("rt/raft/range_1_29", "sensor_msgs::msg::dds_::Range_") &&
+                        desc.isValid() && std::string(desc.topic) == "rt/raft/range_1_29",
+                    "endpoint desc: accepts and owns valid names");
     }
 
     //=================================================================

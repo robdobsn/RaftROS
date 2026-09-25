@@ -20,7 +20,8 @@
 #include "runtime/dispatch/RTPSRemotePublicationMap.h"
 #include "runtime/dispatch/RTPSSEDPPublicationParser.h"
 #include "runtime/dispatch/RTPSSEDPSubscriptionParser.h"
-#include "runtime/autopub/RTPSAutoPubLifecycle.h"
+#include "runtime/autopub/RTPSAutoPubBackend.h"
+#include "AutoPub/AutoPubAttachPlan.h"
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubQoSProfile.h"
 #include "AutoPub/AutoPubPublisherPool.h"
@@ -397,9 +398,10 @@ private:
     static constexpr uint32_t AUTOPUB_CDR_BUF_SIZE = 512;
     uint8_t _autoPubCDRBufs[2][AUTOPUB_CDR_BUF_SIZE] = {};
 
-    // Shared-runtime attach/detach coordinator (slot allocation + owned
-    // topic/type strings).  No RTPS I/O yet in Slice 4.3.
-    RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubLifecycle _autoPubLifecycle;
+    // Compile-selected auto-publish backend: owns endpoint creation and the
+    // send path for whichever transport this image is built with.  The shared
+    // layer hands it AutoPubEndpointDesc descriptors and serialised samples.
+    RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubBackend _autoPubBackend;
 
     // Track whether we registered a status-change callback with DeviceManager.
     bool _autoPubStatusCBRegistered = false;
