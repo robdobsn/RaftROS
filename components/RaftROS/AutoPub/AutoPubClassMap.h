@@ -109,6 +109,52 @@ inline const char* AutoPubClassMap_typeName(AutoPubMsgKind kind)
     }
 }
 
+/// @brief ROS 2 type description hash (REP-2011 "RIHS01_...") for a message
+/// kind.  Zenoh topic keys embed this hash, so a wrong value silently stops
+/// subscribers matching.  Values are the `type_hashes` entries from the
+/// rosidl-generated type descriptions shipped with ROS 2 Jazzy
+/// (`/opt/ros/jazzy/share/<pkg>/msg/<Type>.json`), which are the same hashes
+/// rmw_zenoh puts on the wire.
+/// @return Static literal, or nullptr for Unknown.
+inline const char* AutoPubClassMap_typeHash(AutoPubMsgKind kind)
+{
+    switch (kind)
+    {
+        case AutoPubMsgKind::Imu:
+        case AutoPubMsgKind::Accel:
+            return "RIHS01_7d9a00ff131080897a5ec7e26e315954b8eae3353c3f995c55faf71574000b5b";
+        case AutoPubMsgKind::Temperature:
+            return "RIHS01_72514a14126ab9f8a9abec974c78e5610a367b59db5da355ff1fb982d5bad4b8";
+        case AutoPubMsgKind::RelativeHumidity:
+            return "RIHS01_8687c99b4fb393cb2e545e407b5ea7fd0b5d8960bcd849a0f86c544740138839";
+        case AutoPubMsgKind::FluidPressure:
+            return "RIHS01_22dfb2b145a0bd5a31a1ac3882a1b32148b51d9b2f3bab250290d66f3595bc32";
+        case AutoPubMsgKind::Illuminance:
+            return "RIHS01_b954b25f452fcf81a91c9c2a7e3b3fd85c4c873d452aecb3cfd8fd1da732a22d";
+        case AutoPubMsgKind::Range:
+            return "RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a";
+        case AutoPubMsgKind::Float32:
+            return "RIHS01_7170d3d8f841f7be3172ce5f4f59f3a4d7f63b0447e8b33327601ad64d83d6e2";
+        case AutoPubMsgKind::Int32:
+            return "RIHS01_b6578ded3c58c626cfe8d1a6fb6e04f706f97e9f03d2727c9ff4e74b1cef0deb";
+        case AutoPubMsgKind::Bool:
+            return "RIHS01_feb91e995ff9ebd09c0cb3d2aed18b11077585839fb5db80193b62d74528f6c9";
+        case AutoPubMsgKind::ByteMultiArray:
+            return "RIHS01_972fec7f50ab3c1d06783c228e79e8a9a509021708c511c059926261ada901d4";
+        case AutoPubMsgKind::Wrench:
+            return "RIHS01_018e8519d57c16adbe97c9fe1460ef21fec7e31bc541de3d653a35895677ce52";
+        case AutoPubMsgKind::Float32MultiArray:
+            return "RIHS01_0599f6f85b4bfca379873a0b4375a0aca022156bd2d7021275d116ed1fa8bfe0";
+        case AutoPubMsgKind::Joy:
+            return "RIHS01_0d356c79cad3401e35ffeb75a96a96e08be3ef896b8b83841d73e890989372c5";
+        case AutoPubMsgKind::String:
+            return "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18";
+        case AutoPubMsgKind::Unknown:
+        default:
+            return nullptr;
+    }
+}
+
 /// @brief Result of a class-map lookup.  `primary*` is always populated unless
 ///        `excluded == true`.  `secondary*` is populated only for composite
 ///        two-writer rules (TEMP+RH, PRES+TEMP).

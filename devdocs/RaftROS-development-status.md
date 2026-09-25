@@ -19,7 +19,7 @@ Zenoh firmware backend, build selector or measured ESP32 footprint.
 | --- | --- |
 | Z0: feasibility and baseline | In progress. Pinned host profile, release executable/stack baseline and provisional firmware review budgets recorded. Actual ESP32 app/heap/stack measurements remain open. zenoh-pico incorporation still needs explicit approval. |
 | Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
-| Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. DeviceManager lifecycle, generation-safe handles, bounded handoff and endpoint operations remain pending. |
+| Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Not started. Exactly-one-backend build with RTPS default and Zenoh-only alternative, followed by ESP session integration. |
 | Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
 
@@ -221,6 +221,54 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Zenoh Auto-Publish Backend (2026-09-25)
+
+[ZenohAutoPubBackend.h](../components/RaftROS/Zenoh/ZenohAutoPubBackend.h)
+implements the backend contract introduced in Z2 over a `ZenohTCPSession`, so
+the shared AutoPub layer is unchanged: it hands over an `AutoPubEndpointDesc`
+and later a serialised sample, and sees no key expressions, liveliness tokens
+or sockets. It reuses the codec/session/identity code the connected Linux probe
+already proved on the wire.
+
+Three differences from RTPS the contract had to absorb:
+
+- **Discovery is not per-peer.** RTPS announces each writer to each discovered
+  participant with SEDP; Zenoh declares one liveliness token per endpoint to the
+  router, which fans it out. There is therefore no `announceToPeer()` /
+  `disposeAtPeer()` — `createPublisher()` / `destroyPublisher()` carry the whole
+  visibility lifecycle.
+- **Nothing may block the loop.** The session carries one outbound message at a
+  time, so `createPublisher()` only *stages* a declaration — the key, token and
+  GID are built up front, so a bad descriptor fails at create rather than
+  silently later — and `service(nowMs)` sends one staged message per call,
+  round-robin so no slot starves. A slot is not publishable until its token has
+  gone out; `publish()` returns `QueueFull` until then, and a refused sample
+  never consumes a sequence number, so a subscriber sees no gap after a stall.
+- **A dropped session invalidates every declaration the router held.**
+  `service()` re-stages all live slots when the session leaves `Established`,
+  and endpoints torn down while the link is down are released without an
+  undeclare nobody would receive. Entity ids are never reused, so a re-declared
+  or slot-reusing endpoint is not confused with the old one.
+
+[AutoPubClassMap_typeHash()](../components/RaftROS/AutoPub/AutoPubClassMap.h)
+is new: Zenoh topic keys embed the REP-2011 type hash, and a wrong value
+silently stops subscribers matching. The 14 values are the `type_hashes`
+entries from the rosidl-generated type descriptions shipped with ROS 2 Jazzy
+(`/opt/ros/jazzy/share/<pkg>/msg/<Type>.json`), which are the hashes rmw_zenoh
+puts on the wire; `String` and `Range` match the values the probe had hardcoded,
+which is an independent check on both.
+
+- Tests: **124 passed, 0 failed** (`make zenoh-autopub-test`), driving a real
+  `ZenohTCPSession` fed synthetic handshake bytes — no router, no socket.
+  Four mutations were each caught: reusing entity ids (1 failure), publishing
+  before the token is out (15), not re-staging after a session drop (4), and
+  skipping the undeclare on destroy (4). Other suites unchanged: **1025** unit,
+  **2218** codec, **1245** session.
+- Not addressed: the backend is not yet linked into a firmware image — Z3
+  (exactly-one-backend build selection) is next — so it has not been run against
+  a real router or measured on ESP32. Router interop needs the
+  `eclipse-zenoh` Python package, which is not installed on this host.
 
 ### Open: one malformed SEDP subscription packet per remote participant (2026-09-25)
 

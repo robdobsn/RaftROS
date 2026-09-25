@@ -75,7 +75,7 @@ DEST_DIR=./RaftCore
 # GIT_TAG=v1.0  # Optional: Specify a tag if needed
 
 # Ensure raft_core is executed every time by making it .PHONY
-.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline autopub-pool-stress
+.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-autopub-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline autopub-pool-stress
 
 all: $(OUTPUT)
 
@@ -99,6 +99,15 @@ $(ZENOH_SESSION_TEST_OUT): zenoh_session_tests.cpp ../components/RaftROS/Zenoh/Z
 
 zenoh-session-test: $(ZENOH_SESSION_TEST_OUT)
 	./$(ZENOH_SESSION_TEST_OUT)
+
+ZENOH_AUTOPUB_TEST_OUT = $(BUILD_DIR)/zenoh/zenoh_autopub_backend_tests
+
+$(ZENOH_AUTOPUB_TEST_OUT): zenoh_autopub_backend_tests.cpp ../components/RaftROS/Zenoh/ZenohAutoPubBackend.h ../components/RaftROS/Zenoh/ZenohTCPSession.h ../components/RaftROS/Zenoh/ZenohROSCodec.h ../components/RaftROS/AutoPub/AutoPubClassMap.h ../components/RaftROS/AutoPub/AutoPubEndpointDesc.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS -I../components/RaftROS/AutoPub $< -o $@
+
+zenoh-autopub-test: $(ZENOH_AUTOPUB_TEST_OUT)
+	./$(ZENOH_AUTOPUB_TEST_OUT)
 
 ZENOH_SESSION_PROBE_OUT = $(BUILD_DIR)/zenoh/zenoh_session_probe
 ZENOH_PROBE_LDFLAGS ?=
