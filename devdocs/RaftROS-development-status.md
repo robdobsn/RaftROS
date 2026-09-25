@@ -1,9 +1,8 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-09-18 (shared sample dispatch and RTPS emitter closed out;
-first ESP32-S3 firmware compile of the modified wrapper; last recorded
-hardware/demo validation remains 2026-04-27). Resume commands are in the
-[agent handoff](RaftROS-WSL-agent-handoff.md).
+**Last Updated:** 2026-09-21 (bus→loop mailbox handoff; first hardware and
+native ROS 2 Jazzy end-to-end validation of auto-publishing). Resume commands
+are in the [agent handoff](RaftROS-WSL-agent-handoff.md).
 
 ## Next Milestone: Zenoh Alternative (Started)
 
@@ -222,6 +221,100 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### O6 `_NODE_NAME_UNKNOWN_` — wire-level evidence (2026-09-25)
+
+Captured with tshark on the native Linux host (`base8ubuntu`, Jazzy/FastDDS)
+while the ESP32-S3 published, and compared against a genuine
+`ros_discovery_info` exchange between two host nodes (forced onto UDP with
+`FASTDDS_BUILTIN_TRANSPORTS=UDPv4`, captured on loopback).
+
+**Our rdi traffic matches a working exchange in every checkable respect:**
+
+| Aspect | Ours | Working reference |
+| --- | --- | --- |
+| DATA flags / inline QoS / serialized key | 0x05 / none / none | identical |
+| Octets to inline QoS | 16 | 16 |
+| reader/writer entity ids | `00000204` / `00000103` | identical |
+| HEARTBEAT flags, first/last SN, count | non-final, 1/1, incrementing | non-final, incrementing |
+| SEDP announce | topic `ros_discovery_info`, correct type, RELIABLE + TRANSIENT_LOCAL, unicast locator `<esp>:7411` | identical shape |
+| INFO_DST | the host participant's current prefix | — |
+| UDP checksum | valid | valid |
+
+**Symptom:** the host's rdi reader only ever emits *preemptive* ACKNACKs
+(`bitmapBase 0`, `numBits 0`, count climbing 1..8 on a backoff timer), i.e.
+its WriterProxy never accepts a heartbeat from us. The host also never sends
+its own rdi DATA to our announced reader, so the failure is symmetric.
+
+**Ruled out (each tested, not assumed):**
+
+- Payload layout - the `ParticipantEntitiesInfo` CDR is correct (16-byte GID =
+  prefix + `000001c1`, one node entry, namespace `/`, name `raft_esp32`).
+- Packets not arriving - the exact bytes were mirrored to a plain UDP port on
+  the host and received in full.
+- Wrong port/locator - the host's rdi reader advertises no per-endpoint
+  locator, so the participant's user port (7411) is correct; ACKNACKs arrive
+  from that participant.
+- QoS mismatch, missing `PID_KEY_HASH` inline QoS (tested), reliable delivery
+  in general (`/chatter`, also RELIABLE, delivers fine), malformed
+  submessages (Wireshark dissects ours identically to the working reference),
+  bad UDP checksums, and vendor id (tested announcing eProsima's `010F`).
+
+**Next steps:** compare against CycloneDDS (`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`)
+to establish whether this is FastDDS-specific; failing that, instrument a
+FastDDS build on the host for the rejection reason, or raise it upstream with
+the above evidence.
+
+### Bus→Loop Handoff and Native ROS 2 Validation (2026-09-21)
+
+The auto-publish data path is now split across tasks with a bounded handoff,
+and has been validated on hardware against native ROS 2 Jazzy on Linux.
+
+- **Concurrency defects fixed.** Bus data callbacks run on the bus worker task
+  while attach/detach, `_discovered`, the writer registry and the sockets are
+  owned by the SysMod loop task, with no locking previously. That allowed a
+  use-after-free (detach deleted `DynamicWriterCtx` while a callback was in
+  flight, because `DeviceManager`'s unregister does not withdraw the bus-level
+  registration), unsynchronised access to `_discovered` (a `std::vector` the
+  loop task reallocates), blocking `sendto` on the bus task, and a shared send
+  buffer across bus tasks.
+- **Design:** [AutoPubPublisherPool.h](../components/RaftROS/AutoPub/AutoPubPublisherPool.h)
+  is a transport-neutral pool of generation-tagged slots, each with a
+  latest-only mailbox. The bus callback passes an encoded `{slot, generation}`
+  handle (never a pointer) as DeviceManager callback info, decodes under the
+  pool lock and stores only the latest record. `RaftROS::loop` drains the
+  mailboxes, serialises via `AutoPubSampleRunner` and emits through the RTPS
+  emitter. A stale handle is rejected before the user pointer is reached, so
+  detach can free state safely; `release()` waits for any producer.
+- **Loop-time contract:** the drain never waits on the pool lock (a busy slot
+  defers the pass, counted as `drainSkips`) and the in-use count is lock-free,
+  so the loop task cannot inherit a bus-task stall.
+- **Memory:** per-device 512 B CDR buffers (up to 8 KiB) replaced by two shared
+  buffers, since serialisation now happens on one task; mailboxes are 64 B per
+  device (largest generated poll record is 36 B).
+- **Tests:** Linux suite **1010 passed, 0 failed** (pool, drain-skip and SPDP
+  locator tests added), plus a threaded stress test
+  ([autopub_pool_stress.cpp](../linux_unit_tests/autopub_pool_stress.cpp),
+  `make autopub-pool-stress SAN=thread|address`) which is clean under
+  ThreadSanitizer and AddressSanitizer and was mutation-checked: an unlocked
+  `release()` is caught as a data race and use-after-free, and a missing
+  generation check as wrong-device delivery.
+- **Hardware (Adafruit ESP32-S3 TFT Feather + VL6180 on STEMMA QT):** device
+  attach/detach across repeated unplug/replug cycles is clean, publishing
+  resumes with a new generation, and callback gaps are uniformly 150-250 ms.
+- **Native ROS 2 Jazzy end-to-end (first time):** an Ubuntu 24.04 host on the
+  same subnet discovers `/raft/range_1_29` with the correct
+  `sensor_msgs/msg/Range` type and hash, BEST_EFFORT/VOLATILE QoS, and an
+  rclpy subscriber received **2735 samples at 4.9 Hz over 558 s with ~0.3%
+  loss** (first sample 1.1 s after subscriber start). Samples reach every
+  discovered participant (`peers=N pub=1`).
+- **Diagnostics added:** per-device callback-gap histogram and loop drain-gap
+  metrics in the `autoPubData`/`autoPubStatus` logs, which is how the sample
+  loss was traced to blocking console writes rather than the pool or the bus.
+- **Not addressed:** `_NODE_NAME_UNKNOWN_` (O6) reproduces on native Linux, so
+  it is a real graph-attribution bug rather than a WSL artefact; a rare ~101 ms
+  loop stall around SPDP sends is unexplained; raw decoding, decoder
+  allocation, attach/detach and transport lifecycle still live in RaftROS.
 
 ### Shared Sample Dispatch and First Firmware Compile (2026-09-18)
 
@@ -1530,23 +1623,46 @@ interval.
 
 ## Raft Library Follow-ups — TODO
 
-Found while bench-testing RaftROS on a UM ProS3 (2026-09-18). These are
-changes to RaftCore/RaftSysMods, not RaftROS.
+Found while bench-testing RaftROS on a UM ProS3 and an Adafruit ESP32-S3 TFT
+Feather (2026-09-18/21). These are changes to RaftCore/RaftSysMods, not RaftROS.
 
-- **WiFi STA: connect by signal, not fast scan.** `NetworkSystem::configWifiSTA`
-  leaves `sta.scan_method` at `WIFI_FAST_SCAN`, which joins the first
-  matching AP heard. On a multi-AP SSID this picked -82 to -93 dBm APs while
-  a -62/-66 dBm AP was available. Set `WIFI_ALL_CHANNEL_SCAN` +
-  `WIFI_CONNECT_AP_BY_SIGNAL` (possibly configurable). Note: this alone did
-  not fix the ProS3's `rdiot` auth failures (reason 2 even when BSSID-locked
-  to the strong AP with WPA3 disabled).
-- **DeviceManager data-callback unregister does not reach the bus.**
-  `registerForDeviceData(..., unregister=true)` only removes the pending
-  request; the registration already forwarded to `RaftBusDevicesIF` stays.
-  RaftROS is now safe regardless (generation-checked pool handles).
+**Fixed upstream (2026-09-20/21):**
+
+- **DeviceManager missed registrations made from a status callback** —
+  `busElemStatusCB` took its copy of `_requestedDeviceDataChangeCBList` before
+  calling the status-change callbacks, so a listener registering for device
+  data on identification (as RaftROS does) never reached the bus and its
+  device was never polled. Introduced by the concurrency-hardening merge;
+  auto-publishing stopped entirely until the copy was moved after the
+  callbacks.
+- **WiFi STA now connects by signal** — new `NetMan` setting
+  `wifiSTAConnectBySignal` (default true) selects `WIFI_ALL_CHANNEL_SCAN` +
+  `WIFI_CONNECT_AP_BY_SIGNAL`, applied both in `configWifiSTA` and at boot in
+  `startWifi` (stored NVS configs predate the setting). Before this the board
+  joined -82 to -93 dBm APs while a -62 dBm AP was available, costing ~7% of
+  samples in transit; after it, loss is ~0.3%.
+- **`wifiscan` returned no records** — `getScanResults` called
+  `esp_wifi_scan_get_ap_records` (which frees the driver list) before
+  `esp_wifi_scan_get_ap_num`, so the count was always 0. The API now also
+  reports scan state/id/age/new/lost and caches results.
+- **Invalid BLE status JSON** — `advName` was emitted without its closing
+  quote while advertising.
+
+**Still open:**
+
+- **DeviceManager data-callback unregister** now reaches the bus
+  (`unregisterForDeviceData`), but RaftROS does not depend on it: stale
+  callbacks are rejected by generation-checked pool handles.
 - **`configWifiSTA` can block the loop task for up to 2 s** (`vTaskDelay`
   retry loop around `esp_wifi_set_config`), exceeding the 50 ms SysMod
   budget when a connect attempt is in progress.
+- **Logging blocks the calling task when the USB console has no reader.**
+  Verbose per-packet logging from `loop()` stalled the SysMod loop past the
+  200 ms sensor interval and lost ~5% of samples while no monitor was
+  attached; the same logs replay as a multi-hour backlog when a monitor
+  reattaches. RaftROS's chatty discovery logs are now debug-gated, but a
+  Raft-level fix (drop, don't block, when nothing is reading) would protect
+  every app.
 
 ## Phase 5: Integration with Raft — TODO
 

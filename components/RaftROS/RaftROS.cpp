@@ -130,6 +130,11 @@ static_assert(
 // which accumulates to tens of ms of stalled loop() time when the ESP32-S3 is handling
 // multiple DDS peers.  Comment out RAFTROS_VERBOSE_LOGGING for production / when
 // profiling loop() latency.
+//
+// Logging is not free even when nothing is reading the console: with the USB serial
+// console unattached, writes block the calling task.  Measured on an ESP32-S3 with one
+// peer, the discovery/ACKNACK logs below emitted ~4.5 lines/s which stalled loop() past
+// the 200ms sensor sample interval often enough to lose ~5% of auto-published samples.
 // #define RAFTROS_VERBOSE_LOGGING
 #ifdef RAFTROS_VERBOSE_LOGGING
     #define DEBUG_SDSP_SEND
@@ -150,6 +155,9 @@ static_assert(
     #define RAFTROS_SEND_WRITER_HEARTBEATS
     #define DEBUG_PARTICIPANT_PROCESSING
     #define DEBUG_PUBLISH_CHATTER
+    #define DEBUG_SEDP_SUB_ACK
+    #define DEBUG_AUTOPUB_SEDP_ANNOUNCE
+    #define DEBUG_ROS_DISCOVERY_INFO
 #endif
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -730,12 +738,14 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
     };
     callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
     {
+#ifdef DEBUG_SEDP_SUB_ACK
         if (responded && memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) == 0)
         {
             LOG_I(MODULE_PREFIX,
                   "SEDP sub HEARTBEAT lastSN=%u -> ACKNACK %d bytes",
                   (unsigned)lastSNLow, sentBytes);
         }
+#endif
 #ifdef DEBUG_RECEIVED_HEARTBEAT
         if (responded)
         {
@@ -756,6 +766,7 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                                        bool responded,
                                        int sentBytes)
     {
+#ifdef DEBUG_SEDP_SUB_ACK
         if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) != 0)
             return;
         LOG_I(MODULE_PREFIX,
@@ -770,6 +781,7 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
               (unsigned)(decision.ackNackBitmap & 0xFFFFFFFFu),
               (int)responded,
               sentBytes);
+#endif
     };
     callbacks.onAckNackBuilt = [](void*, RTPSRxChannel,
                                   const uint8_t* readerEID,
@@ -780,6 +792,7 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                                   const struct sockaddr_in& fromAddr,
                                   const struct sockaddr_in& destAddr)
     {
+#ifdef DEBUG_SEDP_SUB_ACK
         static uint16_t sedpSubAckLogCount = 0;
         if (memcmp(writerEID, ENTITYID_SEDP_BUILTIN_SUBSCRIPTIONS_WRITER, 4) != 0)
             return;
@@ -811,6 +824,7 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
               ackBuf[subOff + 20], ackBuf[subOff + 21], ackBuf[subOff + 22], ackBuf[subOff + 23],
               ackBuf[subOff + 24], ackBuf[subOff + 25], ackBuf[subOff + 26], ackBuf[subOff + 27],
               ackBuf[subOff + 28], ackBuf[subOff + 29], ackBuf[subOff + 30], ackBuf[subOff + 31]);
+#endif
     };
     callbacks.onData = [](void* userCtx,
                           RTPSRxChannel,
@@ -1147,7 +1161,6 @@ void RaftROS::recvUserData()
     LOG_I(MODULE_PREFIX, "recvUserData %d bytes from %s:%d",
           n, inet_ntoa(fromAddr.sin_addr), (int)ntohs(fromAddr.sin_port));
 #endif
-
     struct RxCtx
     {
         RTPSRxRunnerAdapterBaseCtx base;
@@ -2062,12 +2075,14 @@ bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8
     // Keep a low-rate diagnostic at INFO level so on-device flash logs confirm
     // that autopub writers are being announced to every discovered peer (this
     // firing is prerequisite to the host's rmw seeing a matched publisher).
+#ifdef DEBUG_AUTOPUB_SEDP_ANNOUNCE
     LOG_I(MODULE_PREFIX,
           "autoPubSEDP slot=%u topic=%s type=%s seq=%u sent %d/%u peerGuidPfx=%02x%02x%02x%02x peerIP=%08x port=%d",
           (unsigned)slot, pEntry->topic, pEntry->type,
           (unsigned)thisSeq, sent, (unsigned)payloadLen,
           remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
           (unsigned)remote.ipAddr, (int)remote.metatrafficPort);
+#endif
     return payloadLen > 0;
 }
 
@@ -2150,10 +2165,12 @@ uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
     // ros_discovery_info payload is (re)built.  A writer not appearing here
     // is invisible to `ros2 topic info` / graph queries even if its SEDP
     // announce is accepted.
+#ifdef DEBUG_ROS_DISCOVERY_INFO
     LOG_I(MODULE_PREFIX,
           "buildRosDiscInfo seq=%u writerGids=%u readerGids=%u payloadLen=%u (chatter+autopub slots)",
           (unsigned)_rosDiscSeqNum, (unsigned)numWriterIds, (unsigned)numReaderIds,
           (unsigned)payloadLen);
+#endif
     return payloadLen;
 }
 
@@ -2225,13 +2242,11 @@ void RaftROS::publishChatter()
             dest.sin_addr.s_addr = remote.ipAddr;
             int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
                               (struct sockaddr*)&dest, sizeof(dest));
-            // Always-on diagnostic (formerly DEBUG_PUBLISH_CHATTER-gated) so
-            // we can see on-device whether chatter is being emitted per tick
-            // even in the current graph-visibility investigation.
             {
                 char destIpStr[16];
                 strncpy(destIpStr, inet_ntoa(*(struct in_addr*)&remote.ipAddr), sizeof(destIpStr));
                 destIpStr[sizeof(destIpStr)-1] = '\0';
+#ifdef DEBUG_PUBLISH_CHATTER
                 if ((_chatterSeqNum % 5) == 1)
                 {
                     LOG_I(MODULE_PREFIX,
@@ -2242,6 +2257,7 @@ void RaftROS::publishChatter()
                           remote.guidPrefix[2], remote.guidPrefix[3],
                           (unsigned)_discovered.size());
                 }
+#endif
             }
         }
     }

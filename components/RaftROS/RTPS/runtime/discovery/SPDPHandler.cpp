@@ -211,6 +211,16 @@ uint32_t SPDPHandler::buildAnnouncementMessage(
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Locator kind (first 4 bytes of a locator param, little-endian)
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+static int32_t locatorKindLE(const uint8_t* pLocator)
+{
+    return (int32_t)((uint32_t)pLocator[0] | ((uint32_t)pLocator[1] << 8) |
+                     ((uint32_t)pLocator[2] << 16) | ((uint32_t)pLocator[3] << 24));
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // Parse received SPDP message, extract participant info
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -276,8 +286,12 @@ bool SPDPHandler::parseAnnouncementMessage(const uint8_t* pBuf, uint32_t bufLen,
                             memcpy(outParticipant.guidPrefix, pVal, 12);
                         break;
 
+                    // Locator params are {kind (4), port (4), address (16)}.  A participant
+                    // typically announces several locators (e.g. shared memory as well as
+                    // UDPv4) so only UDPv4 locators are of use here - taking the port/address
+                    // from another kind would send user data / metatraffic nowhere.
                     case PID_DEFAULT_UNICAST_LOCATOR:
-                        if (plen >= 24)
+                        if ((plen >= 24) && (locatorKindLE(pVal) == LOCATOR_KIND_UDPv4))
                         {
                             outParticipant.userDataPort = pVal[4] | (pVal[5] << 8);
                             memcpy(&outParticipant.ipAddr, pVal + 20, 4);
@@ -285,7 +299,7 @@ bool SPDPHandler::parseAnnouncementMessage(const uint8_t* pBuf, uint32_t bufLen,
                         break;
 
                     case PID_METATRAFFIC_UNICAST_LOCATOR:
-                        if (plen >= 24)
+                        if ((plen >= 24) && (locatorKindLE(pVal) == LOCATOR_KIND_UDPv4))
                         {
                             outParticipant.metatrafficPort = pVal[4] | (pVal[5] << 8);
                             if (outParticipant.ipAddr == 0)

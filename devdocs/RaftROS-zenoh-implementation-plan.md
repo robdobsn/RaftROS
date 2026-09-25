@@ -141,6 +141,32 @@ registry/peer concurrency concerns are unchanged; fake-backend tests do not
 prove them safe. Raw decoding, decoder allocation, attach/detach and transport
 lifecycle still live in RaftROS.
 
+### Bus→Loop Handoff and Hardware Validation (2026-09-21)
+
+Z2 continues: the sensor path now has an explicit task boundary, which is also
+the boundary a Zenoh backend will plug into.
+
+- [AutoPubPublisherPool.h](../components/RaftROS/AutoPub/AutoPubPublisherPool.h)
+  (transport-neutral) owns generation-tagged slots with latest-only mailboxes.
+  The bus callback carries an encoded `{slot, generation}` handle rather than a
+  pointer, decodes under the pool lock and stores the latest record only. The
+  loop task drains, serialises with `AutoPubSampleRunner` and emits via the
+  RTPS emitter - so a Zenoh emitter replaces only the publish callable.
+- Lifetime: a stale handle is rejected before the user pointer is dereferenced;
+  `release()` waits for any in-flight producer, making detach safe without
+  relying on DeviceManager's unregister semantics.
+- Loop-time: `drain()` never waits for the lock (deferring the pass instead)
+  and the in-use count is lock-free, so the loop task cannot inherit a
+  bus-task stall. Serialisation moved off the bus task, so per-device CDR
+  buffers (16 x 512 B) collapse to two shared buffers.
+- Evidence: **1010** Linux assertions; a threaded stress test clean under
+  TSan/ASan and mutation-checked; hardware unplug/replug cycles clean; and the
+  first native ROS 2 Jazzy end-to-end run (Ubuntu 24.04, FastDDS) receiving
+  **2735 Range samples at 4.9 Hz with ~0.3% loss**.
+- Host resources are unchanged by this slice (no new allocation); the ESP32-S3
+  image grew ~1 KB. Firmware/host measurement caveats in the sections below
+  still apply.
+
 ### Pinned Reference and Observed Baseline
 
 | Item | Evidence |

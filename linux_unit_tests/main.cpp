@@ -355,6 +355,32 @@ int main()
         TEST_ASSERT(parsed.userDataPort == 7411, "SPDP parsed user data port = 7411");
         TEST_ASSERT(parsed.leaseDurationSec == 120, "SPDP parsed lease duration = 120");
         TEST_ASSERT(parsed.ipAddr == ip, "SPDP parsed IP address matches");
+
+        // Participants commonly announce non-UDPv4 locators too (e.g. FastDDS announces a
+        // shared-memory locator alongside UDPv4) - those must not supply ports/addresses
+        uint8_t shmBuf[512];
+        memcpy(shmBuf, msgBuf, msgLen);
+        uint32_t locatorParamsPatched = 0;
+        for (uint32_t i = 0; i + 4 <= msgLen; i++)
+        {
+            const uint16_t pid = shmBuf[i] | (shmBuf[i + 1] << 8);
+            const uint16_t plen = shmBuf[i + 2] | (shmBuf[i + 3] << 8);
+            if (((pid == PID_DEFAULT_UNICAST_LOCATOR) || (pid == PID_METATRAFFIC_UNICAST_LOCATOR)) &&
+                (plen == 24) && (i + 4 + plen <= msgLen) && (shmBuf[i + 4] == LOCATOR_KIND_UDPv4))
+            {
+                shmBuf[i + 4] = 16;  // LOCATOR_KIND_SHM
+                locatorParamsPatched++;
+            }
+        }
+        DiscoveredParticipant shmParsed;
+        const bool shmOk = spdp.parseAnnouncementMessage(shmBuf, msgLen, shmParsed);
+        TEST_ASSERT(locatorParamsPatched == 2, "SPDP test patched both locator params to SHM");
+        TEST_ASSERT(shmOk && shmParsed.valid, "SPDP parse succeeds with non-UDPv4 locators");
+        TEST_ASSERT(memcmp(shmParsed.guidPrefix, part.getGuidPrefix(), 12)==0,
+                    "SPDP non-UDPv4 locators still yield guidPrefix");
+        TEST_ASSERT(shmParsed.metatrafficPort == 0 && shmParsed.userDataPort == 0 &&
+                        shmParsed.ipAddr == 0,
+                    "SPDP ignores ports/address from non-UDPv4 locators");
     }
 
     //=================================================================
