@@ -21,7 +21,7 @@ Zenoh firmware backend, build selector or measured ESP32 footprint.
 | Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Build selection done: Kconfig picks RTPS (default) or Zenoh, both ESP32-S3 images build and link only their own backend. The Zenoh SysMod connects, declares its node token and answers interests; DeviceManager auto-publish for it awaits the shared extraction of the device plumbing. Neither image run against a router yet. |
-| Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
+| Z4-Z6: parity and release | Publish parity reached: both builds auto-publish bus devices through one pipeline, verified on hardware, with reconnect proven. Subscriptions, `/chatter`, ROS-tooling verification over Zenoh and resource budgets remain. |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -221,6 +221,59 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Zenoh Publishes Devices, Verified on Hardware (2026-09-25)
+
+The auto-publish pipeline now lives in
+[AutoPubDeviceSource](../components/RaftROS/AutoPub/AutoPubDeviceSource.h),
+templated on the backend, so both builds publish DeviceManager devices through
+one copy of the code: DeviceManager listening, class mapping, QoS overrides,
+decode on the bus task, the generation-safe mailbox, and serialise-and-publish
+on the loop task. The RTPS SysMod keeps only what is RTPS - announce each
+writer to each discovered participant, dispose it at each peer - supplied as
+hooks, and loses ~600 lines. Zenoh needs no hooks: one token, fanned out by the
+router.
+
+**A layering bug the Zenoh build exposed.** The shared descriptor carried a
+DDS-mangled topic (`rt/raft/range_1_29`). That is an RTPS wire convention;
+Zenoh rejected it as not a ROS path, so a device that attached fine on RTPS was
+refused on Zenoh with "backend full". The descriptor now carries the ROS name
+(`/raft/range_1_29`) and the RTPS backend adds the `rt` prefix when it
+announces. Worth noting because host tests could not have caught it - both
+sides agreed with each other, and only a second backend disagreed.
+
+Hardware (ESP32-S3 Feather, VL6180 at 0x29, router stand-in on another host):
+
+| Check | Result |
+| --- | --- |
+| Zenoh session, node token, endpoint token | type hash and QoS correct on the wire |
+| Interest replies | both tokens re-declared against the interest id, then final |
+| Samples | `range=0.016 m`, ~5 Hz, no sequence gaps |
+| Session drop (tool restarted) | both tokens re-declared on the new session, resumed at the next sequence |
+| Real Zenoh library as router | 194 samples in 40 s; both liveliness tokens visible and queryable |
+| RTPS, same board | `ros2 topic list` shows `/raft/range_1_29`, `ros2 topic echo` gives `range: 0.016` |
+| Loop budget | RaftROS ~500 us average, ~2.3 ms max |
+
+A Zenoh **peer** accepts the session and forwards samples but does not retain
+liveliness tokens, so the node and its publishers are invisible to a ROS graph
+even while data flows. Router mode retains them. `rmw_zenohd` runs as a router;
+[tools/zenoh_subscriber_demo.py](../tools/zenoh_subscriber_demo.py) now does
+too. `@ros2_lv` is a verbatim chunk, so a liveliness pattern has to name it -
+`**` alone does not match.
+
+- Tools: [zenoh_router_stub.py](../tools/zenoh_router_stub.py) (speaks the wire
+  protocol, no dependencies) and
+  [zenoh_subscriber_demo.py](../tools/zenoh_subscriber_demo.py) (real Zenoh
+  library, so it also proves Zenoh accepts what the firmware sends).
+  The example README has the demo steps for both, and for `rmw_zenohd`.
+- Tests: **1028 passed, 0 failed**.
+- Remaining parity gap: the Zenoh build does not subscribe, and has no
+  `/chatter` publisher. Subscriptions need a `DeclareSubscriber` on the wire
+  and an incoming-sample path, neither of which `ZenohNetworkMessage` has yet.
+  Not verified with ROS 2 tooling over Zenoh: `rmw_zenoh` is not installed on
+  the ROS host (`sudo apt install ros-jazzy-rmw-zenoh-cpp`), so `ros2 node
+  list` over Zenoh is still unproven - the liveliness tokens ROS discovery
+  reads are correct and queryable, but that is one step short.
 
 ### Z3: One Backend Per Image, and the Zenoh SysMod (2026-09-25)
 
