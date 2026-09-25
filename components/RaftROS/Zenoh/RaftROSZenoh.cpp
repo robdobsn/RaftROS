@@ -99,6 +99,19 @@ void RaftROS::setup()
     deps.nodeName = _nodeName.c_str();
     _autoPubBackend.setup(deps);
 
+    // Auto-publish every bus device DeviceManager reports, through the same
+    // pipeline the RTPS build uses.  Endpoints created while the session is
+    // down are staged by the backend and declared once it is up.
+    if (_autoPubSource.setup(_autoPubBackend, getSysManager(),
+                             configGetString("qosProfiles", "{}").c_str()))
+    {
+        LOG_I(MODULE_PREFIX, "setup auto-publish listener registered with DeviceManager");
+    }
+    else
+    {
+        LOG_W(MODULE_PREFIX, "setup no DeviceManager - auto-publishing disabled");
+    }
+
     LOG_I(MODULE_PREFIX, "setup backend=zenoh router=%s:%u domain=%u node=%s%s session=%s",
           _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_domainId,
           _nodeNamespace.c_str(), _nodeName.c_str(), _sessionIdStr);
@@ -142,6 +155,11 @@ void RaftROS::loop()
     if (!_isEnabled)
         return;
     const uint32_t nowMs = millis();
+
+    // Emit the latest sample of every device whose bus callback has stored one
+    // since the previous pass.  Runs in every state, as the RTPS build does:
+    // with no session nothing is sent, but nothing backs up either.
+    _autoPubSource.drainSamples();
 
     switch (_connState)
     {
@@ -515,7 +533,7 @@ String RaftROS::getStatusJSON() const
     char buf[320];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
-             R"("conn":"%s","sessions":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,"intRefused":%u})",
+             R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,"intRefused":%u})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -523,6 +541,7 @@ String RaftROS::getStatusJSON() const
              _routerHost.c_str(), (unsigned)_routerPort,
              stStr,
              (unsigned)_sessionCount,
+             (unsigned)_autoPubSource.attachedCount(),
              (unsigned)_autoPubBackend.inUseCount(),
              (unsigned)_autoPubBackend.pendingCount(),
              (unsigned)stats.published,

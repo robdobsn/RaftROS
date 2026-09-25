@@ -24,6 +24,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
 #include <vector>
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -85,7 +86,14 @@ public:
             return INVALID_SLOT;
         const RTPSDynamicWriterKey key{desc.deviceId.busNum, desc.deviceId.address, desc.deviceId.subIndex};
         uint8_t entityId[4] = {0};
-        const int slot = _lifecycle.attach(key, desc.topic, desc.type, entityId,
+        // ROS topic -> DDS topic: ROS 2 puts user topics under "rt".  The
+        // descriptor carries the ROS name because the other backend mangles it
+        // differently, so the prefix is applied here.
+        char ddsTopic[AUTOPUB_TOPIC_BUF_LEN];
+        if (std::snprintf(ddsTopic, sizeof(ddsTopic), "rt%s%s",
+                          desc.topic[0] == '/' ? "" : "/", desc.topic) >= (int)sizeof(ddsTopic))
+            return INVALID_SLOT;
+        const int slot = _lifecycle.attach(key, ddsTopic, desc.type, entityId,
                                            static_cast<uint8_t>(desc.qosProfileId));
         return (slot < 0) ? INVALID_SLOT : (uint8_t)slot;
     }
