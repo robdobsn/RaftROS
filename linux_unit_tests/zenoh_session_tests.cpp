@@ -6,6 +6,7 @@
 #include "Zenoh/ZenohStreamFramer.h"
 #include "Zenoh/ZenohTCPSession.h"
 #include "Zenoh/ZenohNetworkMessage.h"
+#include <cstring>
 
 #define TEST_ASSERT(cond, msg) do { if (!(cond)) { std::printf("  FAIL: %s\n", msg); ++failCount; } else { ++passCount; } } while (false)
 
@@ -538,6 +539,192 @@ int main()
     TEST_ASSERT(sendPayload(restarted, {0x23, 1}, 6005) && restarted.closeReason() == 1 &&
                 restarted.start(identity, 7000) && restarted.closeReason() == 0,
                 "restart from remote CLOSE clears its reason");
+    std::printf("Test: subscriber declarations and inbound samples\n");
+    {
+        using Message = RaftRuntime::Zenoh::ZenohNetworkMessage;
+        uint8_t buffer[512];
+
+        // Declaring a subscriber is the same shape as declaring a token, with
+        // body id 2; readDiscovery is the parser a peer would use on it
+        const size_t declared = Message::declareSubscriber(buffer, sizeof(buffer), 5, "0/raft/range_1_29/**");
+        Message::DiscoveryMessage parsed;
+        TEST_ASSERT(declared > 0 && Message::readDiscovery(buffer, declared, parsed) == declared,
+                    "subscriber declaration parses back");
+        TEST_ASSERT(parsed.declaration == 2 && parsed.id == 5 && parsed.key == "0/raft/range_1_29/**",
+                    "subscriber declaration carries body id 2, the subscriber id and the full key");
+        TEST_ASSERT(!parsed.hasInterestId, "an unsolicited declaration carries no interest id");
+
+        const uint32_t interestId = 9;
+        const size_t replied = Message::declareSubscriber(buffer, sizeof(buffer), 5, "0/raft/x/**", &interestId);
+        TEST_ASSERT(replied > 0 && Message::readDiscovery(buffer, replied, parsed) == replied &&
+                    parsed.hasInterestId && parsed.interestId == 9,
+                    "a subscriber declared in reply to an interest carries its id");
+
+        TEST_ASSERT(Message::declareSubscriber(buffer, sizeof(buffer), 5, "") == 0 &&
+                    Message::declareSubscriber(buffer, sizeof(buffer), 5, "trailing/") == 0,
+                    "an unusable key is refused rather than sent");
+        TEST_ASSERT(Message::declareSubscriber(buffer, 3, 5, "0/raft/x") == 0,
+                    "a declaration that would not fit is refused");
+
+        const size_t withdrawn = Message::undeclareSubscriber(buffer, sizeof(buffer), 5);
+        TEST_ASSERT(withdrawn > 0 && Message::readDiscovery(buffer, withdrawn, parsed) == withdrawn &&
+                    parsed.declaration == 3 && parsed.id == 5,
+                    "withdrawing a subscriber names body id 3 and the subscriber id");
+
+        // Inbound samples: what we send is what a peer sends us, so a put()
+        // round-trips through readSample
+        const uint8_t payload[] = {0x00, 0x01, 0x00, 0x00, 0x2a, 0x00, 0x00, 0x00};
+        const uint8_t attachment[] = {1, 2, 3, 4};
+        const size_t sent = Message::put(buffer, sizeof(buffer), "0/raft/range_1_29/type/hash",
+                                         payload, sizeof(payload), attachment, sizeof(attachment));
+        Message::SampleMessage sample;
+        TEST_ASSERT(sent > 0 && Message::readSample(buffer, sent, sample) == sent,
+                    "a sample parses back");
+        TEST_ASSERT(sample.key == "0/raft/range_1_29/type/hash" && sample.keyId == 0,
+                    "a sample sent with a full key reports no key id");
+        TEST_ASSERT(sample.payload.size() == sizeof(payload) &&
+                    std::memcmp(sample.payload.data(), payload, sizeof(payload)) == 0,
+                    "sample payload is borrowed intact");
+        TEST_ASSERT(sample.attachment.size() == sizeof(attachment) &&
+                    std::memcmp(sample.attachment.data(), attachment, sizeof(attachment)) == 0,
+                    "sample attachment is borrowed intact");
+
+        uint8_t bareBuffer[128];
+        const size_t bare = Message::put(bareBuffer, sizeof(bareBuffer), "0/raft/x", payload, sizeof(payload), nullptr, 0);
+        TEST_ASSERT(bare > 0 && Message::readSample(bareBuffer, bare, sample) == bare && sample.attachment.empty(),
+                    "a sample without an attachment parses with an empty one");
+
+        bool everyTruncationRejected = true;
+        for (size_t truncated = 1; truncated < sent; ++truncated)
+            everyTruncationRejected &= Message::readSample(buffer, truncated, sample) == 0;
+        TEST_ASSERT(everyTruncationRejected, "every truncation of a sample is rejected");
+        const uint8_t notASample[] = {0x1e, 0x07, 0x01};
+        TEST_ASSERT(Message::readSample(notASample, sizeof(notASample), sample) == 0,
+                    "a declaration is not read as a sample");
+        // Key expression id 0 with no literal key identifies nothing
+        const uint8_t noKey[] = {0x1d, 0x00, 0x01, 0x01, 0x00};
+        TEST_ASSERT(Message::readSample(noKey, sizeof(noKey), sample) == 0,
+                    "a sample that names neither a key nor a declared id is refused");
+    }
+
+    std::printf("Test: a clock that goes backwards does not expire a live session\n");
+    {
+        Session session;
+        establish(session);
+        session.consumeOutput(session.outputSize(), 5000);
+        // Received at 5000, then serviced with an earlier time: subtracting
+        // would wrap to an enormous age and drop a session that is perfectly
+        // healthy.  This cost a device its router connection on every publish
+        // that ran before the clock was refreshed.
+        session.service(0);
+        TEST_ASSERT(session.state() == Session::State::Established,
+                    "servicing with a time before the last receive keeps the session");
+        const uint8_t message[] = {0x1e, 0x1a};
+        TEST_ASSERT(session.sendNetworkMessage(message, sizeof(message), 0) &&
+                    session.state() == Session::State::Established,
+                    "sending with a stale clock still works");
+        session.consumeOutput(session.outputSize(), 5000);
+        session.service(5000 + 20000);
+        TEST_ASSERT(session.state() == Session::State::Failed &&
+                    session.error() == Session::Error::LeaseExpired,
+                    "a genuinely expired lease still fails the session");
+    }
+
+    std::printf("Test: a sample captured from a real Zenoh router\n");
+    {
+        // Recorded off the wire from zenoh 1.8.0 publishing std_msgs/String to
+        // a subscribing device.  A real Put carries extensions this parser does
+        // not use (a timestamp among them), encoded three different ways -
+        // reading them wrongly cost a session, so the exact bytes are the test.
+        const uint8_t captured[] = {
+        0x7d, 0x00, 0x71, 0x30, 0x2f, 0x63, 0x68, 0x61, 0x74, 0x74, 0x65, 0x72,
+        0x5f, 0x69, 0x6e, 0x2f, 0x73, 0x74, 0x64, 0x5f, 0x6d, 0x73, 0x67, 0x73,
+        0x3a, 0x3a, 0x6d, 0x73, 0x67, 0x3a, 0x3a, 0x64, 0x64, 0x73, 0x5f, 0x3a,
+        0x3a, 0x53, 0x74, 0x72, 0x69, 0x6e, 0x67, 0x5f, 0x2f, 0x52, 0x49, 0x48,
+        0x53, 0x30, 0x31, 0x5f, 0x64, 0x66, 0x36, 0x36, 0x38, 0x63, 0x37, 0x34,
+        0x30, 0x34, 0x38, 0x32, 0x62, 0x62, 0x64, 0x34, 0x38, 0x66, 0x62, 0x33,
+        0x39, 0x64, 0x37, 0x36, 0x61, 0x37, 0x30, 0x64, 0x66, 0x64, 0x34, 0x62,
+        0x64, 0x35, 0x39, 0x64, 0x62, 0x31, 0x32, 0x38, 0x38, 0x30, 0x32, 0x31,
+        0x37, 0x34, 0x33, 0x35, 0x30, 0x33, 0x32, 0x35, 0x39, 0x65, 0x39, 0x34,
+        0x38, 0x66, 0x36, 0x62, 0x31, 0x61, 0x31, 0x38, 0xa1, 0xb0, 0x97, 0x86,
+        0xd4, 0xf4, 0xcc, 0xa6, 0xdb, 0x6a, 0x10, 0xa2, 0xe3, 0x62, 0x94, 0xfd,
+        0x14, 0x31, 0xa2, 0x1f, 0x48, 0x34, 0x5f, 0x56, 0x0b, 0x61, 0xd9, 0x43,
+        0x21, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x6c, 0x23,
+        0xc6, 0xa2, 0x9b, 0xd8, 0x18, 0x10, 0x00, 0x01, 0x02, 0x03, 0x04, 0x05,
+        0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x16, 0x00,
+        0x01, 0x00, 0x00, 0x0e, 0x00, 0x00, 0x00, 0x68, 0x65, 0x6c, 0x6c, 0x6f,
+        0x20, 0x7a, 0x65, 0x6e, 0x6f, 0x68, 0x20, 0x30, 0x00
+        };
+        RaftRuntime::Zenoh::ZenohNetworkMessage::SampleMessage sample;
+        const size_t consumed = RaftRuntime::Zenoh::ZenohNetworkMessage::readSample(
+            captured, sizeof(captured), sample);
+        TEST_ASSERT(consumed == sizeof(captured), "a real router's sample parses completely");
+        TEST_ASSERT(sample.key ==
+            "0/chatter_in/std_msgs::msg::dds_::String_/"
+            "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18",
+            "the sample's key survives the extensions around it");
+        TEST_ASSERT(sample.attachment.size() == 33 &&
+                    static_cast<uint8_t>(sample.attachment[0]) == 1 &&
+                    static_cast<uint8_t>(sample.attachment[16]) == 16,
+                    "the attachment is found among extensions of other encodings");
+        // std_msgs/String CDR: encapsulation header, length including the NUL,
+        // then the text.  Checked here rather than through the decoder so this
+        // suite keeps its single dependency on the Zenoh headers.
+        const char expectedPayload[] = "\x00\x01\x00\x00\x0e\x00\x00\x00hello zenoh 0";
+        TEST_ASSERT(sample.payload.size() == 22 &&
+                    std::memcmp(sample.payload.data(), expectedPayload, 21) == 0 &&
+                    sample.payload.back() == '\0',
+                    "the payload is the std_msgs/String that was published");
+    }
+
+    std::printf("Test: samples reach the session's handler\n");
+    {
+        uint8_t buffer[256];
+        const uint8_t payload[] = {0x00, 0x01, 0x00, 0x00, 0x07};
+        const size_t putLen = RaftRuntime::Zenoh::ZenohNetworkMessage::put(
+            buffer, sizeof(buffer), "0/raft/range_1_29/type/hash", payload, sizeof(payload), nullptr, 0);
+        std::vector<uint8_t> frame{0x25, 37};
+        frame.insert(frame.end(), buffer, buffer + putLen);
+
+        struct Capture { int count = 0; std::string key; bool accept = true; } capture;
+        Session receiver;
+        establish(receiver);
+        receiver.consumeOutput(receiver.outputSize(), 3);
+        std::vector<uint8_t> wire{static_cast<uint8_t>(frame.size()), static_cast<uint8_t>(frame.size() >> 8)};
+        wire.insert(wire.end(), frame.begin(), frame.end());
+        TEST_ASSERT(receiver.receive(wire.data(), wire.size(), 3, nullptr, &capture,
+                    [](void* context, const RaftRuntime::Zenoh::ZenohNetworkMessage::SampleMessage& sample) {
+                        auto* state = static_cast<Capture*>(context);
+                        ++state->count;
+                        state->key = std::string(sample.key);
+                        return state->accept;
+                    }),
+                    "a frame carrying a sample is accepted");
+        TEST_ASSERT(capture.count == 1 && capture.key == "0/raft/range_1_29/type/hash" &&
+                    receiver.sampleCount() == 1, "the sample reaches the handler with its key");
+
+        // A router may forward a sample we have no handler for; skipping it is
+        // not the same as the batch being malformed
+        Session ignoring;
+        establish(ignoring);
+        ignoring.consumeOutput(ignoring.outputSize(), 3);
+        TEST_ASSERT(ignoring.receive(wire.data(), wire.size(), 3) &&
+                    ignoring.state() == Session::State::Established && ignoring.sampleCount() == 1,
+                    "a sample with no handler installed is skipped, not treated as malformed");
+
+        Session refusing;
+        establish(refusing);
+        refusing.consumeOutput(refusing.outputSize(), 3);
+        capture.accept = false;
+        capture.count = 0;
+        TEST_ASSERT(!refusing.receive(wire.data(), wire.size(), 3, nullptr, &capture,
+                    [](void* context, const RaftRuntime::Zenoh::ZenohNetworkMessage::SampleMessage&) {
+                        ++static_cast<Capture*>(context)->count;
+                        return false;
+                    }) && refusing.state() == Session::State::Failed,
+                    "a handler that refuses a sample fails the session");
+    }
+
     std::printf("Zenoh session: %d passed, %d failed\n", passCount, failCount);
     return failCount == 0 ? 0 : 1;
 }

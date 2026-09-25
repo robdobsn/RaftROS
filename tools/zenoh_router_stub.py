@@ -62,15 +62,25 @@ class Reader:
         return self.take(self.number())
 
 
-def decode_range_sample(cdr):
-    """sensor_msgs/Range: header, radiation_type, field_of_view, min, max, range, variance.
+def decode_sample(key, payload):
+    """Summarise a sample using the type named in its key.
 
-    `variance` was added in ROS 2 Jazzy and is last, so the reading is the
-    float before it.  Returns None for anything that is not a CDR payload.
+    A ROS 2 Zenoh key ends with the wire type and its hash, so the payload can
+    be decoded without any prior knowledge of the topic.
     """
-    if len(cdr) < 12 or cdr[:4] != b"\x00\x01\x00\x00":
-        return None
-    return struct.unpack("<f", cdr[-8:-4])[0]
+    data = bytes(payload)
+    if len(data) < 8 or data[:4] != b"\x00\x01\x00\x00":
+        return "%d bytes (not CDR)" % len(data)
+    if "::Range_" in key:
+        # header, radiation_type, field_of_view, min, max, range, variance -
+        # variance was added in Jazzy and is last, so the reading precedes it
+        if len(data) >= 12:
+            return "range=%.4f m" % struct.unpack("<f", data[-8:-4])[0]
+    if "::String_" in key:
+        size = struct.unpack("<I", data[4:8])[0]
+        if 0 < size <= len(data) - 8:
+            return '"%s"' % data[8:8 + size - 1].decode("utf-8", "replace")
+    return "%d bytes" % len(data)
 
 
 class Session:
@@ -169,7 +179,10 @@ class Session:
                 print("declarations complete%s" %
                       ("" if correlation is None else " for interest %d" % correlation), flush=True)
             else:
-                print("unexpected declaration body 0x%02x" % declaration, flush=True)
+                # Unknown declaration: dump it so the exact wire format of a
+                # reference implementation can be read off rather than guessed
+                print("DECLARATION body 0x%02x raw=%s" %
+                      (declaration, payload.hex()), flush=True)
         elif header == 0x3d:
             reader.number()
             key = reader.blob().decode("ascii", "replace")
@@ -182,12 +195,11 @@ class Session:
             count = self.sample_counts.get(key, 0) + 1
             self.sample_counts[key] = count
             sequence_number = struct.unpack_from("<q", attachment)[0] if len(attachment) >= 8 else -1
-            reading = decode_range_sample(cdr)
-            summary = "range=%.4f m" % reading if reading is not None else "%d bytes" % len(cdr)
+            summary = decode_sample(key, cdr)
             if verbose or count <= 3 or count % 20 == 0:
                 print("PUT #%d seq=%d %s\n    %s" % (count, sequence_number, summary, key), flush=True)
         else:
-            print("unexpected network message 0x%02x" % header, flush=True)
+            print("MESSAGE 0x%02x raw=%s" % (header, payload.hex()), flush=True)
 
 
 def serve(port, interest, verbose):

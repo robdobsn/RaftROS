@@ -23,6 +23,11 @@ public:
                        SequenceMismatch, DiscoveryRejected };
     using DiscoveryCallback = bool (*)(void*, const ZenohNetworkMessage::DiscoveryMessage&);
 
+    /// @brief Called for each sample a peer sends us, on the receive path.
+    /// The message borrows the receive buffer, so a handler that needs the
+    /// data later must copy it.  Returning false fails the session.
+    using SampleCallback = bool (*)(void*, const ZenohNetworkMessage::SampleMessage&);
+
     bool start(const std::array<uint8_t, 16>& identity, uint64_t nowMs)
     {
         if (_state == State::AwaitInitAck || _state == State::AwaitOpenAck || _state == State::Established)
@@ -35,7 +40,7 @@ public:
         _sequenceBits = 32;
         _closeReason = 0;
         _remoteLeaseMs = _remoteInitialSequence = 0;
-        _keepAlivesReceived = _frameCount = _discoveryCount = 0;
+        _keepAlivesReceived = _frameCount = _discoveryCount = _sampleCount = 0;
         _rxSequence.fill(0);
         _txSequence = 0;
         _stageStartedMs = _lastRxMs = _lastTxMs = _queuedAtMs = nowMs;
@@ -60,7 +65,8 @@ public:
     }
 
     bool receive(const uint8_t* bytes, size_t length, uint64_t nowMs,
-                 DiscoveryCallback onDiscovery = nullptr, void* context = nullptr)
+                 DiscoveryCallback onDiscovery = nullptr, void* context = nullptr,
+                 SampleCallback onSample = nullptr)
     {
         service(nowMs);
         if (!active())
@@ -74,7 +80,7 @@ public:
                 return fail(Error::InvalidBatch);
             if (result == ZenohStreamFramer<BATCH_CAPACITY>::Result::Complete)
             {
-                if (_framer.size() > _negotiatedBatch || !processBatch(nowMs, onDiscovery, context))
+                if (_framer.size() > _negotiatedBatch || !processBatch(nowMs, onDiscovery, context, onSample))
                 {
                     if (_state != State::Failed)
                         fail(Error::InvalidBatch);
@@ -98,18 +104,21 @@ public:
                 fail(Error::HandshakeTimeout);
             return;
         }
-        if (nowMs - _lastRxMs >= _remoteLeaseMs)
+        // Ordered comparison, not a subtraction: a caller that passes a time
+        // earlier than our last receive must not underflow into an expired
+        // lease and drop a healthy session
+        if (nowMs >= _lastRxMs && nowMs - _lastRxMs >= _remoteLeaseMs)
         {
             fail(Error::LeaseExpired);
             return;
         }
         if (outputSize() != 0)
         {
-            if (nowMs - _queuedAtMs >= LOCAL_LEASE_MS)
+            if (nowMs >= _queuedAtMs && nowMs - _queuedAtMs >= LOCAL_LEASE_MS)
                 fail(Error::SendStalled);
             return;
         }
-        if (nowMs - _lastTxMs >= LOCAL_LEASE_MS / 4)
+        if (nowMs >= _lastTxMs && nowMs - _lastTxMs >= LOCAL_LEASE_MS / 4)
         {
             beginOutput();
             appendByte(0x04);
@@ -164,6 +173,7 @@ public:
     uint32_t keepAlivesReceived() const { return _keepAlivesReceived; }
     uint32_t frameCount() const { return _frameCount; }
     uint32_t discoveryCount() const { return _discoveryCount; }
+    uint32_t sampleCount() const { return _sampleCount; }
     uint8_t closeReason() const { return _closeReason; }
 
 private:
@@ -347,7 +357,8 @@ private:
         return true;
     }
 
-    bool processBatch(uint64_t nowMs, DiscoveryCallback onDiscovery, void* context)
+    bool processBatch(uint64_t nowMs, DiscoveryCallback onDiscovery, void* context,
+                      SampleCallback onSample = nullptr)
     {
         Reader reader(_framer.data(), _framer.size());
         while (reader.remaining() != 0)
@@ -393,6 +404,21 @@ private:
                 bool hasMessage = false;
                 while (reader.remaining() && (reader.current()[0] & 0x1f) >= 0x10)
                 {
+                    if ((reader.current()[0] & 0x1f) == 0x1d)
+                    {
+                        // A sample.  Parsed even with no handler installed, so
+                        // that anything the router forwards unasked is skipped
+                        // rather than treated as a malformed batch.
+                        ZenohNetworkMessage::SampleMessage sample;
+                        const size_t consumed = ZenohNetworkMessage::readSample(reader.current(), reader.remaining(), sample);
+                        if (!consumed || !reader.skip(consumed))
+                            return fail(Error::MalformedMessage);
+                        hasMessage = true;
+                        ++_sampleCount;
+                        if (onSample && !onSample(context, sample))
+                            return fail(Error::DiscoveryRejected);
+                        continue;
+                    }
                     ZenohNetworkMessage::DiscoveryMessage message;
                     const size_t consumed = ZenohNetworkMessage::readDiscovery(reader.current(), reader.remaining(), message);
                     if (!consumed || !reader.skip(consumed))
@@ -420,7 +446,7 @@ private:
     uint16_t _negotiatedBatch = BATCH_CAPACITY;
     uint8_t _sequenceBits = 32, _closeReason = 0;
     uint64_t _stageStartedMs = 0, _lastRxMs = 0, _lastTxMs = 0, _queuedAtMs = 0, _remoteLeaseMs = 0;
-    uint32_t _remoteInitialSequence = 0, _keepAlivesReceived = 0, _frameCount = 0, _discoveryCount = 0;
+    uint32_t _remoteInitialSequence = 0, _keepAlivesReceived = 0, _frameCount = 0, _discoveryCount = 0, _sampleCount = 0;
     std::array<uint32_t, 2> _rxSequence{};
     uint32_t _txSequence = 0;
 };

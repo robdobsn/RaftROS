@@ -21,7 +21,7 @@ Zenoh firmware backend, build selector or measured ESP32 footprint.
 | Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Build selection done: Kconfig picks RTPS (default) or Zenoh, both ESP32-S3 images build and link only their own backend. The Zenoh SysMod connects, declares its node token and answers interests; DeviceManager auto-publish for it awaits the shared extraction of the device plumbing. Neither image run against a router yet. |
-| Z4-Z6: parity and release | Publish parity reached: both builds auto-publish bus devices through one pipeline, verified on hardware, with reconnect proven. Subscriptions, `/chatter`, ROS-tooling verification over Zenoh and resource budgets remain. |
+| Z4-Z6: parity and release | Feature parity reached: both builds auto-publish bus devices, publish `/chatter` and subscribe to strings through one pipeline and one application API, verified on hardware with reconnect proven. ROS-tooling verification over Zenoh (needs `rmw_zenoh` installed), QoS coverage and resource budgets remain. |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -221,6 +221,67 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Zenoh Reaches Parity: Subscriptions and /chatter (2026-09-25)
+
+The Zenoh build now does everything the RTPS build does, through the same
+application API, and the example compiles unchanged on both - nothing in it is
+conditional on the transport.
+
+- **Subscriptions.** `ZenohNetworkMessage` gained `declareSubscriber` /
+  `undeclareSubscriber` (declaration body id 2, the same shape as a token) and
+  `readSample`, and `ZenohTCPSession` delivers inbound samples to a handler.
+  The SysMod declares a subscriber plus an `MS` liveliness token per topic, and
+  takes either a ROS name (`/chatter_in`) or the DDS form the RTPS build takes
+  (`rt/chatter_in`). The handler signature matches RTPS exactly: Zenoh carries a
+  16-byte publisher GID in the sample, split the way a DDS GUID is - last four
+  bytes as the entity id, first twelve as the participant prefix.
+- **`/chatter`.** A 1 Hz `std_msgs/String`, created through the backend as a
+  device endpoint is, so there is something to echo with no sensor attached.
+- `AutoPubStringMessage.h` holds the CDR decode both builds use;
+  `RTPSUserDispatch` keeps its names as aliases.
+- A subscription key needs wildcards, so `validKey` grew an `allowWildcards`
+  argument - a publication still refuses them, where a wildcard is a mistake
+  rather than a pattern.
+
+**Two bugs worth recording.**
+
+1. *The Put body is not just extensions.* Reading a real router's sample failed
+   and cost the session every time one arrived. A zenoh `Put` carries a
+   timestamp (flag `T`) and an encoding (flag `E`) as body fields **before** its
+   extensions, and extensions come in three encodings (unit, varint,
+   length-prefixed buffer) that cannot be skipped without decoding which is
+   which. The fix was read off the wire: `tshark` on the router host, then the
+   `zenoh-codec` source for `put.rs`. The captured 201-byte sample is now a
+   test, so the next change to that parser is checked against a real router's
+   bytes rather than our own writer's.
+2. *A publish with a stale clock killed the session.* `publish()` has no time
+   argument - the shared pipeline that calls it is transport-neutral - so the
+   backend used the clock `service()` last saw. `/chatter` publishes on its own
+   schedule, so it published with a clock of 0, and the session's lease check
+   subtracted that from its last receive, wrapped, and declared the lease
+   expired. Fixed on both sides: the backend takes `setNow()` every pass, and
+   the session's lease and keepalive checks compare rather than subtract.
+   Neither suite caught this, so both halves now have a regression test.
+
+Hardware (ESP32-S3 Feather, VL6180, real Zenoh router and ROS 2 Jazzy):
+
+| Check | Zenoh | RTPS |
+| --- | --- | --- |
+| Device topic | `range=0.0160 m`, ~4 Hz, 194 samples in 45 s | `ros2 topic echo` gives `range: 0.016` |
+| `/chatter` | `"Hello from raft_esp32 [35]"`, 40 in 45 s | as before |
+| Subscription | all 6 published strings received, GID split as RTPS presents it | `ros2 topic pub /chatter_in` received |
+| Graph tokens | node, publisher and subscription tokens all visible and queryable | SEDP as before |
+| Example code | unchanged between the two builds | unchanged |
+
+- App image: Zenoh 1256528 B, RTPS 1268464 B.
+- Tests: **1028** unit, **2218** codec, **1271** session, **138** Zenoh firmware
+  pieces - 0 failed.
+- Still open: `ros2 node list` over Zenoh is unproven because `rmw_zenoh` is not
+  installed on the ROS host (`sudo apt install ros-jazzy-rmw-zenoh-cpp`); the
+  liveliness tokens it reads are correct and queryable, but that is one step
+  short of the ROS tools themselves. Our `rmw` version string says 0.2.11 while
+  Jazzy currently packages 0.2.10.
 
 ### Zenoh Publishes Devices, Verified on Hardware (2026-09-25)
 

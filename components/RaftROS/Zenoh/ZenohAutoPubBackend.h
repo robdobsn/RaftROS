@@ -204,6 +204,16 @@ public:
         return AutoPubPublishResult::Accepted;
     }
 
+    /// @brief Tell the backend what the time is, without doing any work.
+    ///
+    /// publish() has no time argument - the shared pipeline that calls it is
+    /// transport-neutral - so the backend carries the clock service() last saw.
+    /// A caller that may publish without having serviced first must call this
+    /// every pass: publishing with a stale clock hands the session a time
+    /// earlier than its last receive, and its lease check reads that as a lease
+    /// that expired long ago.
+    void setNow(uint64_t nowMs) { _nowMs = nowMs; }
+
     /// @brief Send at most one staged declaration or undeclaration.  Call once
     /// per loop from the task that owns the session: the session carries one
     /// outbound message at a time, so staged work is sent round-robin from a

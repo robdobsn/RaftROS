@@ -109,6 +109,25 @@ inline const char* AutoPubClassMap_typeName(AutoPubMsgKind kind)
     }
 }
 
+/// @brief Reverse of AutoPubClassMap_typeName: the message kind that publishes
+/// a given ROS 2 wire type name.  Used where a caller names a type rather than
+/// a kind (for example an application subscribing to a topic).
+/// @return the kind, or Unknown if no kind publishes that type.  Imu is
+///         returned for the type Accel also maps to.
+inline AutoPubMsgKind AutoPubClassMap_kindForTypeName(const char* typeName)
+{
+    if (!typeName || !*typeName)
+        return AutoPubMsgKind::Unknown;
+    for (uint8_t value = (uint8_t)AutoPubMsgKind::Imu; value <= (uint8_t)AutoPubMsgKind::String; ++value)
+    {
+        const AutoPubMsgKind kind = (AutoPubMsgKind)value;
+        const char* candidate = AutoPubClassMap_typeName(kind);
+        if (candidate && std::strcmp(candidate, typeName) == 0)
+            return kind;
+    }
+    return AutoPubMsgKind::Unknown;
+}
+
 /// @brief ROS 2 type description hash (REP-2011 "RIHS01_...") for a message
 /// kind.  Zenoh topic keys embed this hash, so a wrong value silently stops
 /// subscribers matching.  Values are the `type_hashes` entries from the

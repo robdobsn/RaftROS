@@ -19,47 +19,22 @@
 #include <cstring>
 
 #include "CDRDecoder.h"
+#include "AutoPub/AutoPubStringMessage.h"
 
 namespace RaftRuntime::RTPS::Runtime::UserDispatch
 {
 
-// Outcome of decoding a DATA submessage payload as std_msgs/String.
-// `textLen` excludes the trailing null; `outBuf` is always null-terminated on success.
-struct RTPSStdMsgsStringDecodeResult
-{
-    bool success = false;
-    uint32_t textLen = 0;
-};
+// The decode itself is shared with the Zenoh build - an RTPS DATA payload and
+// a Zenoh sample payload are the same CDR bytes - so these are aliases of
+// AutoPub/AutoPubStringMessage.h and behave exactly as before.
+using RTPSStdMsgsStringDecodeResult = RaftRuntime::AutoPub::AutoPubStringDecodeResult;
 
-// Decode a `std_msgs::msg::String_` CDR-encapsulated payload.
-//
-// pPayload/payloadLen must cover the full DATA serialized payload, *including* the
-// 4-byte CDR encapsulation header (scheme + options). Returns success=true iff the
-// encapsulation header parses, the string length field fits, and the string content
-// is fully present in the buffer.
-//
-// outBuf must be non-null; content will be truncated (but still null-terminated)
-// if textLen+1 would exceed outBufLen.
+/// @brief Decode a `std_msgs::msg::String_` CDR-encapsulated payload
 inline RTPSStdMsgsStringDecodeResult decodeStdMsgsString(
     const uint8_t* pPayload, uint32_t payloadLen,
     char* outBuf, uint32_t outBufLen)
 {
-    RTPSStdMsgsStringDecodeResult res;
-    if (!pPayload || !outBuf || outBufLen == 0)
-        return res;
-
-    CDRDecoder dec;
-    dec.init(pPayload, payloadLen);
-    if (!dec.readEncapsulationHeader())
-        return res;
-
-    uint32_t strLen = 0;
-    if (!dec.readString(outBuf, outBufLen, strLen))
-        return res;
-
-    res.success = true;
-    res.textLen = strLen;
-    return res;
+    return RaftRuntime::AutoPub::AutoPubStringMessage_decode(pPayload, payloadLen, outBuf, outBufLen);
 }
 
 } // namespace RaftRuntime::RTPS::Runtime::UserDispatch

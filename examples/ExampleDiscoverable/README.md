@@ -69,7 +69,7 @@ linked.
 | Needs | nothing beyond the network | a reachable `rmw_zenohd`, and ROS 2 peers running `rmw_zenoh` |
 | App image | ~1268 kB | ~1251 kB |
 | Device auto-publish | yes | yes |
-| `/chatter` and string subscriptions | yes | not yet |
+| `/chatter` publisher and string subscriptions | yes | yes |
 
 Select Zenoh in `systypes/SysTypeMain/sdkconfig.defaults`:
 
@@ -100,8 +100,15 @@ tools:
 ros2 run rmw_zenoh_cpp rmw_zenohd            # the router
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 ros2 node list                               # expect /raft_esp32
+ros2 topic echo /chatter                     # expect one message a second
 ros2 topic echo /raft/range_1_29             # expect Range samples
+ros2 topic pub --once /chatter_in std_msgs/msg/String "{data: 'hello'}"
 ```
+
+The application code is the same either way: `MainSysMod` calls
+`addStringSubscription("rt/chatter_in", ...)` and gets the same handler
+arguments on both builds, so nothing in the example is conditional on the
+transport.
 
 With no router to hand, `tools/` has two stand-ins that need no ROS install:
 
@@ -116,15 +123,23 @@ python3 tools/zenoh_router_stub.py --interest
 python3 tools/zenoh_subscriber_demo.py
 ```
 
-Both print the device's node token, its per-endpoint token (topic, type and
-ROS type hash), and the samples. A device whose session drops re-declares
+Both print the device's node and per-endpoint tokens (topic, type and ROS
+type hash) and decode the samples by the type named in their key:
+
+```
+SAMPLE #1 "Hello from raft_esp32 [35]"
+    0/chatter/std_msgs::msg::dds_::String_/RIHS01_df668c74...
+SAMPLE #1 range=0.0170 m
+    0/raft/range_1_29/sensor_msgs::msg::dds_::Range_/RIHS01_b42b6256...
+```
+ A device whose session drops re-declares
 everything on the new session and carries on from the next sequence number, so
 restarting either tool is a fair test of reconnection.
 
 The SysMod's own view is on `GET /api/rosstat`:
 
 ```json
-{"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":1,"samples":9}
+{"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":2,"samples":204,"subs":2,"rxDropped":0}
 ```
 
 ## Configuration

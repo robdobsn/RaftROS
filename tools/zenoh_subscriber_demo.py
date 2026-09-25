@@ -25,12 +25,25 @@ import time
 import zenoh
 
 
-def decode_range(payload):
-    """sensor_msgs/Range in CDR: `variance` is last (Jazzy), `range` before it"""
+def decode_sample(key, payload):
+    """Summarise a sample using the type named in its key.
+
+    A ROS 2 Zenoh key ends with the wire type and its hash, so the payload can
+    be decoded without any prior knowledge of the topic.
+    """
     data = bytes(payload)
-    if len(data) < 12 or data[:4] != b"\x00\x01\x00\x00":
-        return None
-    return struct.unpack("<f", data[-8:-4])[0]
+    if len(data) < 8 or data[:4] != b"\x00\x01\x00\x00":
+        return "%d bytes (not CDR)" % len(data)
+    if "::Range_" in key:
+        # header, radiation_type, field_of_view, min, max, range, variance -
+        # variance was added in Jazzy and is last, so the reading precedes it
+        if len(data) >= 12:
+            return "range=%.4f m" % struct.unpack("<f", data[-8:-4])[0]
+    if "::String_" in key:
+        size = struct.unpack("<I", data[4:8])[0]
+        if 0 < size <= len(data) - 8:
+            return '"%s"' % data[8:8 + size - 1].decode("utf-8", "replace")
+    return "%d bytes" % len(data)
 
 
 def main():
@@ -66,9 +79,7 @@ def main():
             key = str(sample.key_expr)
             count = counts.get(key, 0) + 1
             counts[key] = count
-            reading = decode_range(sample.payload.to_bytes())
-            summary = "range=%.4f m" % reading if reading is not None else \
-                      "%d bytes" % len(sample.payload.to_bytes())
+            summary = decode_sample(key, sample.payload.to_bytes())
             if count <= 3 or count % 20 == 0:
                 print("SAMPLE #%d %s\n    %s" % (count, summary, key), flush=True)
 
