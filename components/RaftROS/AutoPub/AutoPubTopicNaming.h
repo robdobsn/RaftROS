@@ -10,12 +10,14 @@
 // these fallbacks is introduced in Slice 4.4 (AutoPubClassMap).
 //
 // The fallback topic format used until the class map is in place is:
-//     rt/raft/raw_<bus>_<addrHex>
+//     /raft/raw_<bus>_<addrHex>
 //
 // and the fallback type is:
 //     std_msgs::msg::dds_::String_
 //
-// ROS 2 convention: topic names on the wire are prefixed with "rt/"; type names
+// These are ROS topic names.  The "rt/" prefix DDS puts on the wire belongs to
+// the RTPS backend, not here - a Zenoh image would reject it as not a ROS path.
+// Type names
 // use the "<pkg>::msg::dds_::<Type>_" form (note the trailing underscore).
 //
 // Rob Dobson 2026
@@ -47,7 +49,9 @@ static constexpr const char* AUTOPUB_FALLBACK_TYPE =
 /// @param address       device address (printed as lowercase 2-hex)
 /// @return true on success, false if the output would not fit or inputs invalid
 ///
-/// Format: `rt/raft/<slug>_<bus>_<addrHex>`.  The legacy fallback formatter
+/// Format: `/raft/<slug>_<bus>_<addrHex>` - the ROS topic name, not a wire
+/// name.  Each backend applies its own convention to it: RTPS prefixes `rt`
+/// to get the DDS topic, Zenoh mangles it into a key expression.  The legacy fallback formatter
 /// (`AutoPubTopicNaming_formatFallbackTopic`) is now a thin wrapper that
 /// passes `"raw"` here, keeping the Slice 4.3 behaviour byte-for-byte.
 inline bool AutoPubTopicNaming_formatClassTopic(
@@ -58,7 +62,7 @@ inline bool AutoPubTopicNaming_formatClassTopic(
     if (!pOutBuf || outBufLen == 0 || !pSlug || !pSlug[0])
         return false;
     const int written = std::snprintf(pOutBuf, outBufLen,
-                                      "rt/raft/%s_%u_%02x",
+                                      "/raft/%s_%u_%02x",
                                       pSlug,
                                       (unsigned)busNum,
                                       (unsigned)(address & 0xFFu));

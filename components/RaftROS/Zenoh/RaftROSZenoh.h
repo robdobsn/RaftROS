@@ -15,9 +15,8 @@
 // per pass (one receive, one outbound message), so the SysMod stays inside the
 // Raft main-loop budget of 10 ms average / 50 ms worst case.
 //
-// Not yet here: DeviceManager auto-publish (the device plumbing is still inside
-// the RTPS SysMod and is being extracted behind the backend contract), and
-// subscriptions.
+// DeviceManager auto-publish works exactly as it does on the RTPS build - the
+// pipeline above the transport is shared.  Subscriptions are not here yet.
 //
 // Rob Dobson 2026
 //
@@ -31,6 +30,7 @@
 #endif
 
 #include "RaftSysMod.h"
+#include "AutoPub/AutoPubDeviceSource.h"
 #include "ZenohAutoPubBackend.h"
 #include "ZenohInterestMatch.h"
 #include "ZenohROSCodec.h"
@@ -96,8 +96,14 @@ private:
     NodeTokenState _nodeTokenState = NodeTokenState::PENDING;
     static const uint32_t NODE_TOKEN_ID = 1;
 
-    // Auto-publish backend (endpoint declarations and samples)
+    // Auto-publish backend (endpoint declarations and samples) and the shared
+    // pipeline that feeds it from DeviceManager.  Zenoh needs no hooks around
+    // an endpoint's life: a declaration is made once and the router fans it
+    // out, so there is no per-peer announce or dispose to do.
     RaftRuntime::Zenoh::ZenohAutoPubBackend _autoPubBackend;
+    RaftRuntime::AutoPub::AutoPubDeviceSource<
+        RaftRuntime::Zenoh::ZenohAutoPubBackend,
+        RaftRuntime::Zenoh::ZENOH_AUTOPUB_CAPACITY> _autoPubSource;
 
     /// @brief One router interest still being answered.  A reply is a run of
     /// token declarations followed by a final, all tagged with the interest id,

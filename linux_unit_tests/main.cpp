@@ -39,6 +39,7 @@
 #include "runtime/autopub/RTPSAutoPubTopicNaming.h"
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
+#include "runtime/autopub/RTPSAutoPubBackend.h"
 #include "AutoPub/AutoPubSampleRunner.h"
 #include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 #include "AutoPub/AutoPubPublisherPool.h"
@@ -2578,22 +2579,22 @@ int main()
             char buf[64];
             TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x38),
                         "topic format bus=1 addr=0x38 succeeds");
-            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_1_38") == 0,
-                        "topic format: I2C addr 0x38 -> 'rt/raft/raw_1_38'");
+            TEST_ASSERT(std::strcmp(buf, "/raft/raw_1_38") == 0,
+                        "topic format: I2C addr 0x38 -> '/raft/raw_1_38'");
 
             TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x6A),
                         "topic format bus=1 addr=0x6A succeeds");
-            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_1_6a") == 0,
+            TEST_ASSERT(std::strcmp(buf, "/raft/raw_1_6a") == 0,
                         "topic format: LSM6DS @0x6A -> lowercase hex");
 
             TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 2, 0x08),
                         "topic format bus=2 addr=0x08 succeeds");
-            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_2_08") == 0,
+            TEST_ASSERT(std::strcmp(buf, "/raft/raw_2_08") == 0,
                         "topic format: single-digit addr zero-padded to 2 hex");
 
             TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 0, 0),
                         "topic format bus=0 addr=0 succeeds");
-            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_0_00") == 0,
+            TEST_ASSERT(std::strcmp(buf, "/raft/raw_0_00") == 0,
                         "topic format: edge case bus=0 addr=0");
         }
 
@@ -2602,7 +2603,7 @@ int main()
             char buf[64];
             TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x1138),
                         "topic format: address masked to 8 bits");
-            TEST_ASSERT(std::strcmp(buf, "rt/raft/raw_1_38") == 0,
+            TEST_ASSERT(std::strcmp(buf, "/raft/raw_1_38") == 0,
                         "topic format: high bits of address stripped");
         }
 
@@ -2617,7 +2618,7 @@ int main()
 
         // ---- topic formatting: buffer-too-small leaves empty string --
         {
-            char tiny[6]; // less than "rt/raft/raw_1_38" + NUL = 17
+            char tiny[6]; // less than "/raft/raw_1_38" + NUL = 17
             std::memset(tiny, 'X', sizeof(tiny));
             TEST_ASSERT(!RTPSAutoPubTopicNaming_formatFallbackTopic(tiny, sizeof(tiny), 1, 0x38),
                         "topic format: short buffer rejected");
@@ -2661,11 +2662,40 @@ int main()
             int slot = life.attach({1, 0x6A}, topic, type);
             TEST_ASSERT(slot == 0,
                         "pipe: lifecycle accepts formatted fallback pair");
-            TEST_ASSERT(std::strcmp(life.topicForSlot(0), "rt/raft/raw_1_6a") == 0,
+            TEST_ASSERT(std::strcmp(life.topicForSlot(0), "/raft/raw_1_6a") == 0,
                         "pipe: lifecycle stores formatted fallback topic");
             TEST_ASSERT(std::strcmp(life.typeForSlot(0),
                                     "std_msgs::msg::dds_::String_") == 0,
                         "pipe: lifecycle stores formatted fallback type");
+        }
+
+        // ---- the "rt" prefix is the RTPS backend's, not the shared layer's ----
+        {
+            using RaftRuntime::AutoPub::AutoPubEndpointDesc;
+            using RaftRuntime::AutoPub::AutoPubMsgKind;
+            RTPSAutoPubBackend backend;
+            AutoPubEndpointDesc desc;
+            desc.deviceId = {1, 0x29, 0};
+            desc.msgKind = AutoPubMsgKind::Range;
+            desc.setNames("/raft/range_1_29", "sensor_msgs::msg::dds_::Range_");
+            const uint8_t slot = backend.createPublisher(desc);
+            TEST_ASSERT(slot != RTPSAutoPubBackend::INVALID_SLOT,
+                        "backend accepts a ROS topic name");
+            TEST_ASSERT(slot != RTPSAutoPubBackend::INVALID_SLOT &&
+                        std::strcmp(backend.lifecycle().topicForSlot(slot), "rt/raft/range_1_29") == 0,
+                        "RTPS announces the DDS name: a ROS topic gains the 'rt' prefix here, "
+                        "not in the descriptor a Zenoh image would reject");
+            backend.destroyPublisher(slot);
+
+            AutoPubEndpointDesc unprefixed;
+            unprefixed.deviceId = {1, 0x2A, 0};
+            unprefixed.msgKind = AutoPubMsgKind::Range;
+            unprefixed.setNames("raft/range_1_2a", "sensor_msgs::msg::dds_::Range_");
+            const uint8_t bare = backend.createPublisher(unprefixed);
+            TEST_ASSERT(bare != RTPSAutoPubBackend::INVALID_SLOT &&
+                        std::strcmp(backend.lifecycle().topicForSlot(bare), "rt/raft/range_1_2a") == 0,
+                        "a topic without a leading slash still gets exactly one separator");
+            backend.destroyPublisher(bare);
         }
     }
 
@@ -3832,7 +3862,7 @@ int main()
         const char* distClas[] = {"DIST"};
         auto plan = AutoPubAttachPlan_build(devId, distClas, 1, "VL6180", resolveQoS);
         TEST_ASSERT(!plan.excluded && plan.endpointCount == 1, "attach plan: single endpoint for DIST");
-        TEST_ASSERT(std::string(plan.endpoints[0].topic) == "rt/raft/range_1_29" &&
+        TEST_ASSERT(std::string(plan.endpoints[0].topic) == "/raft/range_1_29" &&
                         std::string(plan.endpoints[0].type) == "sensor_msgs::msg::dds_::Range_" &&
                         plan.endpoints[0].msgKind == AutoPubMsgKind::Range,
                     "attach plan: DIST topic/type/kind");
@@ -3872,7 +3902,7 @@ int main()
         auto fallback = AutoPubAttachPlan_build(devId, unknownClas, 1, "MysteryDev", resolveQoS);
         TEST_ASSERT(fallback.endpointCount == 1 &&
                         std::string(fallback.endpoints[0].type) == "std_msgs::msg::dds_::String_" &&
-                        std::string(fallback.endpoints[0].topic) == "rt/raft/raw_1_29",
+                        std::string(fallback.endpoints[0].topic) == "/raft/raw_1_29",
                     "attach plan: unknown class falls back to raw String topic");
 
         // No class tags at all still yields the fallback endpoint
@@ -3888,8 +3918,8 @@ int main()
         TEST_ASSERT(!desc.setNames(nullptr, nullptr) && !desc.setNames("", "t") &&
                         !desc.setNames("t", ""),
                     "endpoint desc: rejects null/empty names");
-        TEST_ASSERT(desc.setNames("rt/raft/range_1_29", "sensor_msgs::msg::dds_::Range_") &&
-                        desc.isValid() && std::string(desc.topic) == "rt/raft/range_1_29",
+        TEST_ASSERT(desc.setNames("/raft/range_1_29", "sensor_msgs::msg::dds_::Range_") &&
+                        desc.isValid() && std::string(desc.topic) == "/raft/range_1_29",
                     "endpoint desc: accepts and owns valid names");
     }
 

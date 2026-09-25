@@ -33,6 +33,7 @@
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubQoSProfile.h"
 #include "AutoPub/AutoPubPublisherPool.h"
+#include "AutoPub/AutoPubDeviceSource.h"
 #include "RaftThreading.h"
 #include "RaftDeviceConsts.h"
 #include "DeviceTypeRecord.h"
@@ -307,156 +308,38 @@ private:
     uint64_t computeSedpSubHeartbeatLastSN() const;
 
     // -----------------------------------------------------------------
-    // Phase 4 / Z2 — per-bus-device auto-publishing plumbing
+    // Per-bus-device auto-publishing
     //
-    // Flow (status callbacks and loop() run on the SysMod loop task; data
-    // callbacks run on bus worker tasks):
-    //   1. setup() subscribes to DeviceManager::registerForDeviceStatusChange.
-    //   2. On a device going online the status callback allocates writer
-    //      slot(s) in _autoPubLifecycle, builds a DynamicWriterCtx, acquires a
-    //      generation-safe handle from _autoPubPool and registers the data
-    //      callback with that handle (not the ctx pointer) as callback info.
-    //   3. The data callback (bus task) decodes under the pool lock and stores
-    //      only the latest record in the handle's mailbox — no network I/O.
-    //   4. loop() drains the mailboxes, serialises and emits RTPS samples.
-    //   5. On offline / pending-deletion the handle is released (invalidating
-    //      any in-flight or stale callback), writers are disposed and the ctx
-    //      is freed.  DeviceManager's unregister does not reach the bus-level
-    //      registration, so the handle generation is what makes this safe.
+    // Everything above the transport - listening to DeviceManager, deciding
+    // what each device publishes, decoding on the bus task and emitting
+    // serialised samples on the loop task - lives in the shared
+    // AutoPubDeviceSource, which the Zenoh build uses too.  What is left here
+    // is the RTPS-specific part of an endpoint's life: a new writer has to be
+    // announced to every already-discovered participant (otherwise a
+    // participant that finished its SEDP sweep before the device appeared
+    // never sees the topic), and a departing one disposed at each peer so it
+    // is dropped promptly rather than at lease expiry.
     // -----------------------------------------------------------------
-    struct DynamicWriterCtx
-    {
-        RaftROS* pOwner = nullptr;
-        RaftDeviceID deviceID;
-        uint16_t deviceTypeIndex = DEVICE_TYPE_INDEX_INVALID;
-        uint8_t slot = 0xFF;
-        RaftRuntime::AutoPub::AutoPubPublisherHandle handle;
-
-        // Cached decode metadata
-        DeviceTypeRecordDecodeFn decodeFn = nullptr;
-        const AttrFieldDesc* pFieldDescs = nullptr;
-        uint16_t fieldCount = 0;
-        uint16_t structSize = 0;
-        uint16_t pollDataSizeBytes = 0;
-        RaftBusDeviceDecodeState decodeState;
-
-        // Pre-allocated decode buffer (heap; bus callback runs on bus task
-        // which has limited stack budget).  Touched only under the pool lock.
-        uint8_t* pDecodeBuf = nullptr;
-        uint32_t decodeBufSize = 0;
-        uint16_t maxDecodeRecords = 0;
-
-        // Slice 4.5: ROS 2 message kind cached at attach time so the hot
-        // path does not re-run the class-map lookup.
-        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind msgKind =
-            RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind::Unknown;
-
-        // Slice 4.10 — composite secondary writer (e.g. AHT20 publishes
-        // Temperature on the primary slot and RelativeHumidity here).
-        // `secondarySlot == 0xFF` means "no secondary".  When present, the
-        // secondary writer shares the decoded record with the primary but has
-        // its own registry slot (different entityId + topic).
-        uint8_t secondarySlot = 0xFF;
-        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind secondaryMsgKind =
-            RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubMsgKind::Unknown;
-
-        // Diagnostics: data callbacks received (incremented under the pool
-        // lock; read on the loop task only after the handle is released).
-        uint32_t sampleCount = 0;
-
-        // Diagnostics: histogram of gaps between consecutive data callbacks
-        // (<50, <150, <250, <400, >=400 ms).  Written by the bus task under
-        // the pool lock; atomics so the loop task can read them for logging.
-        static constexpr uint8_t CB_GAP_BUCKETS = 5;
-        int64_t lastCallbackUs = 0;
-        std::atomic<uint32_t> cbGapHist[CB_GAP_BUCKETS] = {};
-
-        ~DynamicWriterCtx() { delete[] pDecodeBuf; }
-    };
-
-    // Owning pointer array — index matches lifecycle slot.  Nullptr entries
-    // indicate a free slot.  Capacity matches the lifecycle registry.
-    DynamicWriterCtx* _autoPubCtxs[
-        RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY] = {};
-
-    // Bus-task → loop-task handoff.  One entry per attached device (composites
-    // share one), so capacity never exceeds the writer registry.  64 bytes
-    // covers every generated poll record (largest is 36 bytes); attach rejects
-    // larger records rather than truncating them.
-    struct AutoPubRaftMutexLock
-    {
-        RaftMutex mutex;
-        AutoPubRaftMutexLock() { RaftMutex_init(mutex); }
-        ~AutoPubRaftMutexLock() { RaftMutex_destroy(mutex); }
-        AutoPubRaftMutexLock(const AutoPubRaftMutexLock&) = delete;
-        AutoPubRaftMutexLock& operator=(const AutoPubRaftMutexLock&) = delete;
-        bool lock(uint32_t timeoutMs) { return RaftMutex_lock(mutex, timeoutMs); }
-        void unlock() { RaftMutex_unlock(mutex); }
-    };
-    static constexpr uint32_t AUTOPUB_MAILBOX_RECORD_SIZE = 64;
-    static constexpr uint32_t AUTOPUB_PRODUCER_LOCK_TIMEOUT_MS = 2;
-    RaftRuntime::AutoPub::AutoPubPublisherPool<
-        AutoPubRaftMutexLock,
-        RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY,
-        AUTOPUB_MAILBOX_RECORD_SIZE> _autoPubPool;
-
-    // CDR payload buffers shared by all writers: serialisation now happens
-    // only on the loop task, one sample at a time.  Sized for the largest
-    // message the serialiser emits (sensor_msgs/Imu ≈ 320 B + frame_id margin).
-    static constexpr uint32_t AUTOPUB_CDR_BUF_SIZE = 512;
-    uint8_t _autoPubCDRBufs[2][AUTOPUB_CDR_BUF_SIZE] = {};
+    using AutoPubDeviceSourceT = RaftRuntime::AutoPub::AutoPubDeviceSource<
+        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubBackend,
+        RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY>;
+    AutoPubDeviceSourceT _autoPubSource;
 
     // Compile-selected auto-publish backend: owns endpoint creation and the
-    // send path for whichever transport this image is built with.  The shared
-    // layer hands it AutoPubEndpointDesc descriptors and serialised samples.
+    // send path for whichever transport this image is built with.
     RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubBackend _autoPubBackend;
 
-    // Track whether we registered a status-change callback with DeviceManager.
-    bool _autoPubStatusCBRegistered = false;
+    /// @brief SEDP-announce a newly attached device's endpoints to every
+    /// discovered participant, and advance the ros_discovery_info sequence
+    void autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondarySlot);
 
-    // Slice 4.11 — SysTypes-driven QoS overrides, parsed once at setup().
-    //   `_qosAliasOverrides`   : matched against the per-device topic alias
-    //                            (last path segment, e.g. "imu_1_6a").
-    //   `_qosClassOverrides`   : matched against the device `clas[]` entries
-    //                            (e.g. "ACC", "TEMP").
-    // Resolution order per design §7.2:
-    //   per-device alias → per-class override → built-in default.
-    struct QoSOverride
-    {
-        String key;
-        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId id =
-            RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId::FallbackString;
-    };
-    std::vector<QoSOverride> _qosAliasOverrides;
-    std::vector<QoSOverride> _qosClassOverrides;
+    /// @brief SEDP-dispose a departing device's endpoints at every discovered
+    /// participant.  Runs while the endpoints still exist - the backend needs
+    /// their live entity ids.
+    void autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondarySlot);
 
-    // Parse the SysTypes `qosProfiles` block (called from setup()).
-    void autoPubParseQoSOverrides();
-
-    // Resolve a profile id for a device using (alias, clas[]) — returns the
-    // final profile id after applying overrides.  `pTopicAlias` is the short
-    // per-device suffix (e.g. "imu_1_6a"); `pClasArray` is the device's class
-    // list; `pDeviceTypeName` is optional.
-    RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId
-        autoPubResolveQoSProfileId(
-            const char* pTopicAlias,
-            const char* const* pClasArray, size_t clasCount,
-            const char* pDeviceTypeName) const;
-
-    // Per-device status callback (loop task) and data callback (bus task).
-    void autoPubOnDeviceStatusChange(RaftDevice& device, const BusAddrStatus& addrStatus);
-    void autoPubOnDeviceData(uint16_t deviceTypeIdx, std::vector<uint8_t> data, const void* pCallbackInfo);
-    bool autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrStatus);
-    void autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& addrStatus);
-
-    // Serialise and emit every pending mailbox sample (loop task).
-    void autoPubDrainSamples();
-
-    // Diagnostics: gaps between drain passes (loop task only), reset each
-    // periodic status log.
-    int64_t _autoPubLastDrainUs = 0;
-    uint32_t _autoPubDrainGapMaxUs = 0;
-    uint32_t _autoPubDrainGapsOver150ms = 0;
+    /// @brief Advance the ros_discovery_info sequence after endpoints have gone
+    void autoPubOnEndpointsDetached();
 
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
