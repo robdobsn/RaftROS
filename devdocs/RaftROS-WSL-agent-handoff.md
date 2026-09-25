@@ -3,9 +3,34 @@
 **Recorded:** 2026-09-17, after the 20:05 UTC resource build.
 **Reason:** The user paused implementation to move this agent session from a
 Windows mapped-folder workspace into a native WSL workspace.
-**Resume point (updated 2026-09-18):** Checklist items 1–4 are done (see
-[Resumed in WSL](#resumed-in-wsl-2026-09-18)). Continue at item 5: generation-safe
-publisher handles and attach/detach ownership.
+**Resume point (updated 2026-09-21):** Checklist items 1–5 are done. The
+bus→loop mailbox handoff is implemented and validated on hardware against
+native ROS 2 Jazzy (see
+[development status](RaftROS-development-status.md)). Continue at item 6, or
+at the open issues listed under [Current Open Issues](#current-open-issues-2026-09-21).
+
+## Current Open Issues (2026-09-21)
+
+1. **`_NODE_NAME_UNKNOWN_` (O6) reproduces on native Linux.** `ros2 node list`
+   is empty and `ros2 topic info -v` shows no node name, though the topic,
+   type, hash, QoS and data are all correct. Previously assumed to be a
+   WSL/Jazzy artefact; it is not. This is the next functional bug to chase.
+2. **Rare ~101-176 ms loop stall** around SPDP/heartbeat sends, seen a handful
+   of times per hour. Sockets are already non-blocking, so the suspicion is
+   the lwIP TCP/IP task; needs per-call timing to confirm.
+3. **Logging blocks the loop task when the USB console has no reader** -
+   RaftCore's logger uses a 100 ms write timeout twice per line, so ~200 ms
+   per line with USB unplugged; that lost ~4.5% of auto-published samples.
+   The example now overrides `RAFT_LOGGER_USB_JTAG_WRITE_TIMEOUT_MS=10`;
+   a RaftCore default change is proposed.
+4. **Test hardware moved** to an Adafruit ESP32-S3 TFT Feather (COM18): I2C
+   SDA 42 / SCL 41, and GPIO 21 must be driven high to power the STEMMA QT
+   connector (done in the example's `main.cpp`). The UM ProS3 previously used
+   has an RF fault - it receives fine but never completes WiFi authentication,
+   confirmed against a Xiao ESP32-S3 running the identical stock IDF test.
+5. **ROS 2 test host:** Ubuntu 24.04 at `rob@192.168.86.192` (SSH keys set up,
+   ROS 2 Jazzy installed natively). The Feather must be on `rdint01` to share
+   that subnet; `rdiot` is a different subnet.
 
 ## Resumed in WSL (2026-09-18)
 
