@@ -222,6 +222,30 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### Open: one malformed SEDP subscription packet per remote participant (2026-09-25)
+
+After the `PID_TYPE_CONSISTENCY` fix, CycloneDDS reports exactly **one**
+malformed packet per participant it starts (reproducible, 1 per run):
+
+```
+recv: malformed packet received from vendor 1.18 length 256 state parse:DATA
+  ... wid 0xc2040000 seq 2 ... 5a001000 ... 00010204   (our /chatter_in reader)
+  smid 0x15 flags 0x5 otnh 408 xflags 0 otiq 16
+```
+
+It claims a 492-byte message (`otnh 408` at offset 48) but reports arriving as
+256 bytes. Packet captures taken during the same runs show no such short
+frame: every SEDP subscription announcement we send is 492 or 600 bytes with
+submessage lengths that fit the packet, no oversized `otnh`, and no Wireshark
+expert warnings. So either CycloneDDS's reported length means something other
+than the datagram size, or a short copy is produced on a path the capture on
+`wlp2s0` does not see.
+
+Impact is limited: the ROS graph resolves correctly under CycloneDDS
+regardless (node, publishers and subscribers all listed), so this is a
+correctness wart rather than a functional failure. Worth resolving before
+claiming strict-parser cleanliness.
+
 ### O6 RESOLVED for CycloneDDS — malformed SEDP subscriptions (2026-09-25)
 
 **Root cause:** `SEDPHandler::buildSubscriptionMessage` emitted
