@@ -1,3 +1,4 @@
+#include "Zenoh/ZenohInterestMatch.h"
 #include "Zenoh/ZenohTCPSession.h"
 #include "Zenoh/ZenohNetworkMessage.h"
 #include "Zenoh/ZenohROSIdentity.h"
@@ -134,19 +135,13 @@ public:
             for (uint8_t token = 0; token < 2; ++token)
             {
                 const std::string_view key = token == 0 ? _nodeToken.data() : _publisherToken.data();
-                const auto pattern = message.key;
-                bool matches = pattern.empty() || pattern == key;
-                if (!pattern.empty() && pattern.size() >= 3 && pattern.substr(pattern.size() - 3) == "/**")
-                {
-                    const auto prefix = pattern.substr(0, pattern.size() - 3);
-                    if (prefix.find_first_of("*$?") != std::string_view::npos)
-                        return false;
-                    matches = key == prefix || (key.size() > prefix.size() && key.substr(0, prefix.size()) == prefix && key[prefix.size()] == '/');
-                }
-                else if (pattern.find_first_of("*$?") != std::string_view::npos)
+                // Shared with the firmware SysMod: an expression we do not
+                // implement is refused rather than answered incompletely
+                const auto match = RaftRuntime::Zenoh::ZenohInterestMatch(message.key, key);
+                if (match == RaftRuntime::Zenoh::ZenohInterestMatchResult::Unsupported)
                     return false;
                 const bool active = token == 0 ? _stage >= 2 && _stage < 6 : _stage >= 3 && _stage < 5;
-                if (matches && active)
+                if (match == RaftRuntime::Zenoh::ZenohInterestMatchResult::Match && active)
                     reply.mask |= static_cast<uint8_t>(1u << token);
             }
         }

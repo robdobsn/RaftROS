@@ -6,7 +6,7 @@
 //
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-#include "RaftROS.h"
+#include "RaftROSRTPS.h"
 #include "runtime/dispatch/RTPSUserDispatch.h"
 #include "runtime/autopub/RTPSAutoPubTopicNaming.h"
 #include "runtime/autopub/RTPSAutoPubClassMap.h"

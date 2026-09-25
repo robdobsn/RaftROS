@@ -20,7 +20,7 @@ Zenoh firmware backend, build selector or measured ESP32 footprint.
 | Z0: feasibility and baseline | In progress. Pinned host profile, release executable/stack baseline and provisional firmware review budgets recorded. Actual ESP32 app/heap/stack measurements remain open. zenoh-pico incorporation still needs explicit approval. |
 | Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
-| Z3: isolated firmware builds | Not started. Exactly-one-backend build with RTPS default and Zenoh-only alternative, followed by ESP session integration. |
+| Z3: isolated firmware builds | Build selection done: Kconfig picks RTPS (default) or Zenoh, both ESP32-S3 images build and link only their own backend. The Zenoh SysMod connects, declares its node token and answers interests; DeviceManager auto-publish for it awaits the shared extraction of the device plumbing. Neither image run against a router yet. |
 | Z4-Z6: parity and release | Not started. Dynamic sensors, subscriptions/QoS, reconnect/resource tests and backend-specific demos. |
 
 Runtime transport switching is deferred. Services/parameters remain future
@@ -221,6 +221,58 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Z3: One Backend Per Image, and the Zenoh SysMod (2026-09-25)
+
+The transport is now a build-time choice. `RaftROS.h` is just the
+application-facing name - it includes whichever SysMod the image selected, so
+an application still writes `registerSysMod("RaftROS", RaftROS::create, true)`
+whatever it was built with.
+
+- [RaftROSBackendSelect.h](../components/RaftROS/RaftROSBackendSelect.h) resolves
+  `CONFIG_RAFTROS_BACKEND_RTPS` (default) or `CONFIG_RAFTROS_BACKEND_ZENOH` from
+  the new [Kconfig](../Kconfig) into `RAFTROS_BACKEND_RTPS` /
+  `RAFTROS_BACKEND_ZENOH`, and fails the build if that is not exactly one.
+  Host builds have no Kconfig and default to RTPS.
+- The RTPS SysMod moved to
+  [RTPS/RaftROSRTPS.{h,cpp}](../components/RaftROS/RTPS/RaftROSRTPS.cpp)
+  unchanged (one include line), beside the runtime it drives. `CMakeLists.txt`
+  picks the source list from the selection, so the RTPS runtime and the Zenoh
+  SysMod are never both linked.
+- [Zenoh/RaftROSZenoh.{h,cpp}](../components/RaftROS/Zenoh/RaftROSZenoh.cpp) is
+  the Zenoh build's SysMod: one non-blocking TCP session to a router in place of
+  three UDP sockets and a participant registry. It connects with backoff,
+  declares the node's liveliness token once per session, answers router
+  interests, and drives `ZenohAutoPubBackend`. Every pass does bounded work -
+  one receive, one outbound message - to stay inside the 10 ms / 50 ms loop
+  budget, and `routerHost` must be an IPv4 address because resolving a name
+  would block the loop for the length of the DNS query.
+- [Zenoh/ZenohInterestMatch.h](../components/RaftROS/Zenoh/ZenohInterestMatch.h)
+  decides whether a router's interest covers one of our keys. An expression
+  beyond empty / exact / `<prefix>/**` is reported `Unsupported` so the caller
+  refuses it: answering one we only half understand would under-report our
+  declarations and leave the router with a wrong view of the graph. The Linux
+  probe now uses this instead of its own copy.
+
+Both images build for ESP32-S3 with ESP-IDF 6.0.2, and `ar t libRaftROS.a`
+confirms the exclusion:
+
+| Build | App image | RaftROS objects |
+| --- | --- | --- |
+| RTPS (default) | 1267632 B (28% free) | 18 |
+| Zenoh | 1230304 B (30% free) | 4 (`RaftROSZenoh`, `AutoPubCDRSerializer`, `CDREncoder`, `CDRDecoder`) |
+
+- Tests: **135 passed, 0 failed** (`make zenoh-autopub-test`, +11 for the
+  interest matcher). Other suites unchanged. The probe build caught
+  `ZenohInterestMatch.h` not being self-contained (`<cstdint>` missing) - it
+  only compiled because of include order elsewhere.
+- Not addressed: the Zenoh SysMod does not yet auto-publish DeviceManager
+  devices. That plumbing (~600 lines of attach/detach, decode buffers, pool and
+  mailbox) still lives inside the RTPS SysMod; extracting it behind the backend
+  contract so both SysMods share one copy is the next slice, and until then a
+  Zenoh image declares its node but publishes no topics. Subscriptions are
+  RTPS-only, so the example's `/chatter_in` hook is compiled out under Zenoh.
+  Neither image has been run against a router or on hardware since this change.
 
 ### Zenoh Auto-Publish Backend (2026-09-25)
 

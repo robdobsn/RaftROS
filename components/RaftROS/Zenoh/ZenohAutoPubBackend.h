@@ -42,10 +42,10 @@
 #include "ZenohROSCodec.h"
 #include "ZenohROSIdentity.h"
 #include "ZenohTCPSession.h"
-#include "AutoPubClassMap.h"
-#include "AutoPubEndpointDesc.h"
-#include "AutoPubQoSProfile.h"
-#include "AutoPubSampleRunner.h"
+#include "AutoPub/AutoPubClassMap.h"
+#include "AutoPub/AutoPubEndpointDesc.h"
+#include "AutoPub/AutoPubQoSProfile.h"
+#include "AutoPub/AutoPubSampleRunner.h"
 
 namespace RaftRuntime::Zenoh
 {

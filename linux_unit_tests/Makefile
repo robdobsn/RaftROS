@@ -102,9 +102,9 @@ zenoh-session-test: $(ZENOH_SESSION_TEST_OUT)
 
 ZENOH_AUTOPUB_TEST_OUT = $(BUILD_DIR)/zenoh/zenoh_autopub_backend_tests
 
-$(ZENOH_AUTOPUB_TEST_OUT): zenoh_autopub_backend_tests.cpp ../components/RaftROS/Zenoh/ZenohAutoPubBackend.h ../components/RaftROS/Zenoh/ZenohTCPSession.h ../components/RaftROS/Zenoh/ZenohROSCodec.h ../components/RaftROS/AutoPub/AutoPubClassMap.h ../components/RaftROS/AutoPub/AutoPubEndpointDesc.h
+$(ZENOH_AUTOPUB_TEST_OUT): zenoh_autopub_backend_tests.cpp ../components/RaftROS/Zenoh/ZenohAutoPubBackend.h ../components/RaftROS/Zenoh/ZenohTCPSession.h ../components/RaftROS/Zenoh/ZenohROSCodec.h ../components/RaftROS/AutoPub/AutoPubClassMap.h ../components/RaftROS/AutoPub/AutoPubEndpointDesc.h ../components/RaftROS/Zenoh/ZenohInterestMatch.h
 	@mkdir -p $(dir $@)
-	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS -I../components/RaftROS/AutoPub $< -o $@
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS $< -o $@
 
 zenoh-autopub-test: $(ZENOH_AUTOPUB_TEST_OUT)
 	./$(ZENOH_AUTOPUB_TEST_OUT)
