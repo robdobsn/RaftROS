@@ -199,6 +199,35 @@ int main()
         TEST_ASSERT(backend.stats().published == 2, "published count tracks accepted samples");
     }
 
+    std::printf("Test: the backend can be given the time without being serviced\n");
+    {
+        ZenohTCPSession session;
+        establish(session);
+        ZenohAutoPubBackend backend;
+        backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        backend.service(10);
+        drain(session);
+
+        // publish() has no time argument, so a caller that publishes on some
+        // other schedule must be able to refresh the clock on its own.  Without
+        // this the sample carries the last serviced time - and the session is
+        // handed that stale time too.
+        backend.setNow(500);
+        const uint8_t payload[4] = {0, 1, 0, 0};
+        TEST_ASSERT(backend.publish(slot, payload, sizeof(payload)) == AutoPubPublishResult::Accepted,
+                    "a sample publishes after setNow alone");
+        const auto sent = drain(session);
+        const auto* gid = backend.gidForSlot(slot);
+        uint8_t expected[ZenohROSCodec::ATTACHMENT_SIZE];
+        TEST_ASSERT(gid && ZenohROSCodec::encodeAttachment(expected, sizeof(expected),
+                                                           {1, 500 * 1000000LL, *gid}) &&
+                    contains(sent, expected, sizeof(expected)),
+                    "the sample is stamped with the time setNow supplied");
+        TEST_ASSERT(session.state() == ZenohTCPSession::State::Established,
+                    "publishing does not disturb the session");
+    }
+
     std::printf("Test: publish refusals do not consume a sequence number\n");
     {
         ZenohTCPSession session;

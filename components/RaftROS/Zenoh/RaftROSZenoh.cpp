@@ -10,6 +10,7 @@
 #include "RaftJson.h"
 #include "RestAPIEndpointManager.h"
 #include "RaftUtils.h"
+#include "CDREncoder.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
@@ -99,6 +100,27 @@ void RaftROS::setup()
     deps.nodeName = _nodeName.c_str();
     _autoPubBackend.setup(deps);
 
+    // A standing /chatter publisher, created through the backend exactly as a
+    // device endpoint is
+    _chatterEnabled = configGetBool("chatterEnable", true);
+    if (_chatterEnabled)
+    {
+        RaftRuntime::AutoPub::AutoPubEndpointDesc chatter;
+        chatter.deviceId = {0, 0, 0};
+        chatter.msgKind = RaftRuntime::AutoPub::AutoPubMsgKind::String;
+        chatter.qosProfileId = RaftRuntime::AutoPub::AutoPubQoSProfileId::FallbackString;
+        if (!chatter.setNames("/chatter", RaftRuntime::AutoPub::AutoPubClassMap_typeName(
+                                              RaftRuntime::AutoPub::AutoPubMsgKind::String)))
+            _chatterEnabled = false;
+        else
+            _chatterSlot = _autoPubBackend.createPublisher(chatter);
+        if (_chatterSlot == ZenohAutoPubBackend::INVALID_SLOT)
+        {
+            LOG_W(MODULE_PREFIX, "setup could not create the /chatter publisher");
+            _chatterEnabled = false;
+        }
+    }
+
     // Auto-publish every bus device DeviceManager reports, through the same
     // pipeline the RTPS build uses.  Endpoints created while the session is
     // down are staged by the backend and declared once it is up.
@@ -173,6 +195,7 @@ void RaftROS::loop()
         case ConnState::HANDSHAKE:
         case ConnState::READY:
             serviceSession(nowMs);
+            publishChatter(nowMs);
             break;
     }
 }
@@ -276,6 +299,9 @@ void RaftROS::stepConnect()
 /// let the session mind its lease, send at most one message, flush.
 void RaftROS::serviceSession(uint32_t nowMs)
 {
+    // The backend publishes on the device pipeline's schedule, not ours, so it
+    // needs the time every pass - not only on the passes where it is serviced
+    _autoPubBackend.setNow(nowMs);
     if (!receiveFromRouter(nowMs))
         return;
 
@@ -305,7 +331,8 @@ void RaftROS::serviceSession(uint32_t nowMs)
     // is waiting on, then endpoint declarations and samples.
     if (_connState == ConnState::READY && _session.outputSize() == 0)
     {
-        if (!stepDeclarations(nowMs) && !stepInterestReplies(nowMs))
+        if (!stepDeclarations(nowMs) && !stepSubscriptionDeclarations(nowMs) &&
+            !stepInterestReplies(nowMs))
             _autoPubBackend.service(nowMs);
     }
 
@@ -318,7 +345,7 @@ bool RaftROS::receiveFromRouter(uint32_t nowMs)
     const int count = recv(_sock, _rxBuf, sizeof(_rxBuf), 0);
     if (count > 0)
     {
-        if (!_session.receive(_rxBuf, (size_t)count, nowMs, onDiscoveryThunk, this))
+        if (!_session.receive(_rxBuf, (size_t)count, nowMs, onDiscoveryThunk, this, onSampleThunk))
         {
             LOG_W(MODULE_PREFIX, "session rejected router data error=%d", (int)_session.error());
             closeConnection("bad router data");
@@ -379,6 +406,14 @@ void RaftROS::closeConnection(const char* reason)
     _autoPubBackend.service(millis());
     _nodeTokenState = NodeTokenState::PENDING;
     _pendingInterestCount = 0;
+    _remoteKeyIdCount = 0;
+    // The router dropped our subscriptions with the session; stage them again
+    for (uint8_t index = 0; index < _subscriptionCount; ++index)
+    {
+        if (_subscriptions[index].state == Subscription::State::DECLARED)
+            _subscriptions[index].state = Subscription::State::PENDING_DECLARE;
+        _subscriptions[index].tokenDeclared = false;
+    }
     _lastConnectAttemptMs = millis();
     _reconnectDelayMs = _reconnectDelayMs >= RECONNECT_DELAY_MAX_MS ?
         RECONNECT_DELAY_MAX_MS : _reconnectDelayMs * 2;
@@ -466,7 +501,13 @@ bool RaftROS::stepInterestReplies(uint32_t nowMs)
 bool RaftROS::onDiscovery(const ZenohNetworkMessage::DiscoveryMessage& message)
 {
     if (!message.isInterest)
+    {
+        // A key expression the router has given a numeric id: samples may name
+        // the id instead of the key, and we have to be able to match them
+        if (message.declaration == 0 && !message.key.empty())
+            rememberRemoteKeyId(message.id, message.key);
         return true;
+    }
     if (message.mode == 0)
     {
         // Interest withdrawn - drop any reply still in progress for it
@@ -506,6 +547,258 @@ bool RaftROS::onDiscovery(const ZenohNetworkMessage::DiscoveryMessage& message)
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Chatter
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// @brief Publish the next /chatter message if one is due.  A message the
+/// transport cannot take right now is simply skipped: the next one is a second
+/// away, and queueing it behind a stalled session would only publish it late.
+void RaftROS::publishChatter(uint32_t nowMs)
+{
+    if (!_chatterEnabled || _connState != ConnState::READY ||
+        !Raft::isTimeout(nowMs, _lastChatterSendMs, CHATTER_PUBLISH_INTERVAL_MS))
+        return;
+
+    char message[64];
+    snprintf(message, sizeof(message), "Hello from %s [%u]", _nodeName.c_str(),
+             (unsigned)_chatterMsgIndex);
+
+    uint8_t payload[128];
+    CDREncoder encoder;
+    encoder.reset(payload, sizeof(payload));
+    if (!encoder.writeEncapsulationHeader() || !encoder.writeString(message))
+        return;
+
+    if (_autoPubBackend.publish(_chatterSlot, payload, encoder.getPos()) ==
+            RaftRuntime::AutoPub::AutoPubPublishResult::Accepted)
+    {
+        ++_chatterMsgIndex;
+        _lastChatterSendMs = nowMs;
+    }
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Subscriptions
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+int RaftROS::addStringSubscription(const char* topic, const char* type, StringMessageHandler handler)
+{
+    using namespace RaftRuntime::AutoPub;
+    if (!topic || !*topic || !type || !*type)
+        return -1;
+
+    // Accept the DDS form the RTPS build takes as well as a ROS name, so the
+    // same application code subscribes on either build
+    const char* rosTopic = topic;
+    if (strncmp(topic, "rt/", 3) == 0)
+        rosTopic = topic + 2;           // "rt/chatter_in" -> "/chatter_in"
+    char rosTopicBuf[AUTOPUB_TOPIC_MAX_LEN];
+    if (rosTopic[0] != '/')
+    {
+        if (snprintf(rosTopicBuf, sizeof(rosTopicBuf), "/%s", rosTopic) >= (int)sizeof(rosTopicBuf))
+            return -1;
+        rosTopic = rosTopicBuf;
+    }
+
+    // Reuse an existing slot for the same topic, as the RTPS build does
+    for (uint8_t index = 0; index < _subscriptionCount; ++index)
+    {
+        if (strcmp(_subscriptions[index].rosTopic, rosTopic) == 0)
+        {
+            if (handler)
+                _subscriptions[index].handler = std::move(handler);
+            return index;
+        }
+    }
+    if (_subscriptionCount >= MAX_SUBSCRIPTIONS)
+    {
+        LOG_W(MODULE_PREFIX, "addStringSubscription table full - '%s' not subscribed", rosTopic);
+        return -1;
+    }
+
+    // A Zenoh key carries the ROS type hash, so a type we have no hash for
+    // cannot be subscribed to - say so rather than subscribe to nothing
+    const char* typeHash = AutoPubClassMap_typeHash(AutoPubClassMap_kindForTypeName(type));
+    if (!typeHash)
+    {
+        LOG_W(MODULE_PREFIX, "addStringSubscription no ROS type hash for '%s' - '%s' not subscribed",
+              type, rosTopic);
+        return -1;
+    }
+
+    Subscription& subscription = _subscriptions[_subscriptionCount];
+    if (snprintf(subscription.rosTopic, sizeof(subscription.rosTopic), "%s", rosTopic) >=
+            (int)sizeof(subscription.rosTopic) ||
+        snprintf(subscription.type, sizeof(subscription.type), "%s", type) >= (int)sizeof(subscription.type))
+    {
+        LOG_W(MODULE_PREFIX, "addStringSubscription '%s' does not fit", rosTopic);
+        return -1;
+    }
+
+    // Entity ids come from the same monotonic space as published endpoints so
+    // a subscription and a publisher are never confused for one another
+    subscription.entityId = _nextSubscriptionEntityId++;
+    const ZenohROSCodec::NodeIdentity node = nodeIdentity();
+    const ZenohROSCodec::Endpoint endpoint{subscription.entityId,
+        ZenohROSCodec::EndpointKind::Subscription, subscription.rosTopic, subscription.type, typeHash,
+        {ZenohROSCodec::Reliability::Reliable, ZenohROSCodec::Durability::Volatile, 10}};
+    if (!ZenohROSCodec::formatTopicKey(subscription.key, sizeof(subscription.key), node.domainId,
+                                       endpoint.topic, endpoint.wireType, endpoint.typeHash) ||
+        !ZenohROSCodec::formatEndpointToken(subscription.token, sizeof(subscription.token), node, endpoint))
+    {
+        LOG_W(MODULE_PREFIX, "addStringSubscription cannot express '%s' as a Zenoh endpoint", rosTopic);
+        subscription.key[0] = subscription.token[0] = '\0';
+        return -1;
+    }
+
+    subscription.handler = std::move(handler);
+    subscription.state = Subscription::State::PENDING_DECLARE;
+    subscription.tokenDeclared = false;
+    const int slot = _subscriptionCount++;
+    LOG_I(MODULE_PREFIX, "addStringSubscription slot=%d topic=%s type=%s", slot, rosTopic, type);
+    return slot;
+}
+
+/// @brief Declare one staged subscription: the subscriber first, so samples
+/// start flowing, then the liveliness token that puts it in the ROS graph
+bool RaftROS::stepSubscriptionDeclarations(uint32_t nowMs)
+{
+    for (uint8_t index = 0; index < _subscriptionCount; ++index)
+    {
+        Subscription& subscription = _subscriptions[index];
+        if (subscription.state == Subscription::State::PENDING_DECLARE)
+        {
+            const size_t msgLen = ZenohNetworkMessage::declareSubscriber(
+                _msgBuf, sizeof(_msgBuf), SUBSCRIBER_ID_BASE + index, subscription.key);
+            if (msgLen == 0)
+            {
+                LOG_E(MODULE_PREFIX, "subscription '%s' will not encode - dropping it",
+                      subscription.rosTopic);
+                subscription.state = Subscription::State::DECLARED;   // do not retry
+                subscription.tokenDeclared = true;
+                continue;
+            }
+            if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
+                return false;
+            subscription.state = Subscription::State::DECLARED;
+            LOG_I(MODULE_PREFIX, "subscribed to %s", subscription.key);
+            return true;
+        }
+        if (subscription.state == Subscription::State::DECLARED && !subscription.tokenDeclared)
+        {
+            const size_t msgLen = ZenohNetworkMessage::declareToken(
+                _msgBuf, sizeof(_msgBuf), SUBSCRIBER_TOKEN_ID_BASE + index, subscription.token);
+            if (msgLen == 0)
+            {
+                subscription.tokenDeclared = true;      // do not retry a message that cannot be built
+                continue;
+            }
+            if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
+                return false;
+            subscription.tokenDeclared = true;
+            return true;
+        }
+    }
+    return false;
+}
+
+void RaftROS::rememberRemoteKeyId(uint32_t id, std::string_view key)
+{
+    if (key.size() >= sizeof(_remoteKeyIds[0].key))
+        return;
+    for (uint8_t index = 0; index < _remoteKeyIdCount; ++index)
+    {
+        if (_remoteKeyIds[index].id == id)
+        {
+            memcpy(_remoteKeyIds[index].key, key.data(), key.size());
+            _remoteKeyIds[index].key[key.size()] = '\0';
+            return;
+        }
+    }
+    if (_remoteKeyIdCount >= MAX_REMOTE_KEY_IDS)
+        return;
+    RemoteKeyId& entry = _remoteKeyIds[_remoteKeyIdCount++];
+    entry.id = id;
+    memcpy(entry.key, key.data(), key.size());
+    entry.key[key.size()] = '\0';
+}
+
+/// @brief Which subscription, if any, a sample belongs to.  The key may arrive
+/// in full or as an id the router declared earlier plus a suffix.
+const RaftROS::Subscription* RaftROS::subscriptionForSample(
+        const ZenohNetworkMessage::SampleMessage& sample) const
+{
+    char resolved[RaftRuntime::Zenoh::ZENOH_AUTOPUB_KEY_MAX];
+    std::string_view key = sample.key;
+    if (sample.keyId != 0)
+    {
+        const char* prefix = nullptr;
+        for (uint8_t index = 0; index < _remoteKeyIdCount; ++index)
+        {
+            if (_remoteKeyIds[index].id == sample.keyId)
+            {
+                prefix = _remoteKeyIds[index].key;
+                break;
+            }
+        }
+        if (!prefix)
+            return nullptr;
+        if (snprintf(resolved, sizeof(resolved), "%s%.*s", prefix,
+                     (int)sample.key.size(), sample.key.data()) >= (int)sizeof(resolved))
+            return nullptr;
+        key = resolved;
+    }
+    for (uint8_t index = 0; index < _subscriptionCount; ++index)
+    {
+        if (_subscriptions[index].state == Subscription::State::DECLARED &&
+            key == _subscriptions[index].key)
+            return &_subscriptions[index];
+    }
+    return nullptr;
+}
+
+/// @brief A sample arrived.  Decodes it as std_msgs/String and hands it to the
+/// topic's handler, or the default one.  Runs on the loop task.
+bool RaftROS::onSample(const ZenohNetworkMessage::SampleMessage& sample)
+{
+    const Subscription* pSubscription = subscriptionForSample(sample);
+    if (!pSubscription)
+    {
+        // Not ours: a router may forward more than we asked for.  Dropping it
+        // is not an error - failing the session over it would be.
+        ++_samplesDropped;
+        return true;
+    }
+    Subscription& subscription = const_cast<Subscription&>(*pSubscription);
+    ++subscription.received;
+
+    char text[256];
+    const auto decoded = RaftRuntime::AutoPub::AutoPubStringMessage_decode(
+        reinterpret_cast<const uint8_t*>(sample.payload.data()), (uint32_t)sample.payload.size(),
+        text, sizeof(text));
+    if (!decoded.success)
+    {
+        LOG_W(MODULE_PREFIX, "sample on %s is not a decodable std_msgs/String (%u bytes)",
+              subscription.rosTopic, (unsigned)sample.payload.size());
+        return true;
+    }
+
+    // The publisher's 16-byte GID sits in the attachment, split as a DDS GUID
+    // is so the handler signature matches the RTPS build
+    ZenohROSCodec::Attachment attachment;
+    const bool haveGid = !sample.attachment.empty() &&
+        ZenohROSCodec::decodeAttachment(reinterpret_cast<const uint8_t*>(sample.attachment.data()),
+                                        sample.attachment.size(), attachment);
+    static const uint8_t UNKNOWN_GID[ZenohROSCodec::GID_SIZE] = {};
+    const uint8_t* gid = haveGid ? attachment.publisherGid.data() : UNKNOWN_GID;
+
+    const StringMessageHandler& handler = subscription.handler ? subscription.handler : _defaultHandler;
+    if (handler)
+        handler(gid + 12, gid, text, decoded.textLen);
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // API / status
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -533,7 +826,8 @@ String RaftROS::getStatusJSON() const
     char buf[320];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
-             R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,"intRefused":%u})",
+             R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
+             R"("subs":%u,"rxDropped":%u,"intRefused":%u})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -546,6 +840,8 @@ String RaftROS::getStatusJSON() const
              (unsigned)_autoPubBackend.pendingCount(),
              (unsigned)stats.published,
              (unsigned)stats.redeclares,
+             (unsigned)_subscriptionCount,
+             (unsigned)_samplesDropped,
              (unsigned)_interestsRefused);
     return buf;
 }

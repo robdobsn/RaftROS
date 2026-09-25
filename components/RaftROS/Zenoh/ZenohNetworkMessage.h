@@ -115,6 +115,36 @@ public:
         return writer.size();
     }
 
+    /// @brief Declare a subscriber, so the router forwards matching samples to
+    /// this session.  Same shape as declareToken (body id 2 rather than 6),
+    /// with the key given in full: a session that never declares key-expression
+    /// ids has nothing for the router to resolve a numeric key against.
+    static size_t declareSubscriber(uint8_t* output, size_t capacity, uint32_t subscriberId,
+                                    std::string_view key, const uint32_t* interestId = nullptr)
+    {
+        if (!validKey(key, /*allowWildcards=*/true))
+            return 0;
+        Writer writer(output, capacity);
+        writer.byte(interestId ? 0x3e : 0x1e);
+        if (interestId)
+            writer.integer(*interestId);
+        writer.byte(0x22);
+        writer.integer(subscriberId);
+        writer.byte(0);
+        writer.string(key);
+        return writer.size();
+    }
+
+    /// @brief Withdraw a subscriber
+    static size_t undeclareSubscriber(uint8_t* output, size_t capacity, uint32_t subscriberId)
+    {
+        Writer writer(output, capacity);
+        writer.byte(0x1e);
+        writer.byte(0x03);
+        writer.integer(subscriberId);
+        return writer.size();
+    }
+
     static size_t declareFinal(uint8_t* output, size_t capacity, const uint32_t* interestId = nullptr)
     {
         Writer writer(output, capacity);
@@ -146,6 +176,96 @@ public:
         writer.integer(static_cast<uint32_t>(payloadSize));
         writer.bytes(payload, payloadSize);
         return writer.size();
+    }
+
+    /// @brief One sample arriving from the router.
+    ///
+    /// A key can arrive two ways: in full, or as a key-expression id the peer
+    /// declared earlier plus an optional suffix.  The id form is reported
+    /// rather than resolved - the resolution table belongs to whoever declared
+    /// the subscriptions, not to a message parser.
+    struct SampleMessage
+    {
+        uint32_t keyId = 0;             ///< 0 when the key arrived in full
+        std::string_view key;           ///< Full key, or the suffix after `keyId`
+        std::string_view payload;
+        std::string_view attachment;    ///< Empty when the sample carried none
+    };
+
+    /// @brief Parse one Put from a peer
+    /// @return bytes consumed, or 0 if this is not a well-formed Put
+    static size_t readSample(const uint8_t* input, size_t length, SampleMessage& output)
+    {
+        Cursor reader(input, length);
+        uint8_t header = 0;
+        if (!reader.byte(header) || (header & 0x1f) != 0x1d)
+            return 0;
+        SampleMessage message;
+        uint32_t keyId = 0;
+        if (!reader.number(keyId) || keyId > 65535)
+            return 0;
+        message.keyId = keyId;
+        if (header & 0x20)
+        {
+            uint32_t size = 0;
+            if (!reader.number(size) || size == 0 || size > MAX_KEY_SIZE)
+                return 0;
+            const uint8_t* keyStart = nullptr;
+            if (!reader.bytes(size, keyStart))
+                return 0;
+            message.key = std::string_view(reinterpret_cast<const char*>(keyStart), size);
+        }
+        else if (keyId == 0)
+        {
+            // Neither a full key nor a declared id: nothing identifies the topic
+            return 0;
+        }
+        std::string_view ignored;
+        if (!reader.sampleExtensions((header & 0x80) != 0, ignored))
+            return 0;
+
+        uint8_t body = 0;
+        if (!reader.byte(body) || (body & 0x1f) != 0x01)
+            return 0;
+        // The Put body's own fields come before its extensions: a timestamp
+        // (flag T) is a varint clock reading followed by the publishing
+        // session's id, and an encoding (flag E) is a varint that says in its
+        // low bit whether a schema string follows.  Neither is used here, but
+        // both have to be stepped over to reach the attachment and payload.
+        if (body & 0x20)
+        {
+            uint64_t clock = 0;
+            uint32_t idSize = 0;
+            const uint8_t* idStart = nullptr;
+            if (!reader.integer(clock) || !reader.number(idSize) || idSize > 16 ||
+                !reader.bytes(idSize, idStart))
+                return 0;
+        }
+        if (body & 0x40)
+        {
+            uint32_t encoding = 0;
+            if (!reader.number(encoding))
+                return 0;
+            if (encoding & 1)
+            {
+                uint32_t schemaSize = 0;
+                const uint8_t* schemaStart = nullptr;
+                if (!reader.number(schemaSize) || schemaSize > MAX_KEY_SIZE ||
+                    !reader.bytes(schemaSize, schemaStart))
+                    return 0;
+            }
+        }
+        if (!reader.sampleExtensions((body & 0x80) != 0, message.attachment))
+            return 0;
+        uint32_t payloadSize = 0;
+        if (!reader.number(payloadSize) || payloadSize > MAX_PAYLOAD_SIZE)
+            return 0;
+        const uint8_t* payloadStart = nullptr;
+        if (!reader.bytes(payloadSize, payloadStart))
+            return 0;
+        message.payload = std::string_view(reinterpret_cast<const char*>(payloadStart), payloadSize);
+        output = message;
+        return reader.position();
     }
 
 private:
@@ -239,6 +359,50 @@ private:
             }
             return true;
         }
+        /// @brief Walk the extensions on an inbound sample, capturing the
+        /// attachment and skipping the rest.
+        ///
+        /// Zenoh encodes an extension's body three ways, chosen by two bits of
+        /// its header: nothing at all, a varint, or a length-prefixed buffer -
+        /// so an extension cannot be skipped without decoding which it is.
+        /// Unknown extensions are skipped even when flagged mandatory: a
+        /// consumer that only reads the payload and the attachment loses
+        /// nothing by ignoring, say, a timestamp, and dropping the sample
+        /// instead would lose data over a field we do not use.
+        bool sampleExtensions(bool more, std::string_view& attachment)
+        {
+            for (size_t count = 0; more; ++count)
+            {
+                uint8_t header = 0;
+                uint64_t value = 0;
+                if (count == 16 || !byte(header) || (header & 0x60) == 0x60)
+                    return false;
+                if ((header & 0x60) && !integer(value))
+                    return false;
+                if ((header & 0x60) == 0x40)
+                {
+                    if (value > _length - _offset || value > MAX_ATTACHMENT_SIZE)
+                        return false;
+                    if ((header & 0x7f) == 0x43)
+                        attachment = std::string_view(reinterpret_cast<const char*>(_input + _offset),
+                                                      static_cast<size_t>(value));
+                    _offset += static_cast<size_t>(value);
+                }
+                more = (header & 0x80) != 0;
+            }
+            return true;
+        }
+
+        /// @brief Borrow `size` bytes of the input, without copying
+        bool bytes(size_t size, const uint8_t*& start)
+        {
+            if (size > _length - _offset)
+                return false;
+            start = _input + _offset;
+            _offset += size;
+            return true;
+        }
+
         size_t position() const { return _offset; }
     private:
         const uint8_t* _input;
@@ -246,15 +410,21 @@ private:
         size_t _offset = 0;
     };
 
-    static bool validKey(std::string_view key)
+    /// @brief Is this a usable key expression?
+    /// @param allowWildcards a subscription may match a set of keys ("*",
+    ///        "**", "$*"); a publication names exactly one, so wildcards in it
+    ///        are a mistake rather than a pattern and are refused.
+    static bool validKey(std::string_view key, bool allowWildcards = false)
     {
         if (key.empty() || key.size() > MAX_KEY_SIZE || key.front() == '/' || key.back() == '/')
             return false;
         char previous = 0;
         for (const char character : key)
         {
+            const bool wildcard = character == '*' || character == '$';
             if (static_cast<unsigned char>(character) <= 32 || static_cast<unsigned char>(character) >= 127 ||
-                character == '*' || character == '$' || character == '?' || character == '#' ||
+                character == '?' || character == '#' ||
+                (wildcard && !allowWildcards) ||
                 (character == '/' && previous == '/'))
                 return false;
             previous = character;
