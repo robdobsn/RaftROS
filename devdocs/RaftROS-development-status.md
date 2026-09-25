@@ -222,6 +222,47 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### O6 RESOLVED for CycloneDDS — malformed SEDP subscriptions (2026-09-25)
+
+**Root cause:** `SEDPHandler::buildSubscriptionMessage` emitted
+`PID_TYPE_CONSISTENCY` with a declared parameter length of 8 but wrote **9**
+bytes of value (2-byte kind + 5 booleans + 2 pad bytes). Every parameter
+after it was shifted by one byte. Only *subscription* announcements carry
+this parameter, so our reader announcements were corrupt while publication
+announcements were well-formed - exactly matching the observed asymmetry
+(remote readers matched our writers; remote writers never matched our
+readers, so `ros_discovery_info` never flowed either way and the graph could
+not attribute endpoints to a node).
+
+**How it was found:** CycloneDDS (`RMW_IMPLEMENTATION=rmw_cyclonedds_cpp`)
+rejects the packets outright and says so - `malformed packet received from
+vendor 1.15 ... state parse:DATA`. FastDDS mis-parsed them silently, which
+is why the symptom survived months of investigation. Wireshark's expert info
+also flagged it once looked for: *"Not enough bytes to read the parameter
+value"*, with the following parameter read as id `0x2300` length 2048 (the
+real `PID_DEADLINE` + length, one byte early).
+
+**Result with CycloneDDS** (ESP32-S3 + VL6180, native Jazzy host):
+
+```
+ros2 node list                        -> /raft_esp32
+ros2 node info /raft_esp32            -> publishers /chatter, /raft/range_1_29
+                                         subscribers /chatter_in, /chatter_in2
+ros2 topic info -v /raft/range_1_29   -> Node name: raft_esp32, namespace /
+```
+
+**Still open (FastDDS only):** FastDDS continues to report
+`_NODE_NAME_UNKNOWN_` and its `ros_discovery_info` reader stays in the
+preemptive-ACKNACK state (`bitmapBase 0`, count incrementing on a backoff
+timer), never accepting our HEARTBEAT, and it never sends us its own rdi
+DATA. Ruled out since: message structure (identical to a captured working
+FastDDS-to-FastDDS exchange), addressing, ports, checksums, QoS
+(RELIABLE/TRANSIENT_LOCAL, AUTOMATIC liveliness with INFINITE lease),
+`PID_KEY_HASH` inline QoS, and vendor id. Reliable delivery works generally
+(`/chatter`). FastDDS release builds have Info logging compiled out, so
+getting its rejection reason needs an instrumented build or an upstream
+question.
+
 ### O6 `_NODE_NAME_UNKNOWN_` — wire-level evidence (2026-09-25)
 
 Captured with tshark on the native Linux host (`base8ubuntu`, Jazzy/FastDDS)
