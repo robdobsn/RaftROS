@@ -682,6 +682,11 @@ uint32_t SEDPHandler::buildSubscriptionMessage(
 #endif
 
     // PID_TYPE_CONSISTENCY — see notes in buildPublicationMessage.
+    // Value is exactly the declared 8 bytes: kind (2) + five booleans (5) +
+    // one pad byte to the 4-byte boundary.  Writing more than the declared
+    // length shifts every following parameter, which strict parsers
+    // (CycloneDDS) reject as a malformed packet and lenient ones (FastDDS)
+    // mis-parse - readers announced this way never match.
     putLE16(payload + pp, PID_TYPE_CONSISTENCY); pp += 2;
     putLE16(payload + pp, 8); pp += 2;
     putLE16(payload + pp, 1); pp += 2;  // kind = ALLOW_TYPE_COERCION
@@ -690,8 +695,7 @@ uint32_t SEDPHandler::buildSubscriptionMessage(
     payload[pp++] = 0;  // ignore_member_names
     payload[pp++] = 0;  // prevent_type_widening
     payload[pp++] = 0;  // force_type_validation
-    payload[pp++] = 0;  // pad
-    payload[pp++] = 0;  // pad
+    payload[pp++] = 0;  // pad to 8
 
 
     // Default QoS policy PIDs (DEADLINE, LIVELINESS, etc.)
