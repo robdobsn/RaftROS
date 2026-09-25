@@ -11,9 +11,12 @@ When connected to WiFi and booted:
 - Publishes `std_msgs/msg/String` on `/chatter` at 1 Hz with a payload like `Hello from raft_esp32 [N]` (RELIABLE + VOLATILE QoS).
 - Handles incoming HEARTBEAT / ACKNACK and retransmits lost SEDP and user-data DATA submessages.
 - **Auto-publishes every connected bus device** as a typed ROS 2 topic on
-  `rt/raft/<slug>_<bus>_<addrHex>` (Phase 4). For example an MPU6050 at
-  `bus=1, addr=0x68` appears as `rt/raft/imu_1_68` with type
+  `/raft/<slug>_<bus>_<addrHex>` (Phase 4). For example an MPU6050 at
+  `bus=1, addr=0x68` appears as `/raft/imu_1_68` with type
   `sensor_msgs/msg/Imu`. See "Auto-publishing bus devices" below.
+- Does all of the above over **either** transport: native RTPS/DDS (the
+  default) or Zenoh via an `rmw_zenoh` router. The choice is made at build
+  time - see "Choosing the transport" below.
 
 ## Build and flash
 
@@ -54,9 +57,79 @@ env -u PYTHONPATH PYTHONNOUSERSITE=1 bash -lc '
 
 The `env -u PYTHONPATH PYTHONNOUSERSITE=1` and `--no-daemon` parts avoid a common user-site numpy collision and a ROS 2 daemon XMLRPC timeout when running against a non-local DDS participant.
 
+## Choosing the transport
+
+ROS 2 can be reached two ways, and one is compiled into an image - there is no
+runtime switch, and the RTPS runtime and the Zenoh session are never both
+linked.
+
+| | RTPS / DDS (default) | Zenoh |
+| --- | --- | --- |
+| How it reaches ROS 2 | directly, over multicast and unicast UDP | one TCP session to a router |
+| Needs | nothing beyond the network | a reachable `rmw_zenohd`, and ROS 2 peers running `rmw_zenoh` |
+| App image | ~1268 kB | ~1251 kB |
+| Device auto-publish | yes | yes |
+| `/chatter` and string subscriptions | yes | not yet |
+
+Select Zenoh in `systypes/SysTypeMain/sdkconfig.defaults`:
+
+```
+CONFIG_RAFTROS_BACKEND_ZENOH=y
+```
+
+and point the device at the router in `systypes/SysTypeMain/SysTypes.json`:
+
+```json
+"RaftROS": {
+    "routerHost": "192.168.86.192",
+    "routerPort": 7447
+}
+```
+
+`routerHost` must be an IPv4 address: resolving a name would block the main
+loop for as long as the DNS query takes, so the SysMod refuses a hostname and
+says so in the log. Delete `build/SysTypeMain/sdkconfig` after changing
+`sdkconfig.defaults`, or the old selection is kept.
+
+## Demonstrating the Zenoh build
+
+Run a router on a machine the device can reach, then use the ordinary ROS 2
+tools:
+
+```bash
+ros2 run rmw_zenoh_cpp rmw_zenohd            # the router
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
+ros2 node list                               # expect /raft_esp32
+ros2 topic echo /raft/range_1_29             # expect Range samples
+```
+
+With no router to hand, `tools/` has two stand-ins that need no ROS install:
+
+```bash
+# Speaks the wire protocol directly: shows the session, every liveliness token
+# the device declares, and decoded samples.  Use --interest to exercise the
+# device's interest replies.
+python3 tools/zenoh_router_stub.py --interest
+
+# Uses the real Zenoh library, so it also shows that Zenoh itself accepts what
+# the firmware sends.  Needs: pip install eclipse-zenoh==1.8.0
+python3 tools/zenoh_subscriber_demo.py
+```
+
+Both print the device's node token, its per-endpoint token (topic, type and
+ROS type hash), and the samples. A device whose session drops re-declares
+everything on the new session and carries on from the next sequence number, so
+restarting either tool is a fair test of reconnection.
+
+The SysMod's own view is on `GET /api/rosstat`:
+
+```json
+{"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":1,"samples":9}
+```
+
 ## Configuration
 
-The RaftROS SysMod and the overall system configuration live in `systypes/SysTypeMain/SysTypes.json`. The relevant RaftROS fields are the domain ID, the ROS 2 node name (`raft_esp32` by default), the SPDP announce interval, and the participant lease duration.
+The RaftROS SysMod and the overall system configuration live in `systypes/SysTypeMain/SysTypes.json`. The relevant RaftROS fields are the domain ID, the ROS 2 node name (`raft_esp32` by default), the SPDP announce interval and participant lease duration (RTPS), and the router address (Zenoh).
 
 ## Auto-publishing bus devices (Phase 4)
 
@@ -67,8 +140,8 @@ common case.
 
 ### Topic + type rules
 
-- Topic name: `rt/raft/<slug>_<bus>_<addrHex>`
-  (e.g. `rt/raft/imu_1_6a`, `rt/raft/temperature_1_38`).
+- Topic name: `/raft/<slug>_<bus>_<addrHex>`
+  (e.g. `/raft/imu_1_6a`, `/raft/temperature_1_38`).
 - Message type is chosen by first-match on the device's `clas[]` tags and
   device type name (see `RTPSAutoPubClassMap.h`):
   - `{ACC, GYRO}` → `sensor_msgs/msg/Imu` (single writer).
@@ -115,8 +188,8 @@ override → built-in default):
 ros2 topic list --no-daemon
 
 # Example: an MPU6050 on I2C bus 1, address 0x6A.
-ros2 topic info /rt/raft/imu_1_6a --no-daemon -v
-ros2 topic echo /rt/raft/imu_1_6a sensor_msgs/msg/Imu --no-daemon
+ros2 topic info /raft/imu_1_6a --no-daemon -v
+ros2 topic echo /raft/imu_1_6a sensor_msgs/msg/Imu --no-daemon
 ```
 
 When the device is removed (or stops responding long enough for
