@@ -1,0 +1,121 @@
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+//
+// AutoPubAttachPlan - decide which endpoints a bus device should publish
+//
+// Pure decision logic shared by all backends: class mapping -> ROS topic/type
+// names -> semantic QoS.  No transport, no allocation, no RaftCore types.  The
+// caller supplies QoS override resolution (SysTypes alias/class overrides live
+// in the SysMod), so this header stays unit-testable on the host.
+//
+// Mirrors the behaviour the RTPS wrapper had inline: actuators are excluded,
+// an unmapped class falls back to std_msgs/String with the "raw" slug, and a
+// composite device yields a second endpoint with subIndex 1.
+//
+// Rob Dobson 2026
+//
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+#pragma once
+
+#include <cstddef>
+#include <cstring>
+#include "AutoPubClassMap.h"
+#include "AutoPubEndpointDesc.h"
+#include "AutoPubTopicNaming.h"
+
+namespace RaftRuntime {
+namespace AutoPub {
+
+/// @brief Endpoints a device should publish (at most one composite pair)
+struct AutoPubAttachPlan
+{
+    static constexpr uint8_t MAX_ENDPOINTS = 2;
+    bool excluded = false;                          ///< Device is an actuator - publish nothing
+    uint8_t endpointCount = 0;
+    AutoPubEndpointDesc endpoints[MAX_ENDPOINTS];
+};
+
+/// @brief The per-device alias a QoS override matches against: the last path
+/// segment of the topic (e.g. "range_1_29" in "rt/raft/range_1_29")
+inline const char* AutoPubAttachPlan_topicAlias(const char* topic)
+{
+    if (!topic)
+        return "";
+    const char* slash = std::strrchr(topic, '/');
+    return slash ? slash + 1 : topic;
+}
+
+/// @brief Build the plan for a device.
+/// @param deviceId bus/address of the device (subIndex is assigned per endpoint)
+/// @param clasArray device class tags (e.g. "TEMP", "RH"), may be null
+/// @param clasCount number of class tags
+/// @param deviceTypeName device type name from the type record, may be null
+/// @param resolveQoS callable (alias, clasArray, clasCount, deviceTypeName) -> AutoPubQoSProfileId
+/// @return plan; endpointCount 0 means nothing to publish (excluded, or a name
+///         that would not fit the descriptor)
+template<typename ResolveQoS>
+inline AutoPubAttachPlan AutoPubAttachPlan_build(
+        const AutoPubDeviceId& deviceId,
+        const char* const* clasArray, size_t clasCount,
+        const char* deviceTypeName,
+        ResolveQoS&& resolveQoS)
+{
+    AutoPubAttachPlan plan;
+    const AutoPubClassMapping mapping = AutoPubClassMap_lookup(clasArray, clasCount, deviceTypeName);
+    if (mapping.excluded)
+    {
+        plan.excluded = true;
+        return plan;
+    }
+
+    // Primary endpoint.  A successful lookup always yields a slug; fall back
+    // explicitly in case a future mapping returns something unexpected.
+    const char* const primarySlug = mapping.primaryTopicSlug ? mapping.primaryTopicSlug : "raw";
+    const char* const primaryType = AutoPubClassMap_typeName(mapping.primaryKind)
+                                  ? AutoPubClassMap_typeName(mapping.primaryKind)
+                                  : AUTOPUB_FALLBACK_TYPE;
+    char topicBuf[AUTOPUB_TOPIC_MAX_LEN];
+    if (!AutoPubTopicNaming_formatClassTopic(topicBuf, sizeof(topicBuf), primarySlug,
+                                             deviceId.busNum, deviceId.address))
+        return plan;
+
+    AutoPubEndpointDesc& primary = plan.endpoints[0];
+    if (!primary.setNames(topicBuf, primaryType))
+        return plan;
+    primary.deviceId = deviceId;
+    primary.deviceId.subIndex = 0;
+    primary.msgKind = mapping.primaryKind;
+    primary.qosProfileId = resolveQoS(AutoPubAttachPlan_topicAlias(primary.topic),
+                                      clasArray, clasCount, deviceTypeName);
+    plan.endpointCount = 1;
+
+    // Composite secondary endpoint (e.g. AHT20 -> Temperature + RelativeHumidity).
+    // A secondary that cannot be named is dropped; the primary still publishes.
+    if (!mapping.hasSecondary())
+        return plan;
+    const char* const secondarySlug = mapping.secondaryTopicSlug ? mapping.secondaryTopicSlug : "raw2";
+    const char* const secondaryType = AutoPubClassMap_typeName(mapping.secondaryKind)
+                                    ? AutoPubClassMap_typeName(mapping.secondaryKind)
+                                    : AUTOPUB_FALLBACK_TYPE;
+    char secTopicBuf[AUTOPUB_TOPIC_MAX_LEN];
+    if (!AutoPubTopicNaming_formatClassTopic(secTopicBuf, sizeof(secTopicBuf), secondarySlug,
+                                             deviceId.busNum, deviceId.address))
+        return plan;
+
+    AutoPubEndpointDesc& secondary = plan.endpoints[1];
+    if (!secondary.setNames(secTopicBuf, secondaryType))
+    {
+        secondary = AutoPubEndpointDesc();
+        return plan;
+    }
+    secondary.deviceId = deviceId;
+    secondary.deviceId.subIndex = 1;
+    secondary.msgKind = mapping.secondaryKind;
+    secondary.qosProfileId = resolveQoS(AutoPubAttachPlan_topicAlias(secondary.topic),
+                                        clasArray, clasCount, deviceTypeName);
+    plan.endpointCount = 2;
+    return plan;
+}
+
+} // namespace AutoPub
+} // namespace RaftRuntime

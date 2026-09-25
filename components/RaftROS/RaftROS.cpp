@@ -206,6 +206,19 @@ void RaftROS::setup()
     // Initialize RTPS participant (GUID will be set when MAC is available)
     _participant.init(_domainId, _nodeName.c_str(), 0, nullptr);
 
+    // Wire the auto-publish backend to the RTPS objects it sends with.  The
+    // socket is passed by pointer because it is recreated on reconnect.
+    {
+        RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubBackendDeps deps;
+        deps.participant = &_participant;
+        deps.sedpHandler = &_sedpHandler;
+        deps.discovered = &_discovered;
+        deps.userDataSock = &_userDataSock;
+        deps.sendBuf = _autoPubSendBuf;
+        deps.sendBufLen = sizeof(_autoPubSendBuf);
+        _autoPubBackend.setup(deps);
+    }
+
     // Phase 4 / Slice 4.3 — register with DeviceManager so we get notified every
     // time a bus device comes online or goes offline.  Writers and SEDP announce
     // are still deferred (later slices); for now the hook is used to decode poll
@@ -353,7 +366,7 @@ void RaftROS::loop()
             const auto poolCounters = _autoPubPool.counters();
             LOG_I(MODULE_PREFIX,
                   "autoPubStatus slots=%u/%u devices=%u discovered=%u rosDiscSeq=%u state=%d stale=%u busy=%u empty=%u drainSkips=%u drainGapMax=%ums drainGaps>150ms=%u",
-                  (unsigned)_autoPubLifecycle.inUseCount(),
+                  (unsigned)_autoPubBackend.lifecycle().inUseCount(),
                   (unsigned)RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY,
                   (unsigned)_autoPubPool.inUseCount(),
                   (unsigned)_discovered.size(),
@@ -1747,7 +1760,7 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
               remote.guidPrefix[4], remote.guidPrefix[5], remote.guidPrefix[6], remote.guidPrefix[7],
               remote.guidPrefix[8], remote.guidPrefix[9], remote.guidPrefix[10], remote.guidPrefix[11],
               (unsigned)remote.metatrafficPort, (unsigned)remote.userDataPort, senderIpStr,
-              (unsigned)_autoPubLifecycle.inUseCount());
+              (unsigned)_autoPubBackend.lifecycle().inUseCount());
     }
 
     if (_pendingAnnounces.size() >= MAX_PENDING_ANNOUNCES)
@@ -2039,7 +2052,7 @@ void RaftROS::drainPendingAnnounces()
 
 bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8_t slot)
 {
-    const auto* pEntry = _autoPubLifecycle.get(slot);
+    const auto* pEntry = _autoPubBackend.lifecycle().get(slot);
     if (!pEntry || !pEntry->inUse || !pEntry->topic || !pEntry->type)
         return false;
 
@@ -2105,7 +2118,7 @@ uint64_t RaftROS::computeSedpPubHeartbeatLastSN() const
     using RaftRuntime::RTPS::Runtime::AutoPub::DYNAMIC_WRITER_REGISTRY_CAPACITY;
     for (uint8_t slot = 0; slot < DYNAMIC_WRITER_REGISTRY_CAPACITY; slot++)
     {
-        const auto* pEntry = _autoPubLifecycle.get(slot);
+        const auto* pEntry = _autoPubBackend.lifecycle().get(slot);
         if (pEntry && pEntry->inUse && pEntry->sedpSeqNum > maxSeq)
             maxSeq = pEntry->sedpSeqNum;
     }
@@ -2140,7 +2153,7 @@ uint32_t RaftROS::buildRosDiscInfoWithGids(uint8_t* pBuf, uint32_t bufLen)
     writerIds[numWriterIds++] = ENTITYID_CHATTER_WRITER;
     for (uint8_t slot = 0; slot < DYNAMIC_WRITER_REGISTRY_CAPACITY; slot++)
     {
-        const auto* pEntry = _autoPubLifecycle.get(slot);
+        const auto* pEntry = _autoPubBackend.lifecycle().get(slot);
         if (!pEntry)
             continue;
         writerIds[numWriterIds++] = pEntry->entityId;
@@ -2505,7 +2518,7 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
 
     // Already attached? (Shouldn't normally happen — DeviceManager re-emits
     // online on reconnect after offline, by which point we've detached.)
-    if (_autoPubLifecycle.find(key) >= 0)
+    if (_autoPubBackend.lifecycle().find(key) >= 0)
     {
         LOG_I(MODULE_PREFIX, "autoPubAttach already attached devID=%s — skipping",
               devID.toString().c_str());
@@ -2532,95 +2545,60 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
     for (const auto& s : clasStrs)
         clasPtrs.push_back(s.c_str());
 
-    const RTPSAutoPubClassMapping mapping = RTPSAutoPubClassMap_lookup(
-        clasPtrs.empty() ? nullptr : clasPtrs.data(),
-        clasPtrs.size(),
-        pDeviceTypeName);
+    // Decide what this device publishes: class mapping -> ROS topic/type ->
+    // semantic QoS.  Shared with any backend (AutoPub/AutoPubAttachPlan.h);
+    // the SysTypes QoS overrides stay here because they are SysMod config.
+    using RaftRuntime::AutoPub::AutoPubAttachPlan_build;
+    using RaftRuntime::AutoPub::AutoPubQoSProfile_name;
+    const RaftRuntime::AutoPub::AutoPubDeviceId planDeviceId{
+        (uint8_t)devID.getBusNum(), (uint32_t)devID.getAddress(), 0};
+    const auto plan = AutoPubAttachPlan_build(
+        planDeviceId,
+        clasPtrs.empty() ? nullptr : clasPtrs.data(), clasPtrs.size(), pDeviceTypeName,
+        [this](const char* alias, const char* const* clasArray, size_t clasCount,
+               const char* deviceTypeName) {
+            return autoPubResolveQoSProfileId(alias, clasArray, clasCount, deviceTypeName);
+        });
 
-    if (mapping.excluded)
+    if (plan.excluded)
     {
         LOG_I(MODULE_PREFIX, "autoPubAttach devID=%s type=%s is an actuator — excluded from auto-publish",
-              devID.toString().c_str(),
-              pDeviceTypeName ? pDeviceTypeName : "?");
+              devID.toString().c_str(), pDeviceTypeName ? pDeviceTypeName : "?");
         return false;
     }
-
-    // Resolve topic slug + type name.  A successful class-map lookup always
-    // yields a non-null slug; for safety fall through to the explicit
-    // fallback formatters if the lookup ever returned something unexpected.
-    const char* const pTopicSlug = mapping.primaryTopicSlug
-                                 ? mapping.primaryTopicSlug : "raw";
-    const char* const pTypeName  = RTPSAutoPubClassMap_typeName(mapping.primaryKind)
-                                 ? RTPSAutoPubClassMap_typeName(mapping.primaryKind)
-                                 : RTPS_AUTOPUB_FALLBACK_TYPE;
-
-    char topicBuf[AUTOPUB_TOPIC_BUF_LEN];
-    char typeBuf[AUTOPUB_TYPE_BUF_LEN];
-    if (!RTPSAutoPubTopicNaming_formatClassTopic(topicBuf, sizeof(topicBuf),
-                                                 pTopicSlug,
-                                                 (uint8_t)devID.getBusNum(),
-                                                 (uint32_t)devID.getAddress()))
+    if (plan.endpointCount == 0)
     {
-        LOG_W(MODULE_PREFIX, "autoPubAttach topic format failed for devID=%s slug=%s",
-              devID.toString().c_str(), pTopicSlug);
+        LOG_W(MODULE_PREFIX, "autoPubAttach devID=%s type=%s — no publishable endpoint (name too long?)",
+              devID.toString().c_str(), pDeviceTypeName ? pDeviceTypeName : "?");
         return false;
     }
+    if (plan.endpointCount > 1)
     {
-        const int written = std::snprintf(typeBuf, sizeof(typeBuf), "%s", pTypeName);
-        if (written < 0 || (size_t)written >= sizeof(typeBuf))
-        {
-            LOG_W(MODULE_PREFIX, "autoPubAttach type name too long for devID=%s (%s)",
-                  devID.toString().c_str(), pTypeName);
-            return false;
-        }
-    }
-
-    if (mapping.hasSecondary())
-    {
-        // Two-writer composite (TEMP+RH, PRES+TEMP).  Attach of the secondary
-        // writer happens below, after the primary slot allocation succeeds.
-        LOG_I(MODULE_PREFIX,
-              "autoPubAttach devID=%s composite: primary=%s/%s, secondary=%s/%s",
+        LOG_I(MODULE_PREFIX, "autoPubAttach devID=%s composite: primary=%s/%s, secondary=%s/%s",
               devID.toString().c_str(),
-              pTopicSlug,
-              pTypeName,
-              mapping.secondaryTopicSlug ? mapping.secondaryTopicSlug : "?",
-              RTPSAutoPubClassMap_typeName(mapping.secondaryKind)
-                  ? RTPSAutoPubClassMap_typeName(mapping.secondaryKind) : "?");
+              plan.endpoints[0].topic, plan.endpoints[0].type,
+              plan.endpoints[1].topic, plan.endpoints[1].type);
     }
 
-    // Slice 4.11 — resolve the QoS profile for this writer.  The alias is the
-    // per-device tail of the topic ("imu_1_6a"), which is what the SysTypes
-    // override surface documents (design §7.2).
-    using RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId;
-    using RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfile_name;
-    const char* pAlias = std::strrchr(topicBuf, '/');
-    pAlias = pAlias ? pAlias + 1 : topicBuf;
-    const RTPSAutoPubQoSProfileId qosId = autoPubResolveQoSProfileId(
-        pAlias,
-        clasPtrs.empty() ? nullptr : clasPtrs.data(),
-        clasPtrs.size(),
-        pDeviceTypeName);
-
-    uint8_t entityId[4] = {0};
-    const int slot = _autoPubLifecycle.attach(key, topicBuf, typeBuf, entityId,
-                                              static_cast<uint8_t>(qosId));
-    if (slot < 0)
+    // Create the primary publisher on the selected backend
+    const uint8_t slot = _autoPubBackend.createPublisher(plan.endpoints[0]);
+    if (slot == RTPSAutoPubBackend::INVALID_SLOT)
     {
-        LOG_W(MODULE_PREFIX, "autoPubAttach lifecycle full — cannot attach devID=%s typeIdx=%u",
+        LOG_W(MODULE_PREFIX, "autoPubAttach backend full — cannot attach devID=%s typeIdx=%u",
               devID.toString().c_str(), (unsigned)addrStatus.deviceTypeIndex);
         return false;
     }
-    LOG_I(MODULE_PREFIX, "autoPubAttach devID=%s slot=%d alias=%s qos=%s",
-          devID.toString().c_str(), slot, pAlias,
-          RTPSAutoPubQoSProfile_name(qosId));
+    LOG_I(MODULE_PREFIX, "autoPubAttach devID=%s slot=%u topic=%s type=%s qos=%s",
+          devID.toString().c_str(), (unsigned)slot,
+          plan.endpoints[0].topic, plan.endpoints[0].type,
+          AutoPubQoSProfile_name(plan.endpoints[0].qosProfileId));
 
     // Build per-device context — cache decode metadata + pre-allocate decode buffer.
     DynamicWriterCtx* pCtx = new DynamicWriterCtx();
     pCtx->pOwner = this;
     pCtx->deviceID = devID;
     pCtx->deviceTypeIndex = addrStatus.deviceTypeIndex;
-    pCtx->slot = (uint8_t)slot;
+    pCtx->slot = slot;
 
     if (haveTypeRec && devTypeRec.pollResultDecodeFn && devTypeRec.pollFieldDescs)
     {
@@ -2646,7 +2624,7 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
 
     // Slice 4.5 — cache the ROS 2 message kind so the hot path skips the
     // class-map lookup.  CDR payload buffers are shared (loop task only).
-    pCtx->msgKind = mapping.primaryKind;
+    pCtx->msgKind = plan.endpoints[0].msgKind;
 
     // Z2 — claim a generation-safe mailbox handle for the bus data callback.
     // Without one the writer is still announced but publishes nothing.
@@ -2664,78 +2642,35 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
 
     _autoPubCtxs[slot] = pCtx;
 
-    LOG_I(MODULE_PREFIX, "autoPubAttach devID=%s typeIdx=%u slot=%d topic=%s type=%s eid=%02x%02x%02x%02x fields=%u structSize=%u",
+    const uint8_t* pEntityId = _autoPubBackend.entityIdForSlot(slot);
+    LOG_I(MODULE_PREFIX, "autoPubAttach devID=%s typeIdx=%u slot=%u topic=%s type=%s eid=%02x%02x%02x%02x fields=%u structSize=%u",
           devID.toString().c_str(), (unsigned)addrStatus.deviceTypeIndex,
-          slot, topicBuf, pTypeName,
-          entityId[0], entityId[1], entityId[2], entityId[3],
+          (unsigned)slot, plan.endpoints[0].topic, plan.endpoints[0].type,
+          pEntityId ? pEntityId[0] : 0, pEntityId ? pEntityId[1] : 0,
+          pEntityId ? pEntityId[2] : 0, pEntityId ? pEntityId[3] : 0,
           (unsigned)pCtx->fieldCount, (unsigned)pCtx->structSize);
 
-    // Slice 4.10 — attach the composite secondary writer, if any.  Uses
-    // `subIndex=1` to get a distinct registry slot (distinct entityId and
-    // topic) while still being able to resolve "the device at (bus, addr)".
-    // Failure here is logged but non-fatal — the primary writer keeps working.
-    if (mapping.hasSecondary())
+    // Composite secondary endpoint (e.g. AHT20 publishes Temperature on the
+    // primary slot and RelativeHumidity here).  It shares the decoded record
+    // and field descriptors with the primary but gets its own backend
+    // publisher (distinct topic and wire identity).  Failure is non-fatal:
+    // the primary keeps publishing.
+    if (plan.endpointCount > 1)
     {
-        const char* const pSecSlug = mapping.secondaryTopicSlug
-                                   ? mapping.secondaryTopicSlug : "raw2";
-        const char* const pSecType = RTPSAutoPubClassMap_typeName(mapping.secondaryKind)
-                                   ? RTPSAutoPubClassMap_typeName(mapping.secondaryKind)
-                                   : RTPS_AUTOPUB_FALLBACK_TYPE;
-        char secTopicBuf[AUTOPUB_TOPIC_BUF_LEN];
-        char secTypeBuf[AUTOPUB_TYPE_BUF_LEN];
-        if (!RTPSAutoPubTopicNaming_formatClassTopic(secTopicBuf, sizeof(secTopicBuf),
-                                                     pSecSlug,
-                                                     (uint8_t)devID.getBusNum(),
-                                                     (uint32_t)devID.getAddress()))
+        const uint8_t secSlot = _autoPubBackend.createPublisher(plan.endpoints[1]);
+        if (secSlot == RTPSAutoPubBackend::INVALID_SLOT)
         {
-            LOG_W(MODULE_PREFIX, "autoPubAttach secondary topic format failed devID=%s slug=%s",
-                  devID.toString().c_str(), pSecSlug);
+            LOG_W(MODULE_PREFIX, "autoPubAttach composite backend full — only primary attached devID=%s",
+                  devID.toString().c_str());
         }
         else
         {
-            const int secWritten = std::snprintf(secTypeBuf, sizeof(secTypeBuf), "%s", pSecType);
-            if (secWritten < 0 || (size_t)secWritten >= sizeof(secTypeBuf))
-            {
-                LOG_W(MODULE_PREFIX, "autoPubAttach secondary type too long devID=%s (%s)",
-                      devID.toString().c_str(), pSecType);
-            }
-            else
-            {
-                const RTPSDynamicWriterKey secKey{
-                    (uint8_t)devID.getBusNum(),
-                    (uint32_t)devID.getAddress(),
-                    /*subIndex=*/1 };
-                uint8_t secEntityId[4] = {0};
-                // Composite secondary shares the primary QoS profile unless a
-                // per-alias override selects a different one for the secondary
-                // topic slug (same class set, but distinct alias tail).
-                const char* pSecAlias = std::strrchr(secTopicBuf, '/');
-                pSecAlias = pSecAlias ? pSecAlias + 1 : secTopicBuf;
-                const RTPSAutoPubQoSProfileId secQosId = autoPubResolveQoSProfileId(
-                    pSecAlias,
-                    clasPtrs.empty() ? nullptr : clasPtrs.data(),
-                    clasPtrs.size(),
-                    pDeviceTypeName);
-                const int secSlot = _autoPubLifecycle.attach(
-                    secKey, secTopicBuf, secTypeBuf, secEntityId,
-                    static_cast<uint8_t>(secQosId));
-                if (secSlot < 0)
-                {
-                    LOG_W(MODULE_PREFIX,
-                          "autoPubAttach composite lifecycle full — only primary attached devID=%s",
-                          devID.toString().c_str());
-                }
-                else
-                {
-                    pCtx->secondarySlot = (uint8_t)secSlot;
-                    pCtx->secondaryMsgKind = mapping.secondaryKind;
-                    LOG_I(MODULE_PREFIX,
-                          "autoPubAttach secondary devID=%s slot=%d topic=%s type=%s eid=%02x%02x%02x%02x qos=%s",
-                          devID.toString().c_str(), secSlot, secTopicBuf, pSecType,
-                          secEntityId[0], secEntityId[1], secEntityId[2], secEntityId[3],
-                          RTPSAutoPubQoSProfile_name(secQosId));
-                }
-            }
+            pCtx->secondarySlot = secSlot;
+            pCtx->secondaryMsgKind = plan.endpoints[1].msgKind;
+            LOG_I(MODULE_PREFIX, "autoPubAttach secondary devID=%s slot=%u topic=%s type=%s qos=%s",
+                  devID.toString().c_str(), (unsigned)secSlot,
+                  plan.endpoints[1].topic, plan.endpoints[1].type,
+                  AutoPubQoSProfile_name(plan.endpoints[1].qosProfileId));
         }
     }
 
@@ -2764,7 +2699,7 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
     // "Publisher count: 0" and `ros2 topic echo` stays silent.
     for (const auto& remote : _discovered)
     {
-        (void)emitAutoPubSedpAnnounce(remote, (uint8_t)slot);
+        (void)emitAutoPubSedpAnnounce(remote, slot);
         if (pCtx->secondarySlot != 0xFF)
             (void)emitAutoPubSedpAnnounce(remote, pCtx->secondarySlot);
     }
@@ -2777,8 +2712,8 @@ bool RaftROS::autoPubAttachDevice(RaftDevice& device, const BusAddrStatus& addrS
     if (!_discovered.empty())
         _rosDiscSeqNum++;
     LOG_I(MODULE_PREFIX,
-          "autoPubAttach slot=%d secSlot=%d (rosDiscSeqNum now %u discovered=%u)",
-          slot, (int)pCtx->secondarySlot,
+          "autoPubAttach slot=%u secSlot=%d (rosDiscSeqNum now %u discovered=%u)",
+          (unsigned)slot, (int)pCtx->secondarySlot,
           (unsigned)_rosDiscSeqNum, (unsigned)_discovered.size());
 
     return true;
@@ -2790,7 +2725,7 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     const RaftDeviceID devID = device.getDeviceID();
     const RTPSDynamicWriterKey key{ (uint8_t)devID.getBusNum(), (uint32_t)devID.getAddress() };
 
-    const int slot = _autoPubLifecycle.find(key);
+    const int slot = _autoPubBackend.lifecycle().find(key);
     if (slot < 0)
         return;
 
@@ -2822,7 +2757,7 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     {
         if (slotIdx == 0xFF)
             return;
-        const auto* pRegEntry = _autoPubLifecycle.get(slotIdx);
+        const auto* pRegEntry = _autoPubBackend.lifecycle().get(slotIdx);
         if (!pRegEntry || !pRegEntry->inUse || _discovered.empty())
             return;
         // Dispose uses a fixed unique seq per slot (distinct from the
@@ -2860,9 +2795,9 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     if (pCtx && pCtx->secondarySlot != 0xFF)
         disposeSlot(pCtx->secondarySlot);
 
-    _autoPubLifecycle.detachSlot(slot);
+    _autoPubBackend.destroyPublisher((uint8_t)slot);
     if (pCtx && pCtx->secondarySlot != 0xFF)
-        _autoPubLifecycle.detachSlot(pCtx->secondarySlot);
+        _autoPubBackend.destroyPublisher(pCtx->secondarySlot);
 
     // See autoPubAttachDevice: only advance the RDI writer sequence when a
     // discovered participant may already have accepted the previous sample.
@@ -2972,30 +2907,12 @@ void RaftROS::autoPubDrainSamples()
              AUTOPUB_CDR_BUF_SIZE}
         };
         AutoPubSampleResult results[2];
-        RTPSAutoPubSampleEmission emissions[2];
+        uint64_t emissionSeq[2] = {0, 0};
+        uint32_t emissionPeers[2] = {0, 0};
         auto publish = [&](uint8_t outputIndex, const uint8_t* payload, uint32_t length, uint32_t) {
             const uint8_t slot = outputIndex == 0 ? pCtx->slot : pCtx->secondarySlot;
-            emissions[outputIndex] = RTPSAutoPubSampleEmitter_emit(
-                _autoPubLifecycle.getMutable(slot), payload, length, _discovered,
-                [&](const auto& remote, const auto& entry, const uint8_t* cdr,
-                    uint32_t cdrLength, uint64_t sequence) {
-                    const uint32_t msgLen = _sedpHandler.buildUserDataMessage(
-                        _autoPubSendBuf, sizeof(_autoPubSendBuf),
-                        _participant, remote.guidPrefix,
-                        entry.entityId, cdr, cdrLength,
-                        sequence, /*heartbeatCount=*/0,
-                        /*firstSN=*/sequence);
-                    if (msgLen == 0)
-                        return AutoPubPublishResult::Oversized;
-                    struct sockaddr_in dest = {};
-                    dest.sin_family = AF_INET;
-                    dest.sin_port = htons(remote.userDataPort);
-                    dest.sin_addr.s_addr = remote.ipAddr;
-                    const int sent = sendto(_userDataSock, _autoPubSendBuf, msgLen, 0,
-                                            (struct sockaddr*)&dest, sizeof(dest));
-                    return sent > 0 ? AutoPubPublishResult::Accepted : AutoPubPublishResult::SendFailed;
-                });
-            return emissions[outputIndex].result;
+            return _autoPubBackend.publish(slot, payload, length,
+                                           &emissionSeq[outputIndex], &emissionPeers[outputIndex]);
         };
 
         const bool batchOK = AutoPubSampleRunner::run(batch, outputs, 2, results, publish);
@@ -3017,7 +2934,7 @@ void RaftROS::autoPubDrainSamples()
                   pCtx->deviceID.toString().c_str(), (unsigned)pCtx->deviceTypeIndex,
                   (unsigned)pCtx->slot,
                   (unsigned)results[0].bytesWritten, (int)results[0].serialized,
-                  (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
+                  (unsigned)emissionSeq[0], (unsigned)emissionPeers[0],
                   (unsigned)results[0].publishResult,
                   (unsigned)sample.overwritten,
                   (unsigned)pCtx->cbGapHist[0].load(std::memory_order_relaxed),
@@ -3034,10 +2951,10 @@ void RaftROS::autoPubDrainSamples()
                   pCtx->deviceID.toString().c_str(), (unsigned)pCtx->deviceTypeIndex,
                   (unsigned)pCtx->slot, (unsigned)pCtx->secondarySlot,
                   (unsigned)results[0].bytesWritten, (int)results[0].serialized,
-                  (unsigned)emissions[0].sequence, (unsigned)emissions[0].peersSent,
+                  (unsigned)emissionSeq[0], (unsigned)emissionPeers[0],
                   (unsigned)results[0].publishResult,
                   (unsigned)results[1].bytesWritten, (int)results[1].serialized,
-                  (unsigned)emissions[1].sequence, (unsigned)emissions[1].peersSent,
+                  (unsigned)emissionSeq[1], (unsigned)emissionPeers[1],
                   (unsigned)results[1].publishResult,
                   (unsigned)sample.overwritten, (unsigned)sample.produced);
         }
