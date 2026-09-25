@@ -32,7 +32,7 @@ RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -DRAFTROS_ZENOH_GID_REFERENCE
     /reference/src/rmw_zenoh/rmw_zenoh_cpp/src/detail/simplified_xxhash3.cpp -o zenoh_gid_reference_tests \
     && ./zenoh_gid_reference_tests
 COPY linux_unit_tests/zenoh_metadata_interop.py linux_unit_tests/zenoh_wire_interop.py ./
-COPY components/RaftROS/Zenoh/ZenohStreamFramer.h components/RaftROS/Zenoh/ZenohTCPSession.h components/RaftROS/Zenoh/ZenohNetworkMessage.h include/Zenoh/
+COPY components/RaftROS/Zenoh/ZenohStreamFramer.h components/RaftROS/Zenoh/ZenohTCPSession.h components/RaftROS/Zenoh/ZenohNetworkMessage.h components/RaftROS/Zenoh/ZenohInterestMatch.h include/Zenoh/
 COPY components/RaftROS/CDR/CDREncoder.h components/RaftROS/CDR/CDREncoder.cpp include/CDR/
 COPY components/RaftROS/AutoPub/AutoPubCDRSerializer.h components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp components/RaftROS/AutoPub/AutoPubClassMap.h components/RaftROS/AutoPub/AutoPubSampleRunner.h include/AutoPub/
 COPY linux_unit_tests/zenoh_session_tests.cpp linux_unit_tests/zenoh_session_probe.cpp ./

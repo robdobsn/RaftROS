@@ -1,0 +1,45 @@
+menu "RaftROS"
+
+    choice RAFTROS_BACKEND
+        prompt "ROS 2 transport backend"
+        default RAFTROS_BACKEND_RTPS
+        help
+            Which ROS 2 transport this image speaks.  Exactly one backend is
+            compiled and linked; there is no runtime switch.
+
+        config RAFTROS_BACKEND_RTPS
+            bool "RTPS / DDS (native ROS 2 over UDP)"
+            help
+                Talk to ROS 2 directly over RTPS/DDS multicast and unicast UDP,
+                as FastDDS and CycloneDDS do.  No router or bridge is needed.
+
+        config RAFTROS_BACKEND_ZENOH
+            bool "Zenoh (via an rmw_zenoh router)"
+            help
+                Talk to ROS 2 through a Zenoh router over one TCP session, as
+                rmw_zenoh does.  A router must be reachable; ROS 2 peers must
+                also be running rmw_zenoh.
+    endchoice
+
+    config RAFTROS_ZENOH_ROUTER_HOST
+        string "Zenoh router host"
+        default "192.168.1.1"
+        depends on RAFTROS_BACKEND_ZENOH
+        help
+            IPv4 address of the Zenoh router to connect to.  Overridden by the
+            "routerHost" setting in the SysMod's SysTypes configuration.
+
+            This must be an address, not a hostname: resolving a name blocks
+            for as long as the DNS query takes, which would break the Raft
+            main-loop budget.
+
+    config RAFTROS_ZENOH_ROUTER_PORT
+        int "Zenoh router port"
+        default 7447
+        range 1 65535
+        depends on RAFTROS_BACKEND_ZENOH
+        help
+            TCP port the Zenoh router listens on.  Overridden by the
+            "routerPort" setting in the SysMod's SysTypes configuration.
+
+endmenu

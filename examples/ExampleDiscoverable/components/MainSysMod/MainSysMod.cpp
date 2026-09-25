@@ -24,6 +24,9 @@ MainSysMod::~MainSysMod()
 
 void MainSysMod::setup()
 {
+#if RAFTROS_BACKEND_RTPS
+    // Subscriptions are an RTPS-build feature today; the Zenoh build publishes
+    // but does not yet subscribe, so this hook is compiled out there.
     // Hook the RaftROS /chatter_in handler so application code receives decoded
     // std_msgs/String messages. This runs after SysMods have been created, so
     // the RaftROS instance is available by name lookup.
@@ -75,6 +78,7 @@ void MainSysMod::setup()
             LOG_W(MODULE_PREFIX, "RaftROS SysMod not found - cannot register handler");
         }
     }
+#endif
 }
 
 void MainSysMod::loop()

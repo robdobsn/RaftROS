@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "Zenoh/ZenohAutoPubBackend.h"
+#include "Zenoh/ZenohInterestMatch.h"
 
 #define TEST_ASSERT(cond, msg) do { if (!(cond)) { std::printf("  FAIL: %s\n", msg); ++failCount; } else { ++passCount; } } while (false)
 
@@ -358,6 +359,37 @@ int main()
                     "all endpoints are declared and holding slots");
     }
 
-    std::printf("ZenohAutoPubBackend: %d passed, %d failed\n", passCount, failCount);
+    std::printf("Test: router interests are matched, or refused rather than guessed at\n");
+    {
+        using RaftRuntime::Zenoh::ZenohInterestMatch;
+        using Result = RaftRuntime::Zenoh::ZenohInterestMatchResult;
+        const char* token = "@ros2_lv/23/abc/1/2/MP/%/%/raft_esp32/%raft_esp32%range/type/hash/2::,5:,:,:,,";
+
+        TEST_ASSERT(ZenohInterestMatch("", token) == Result::Match,
+                    "an empty key expression asks for everything we hold");
+        TEST_ASSERT(ZenohInterestMatch(token, token) == Result::Match, "an exact key matches");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/23/other", token) == Result::NoMatch,
+                    "a different exact key does not match");
+
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/**", token) == Result::Match,
+                    "a subtree expression covers keys below its prefix");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/23/abc/**", token) == Result::Match,
+                    "a deeper subtree expression still covers the key");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/24/**", token) == Result::NoMatch,
+                    "a subtree of a different domain does not match");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/2/**", "@ros2_lv/23/abc") == Result::NoMatch,
+                    "a subtree prefix only matches on a segment boundary, not a shared character run");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/23/**", "@ros2_lv/23") == Result::Match,
+                    "a subtree expression covers the prefix itself");
+
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/*/abc", token) == Result::Unsupported,
+                    "a wildcard we do not implement is refused, not silently unmatched");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/*/**", token) == Result::Unsupported,
+                    "a wildcard inside a subtree prefix is refused");
+        TEST_ASSERT(ZenohInterestMatch("@ros2_lv/$x/abc", token) == Result::Unsupported,
+                    "a verbatim-segment expression is refused");
+    }
+
+    std::printf("Zenoh firmware pieces: %d passed, %d failed\n", passCount, failCount);
     return failCount == 0 ? 0 : 1;
 }
