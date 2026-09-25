@@ -216,6 +216,10 @@ void RaftROS::setup()
         deps.userDataSock = &_userDataSock;
         deps.sendBuf = _autoPubSendBuf;
         deps.sendBufLen = sizeof(_autoPubSendBuf);
+        deps.metatrafficSock = &_metatrafficSock;
+        deps.metaSendBuf = _sendBuf;
+        deps.metaSendBufLen = sizeof(_sendBuf);
+        deps.myIpAddr = &_myIpAddr;
         _autoPubBackend.setup(deps);
     }
 
@@ -2052,51 +2056,20 @@ void RaftROS::drainPendingAnnounces()
 
 bool RaftROS::emitAutoPubSedpAnnounce(const DiscoveredParticipant& remote, uint8_t slot)
 {
-    const auto* pEntry = _autoPubBackend.lifecycle().get(slot);
-    if (!pEntry || !pEntry->inUse || !pEntry->topic || !pEntry->type)
-        return false;
-
-    // QoS: resolved per-writer at attach time (design doc §7.2).  Profile id
-    // is stored on the registry entry; Slice 4.11 translates to the SEDP
-    // reliability/durability enums here.
-    using RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfileId;
-    using RaftRuntime::RTPS::Runtime::AutoPub::RTPSAutoPubQoSProfile_get;
-    // SEDP publications writer seq is a fixed unique value per slot (assigned
-    // at allocate() time).  Re-announces reuse the same seq so FastDDS treats
-    // them as retransmits of an already-received sample rather than a fresh
-    // one colliding with ros_discovery_info (seq 1) or /chatter (seq 2).
-    const uint64_t thisSeq = pEntry->sedpSeqNum;
-    const auto qos = RTPSAutoPubQoSProfile_get(
-        static_cast<RTPSAutoPubQoSProfileId>(pEntry->qosProfileId));
-    const uint32_t payloadLen = _sedpHandler.buildPublicationMessage(
-        _sendBuf, sizeof(_sendBuf),
-        _participant, remote.guidPrefix,
-        pEntry->entityId, pEntry->topic, pEntry->type,
-        qos.reliability, qos.durability,
-        thisSeq, _myIpAddr, /*heartbeatCount*/ 0,
-        computeSedpPubHeartbeatLastSN());
-    if (payloadLen == 0)
-        return false;
-
-    struct sockaddr_in dest = {};
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(remote.metatrafficPort);
-    dest.sin_addr.s_addr = remote.ipAddr;
-    const int sent = sendto(_metatrafficSock, _sendBuf, payloadLen, 0,
-                            (struct sockaddr*)&dest, sizeof(dest));
-
-    // Keep a low-rate diagnostic at INFO level so on-device flash logs confirm
-    // that autopub writers are being announced to every discovered peer (this
-    // firing is prerequisite to the host's rmw seeing a matched publisher).
+    // Message building and sending belong to the backend; the SEDP
+    // publications high-water mark stays here because it spans every
+    // announced endpoint (chatter and ros_discovery_info as well as autopub).
+    const bool announced = _autoPubBackend.announceToPeer(slot, remote,
+                                                          computeSedpPubHeartbeatLastSN());
 #ifdef DEBUG_AUTOPUB_SEDP_ANNOUNCE
+    const auto* pEntry = _autoPubBackend.lifecycle().get(slot);
     LOG_I(MODULE_PREFIX,
-          "autoPubSEDP slot=%u topic=%s type=%s seq=%u sent %d/%u peerGuidPfx=%02x%02x%02x%02x peerIP=%08x port=%d",
-          (unsigned)slot, pEntry->topic, pEntry->type,
-          (unsigned)thisSeq, sent, (unsigned)payloadLen,
+          "autoPubSEDP slot=%u topic=%s announced=%d peerGuidPfx=%02x%02x%02x%02x peerIP=%08x port=%d",
+          (unsigned)slot, (pEntry && pEntry->topic) ? pEntry->topic : "?", (int)announced,
           remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
           (unsigned)remote.ipAddr, (int)remote.metatrafficPort);
 #endif
-    return payloadLen > 0;
+    return announced;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -2753,42 +2726,28 @@ void RaftROS::autoPubDetachDevice(RaftDevice& device, const BusAddrStatus& /*add
     // waiting for the participant lease to expire).  Must run *before* we
     // release the registry slot because we need the live `entityId`.
     // Slice 4.10 — also disposes the composite secondary slot (if any).
+    // Tell discovered peers to drop the writer now rather than waiting for
+    // the participant lease to expire.  Must run before the slot is released:
+    // the backend needs the live endpoint identity.
     auto disposeSlot = [&](uint8_t slotIdx)
     {
         if (slotIdx == 0xFF)
             return;
-        const auto* pRegEntry = _autoPubBackend.lifecycle().get(slotIdx);
-        if (!pRegEntry || !pRegEntry->inUse || _discovered.empty())
-            return;
-        // Dispose uses a fixed unique seq per slot (distinct from the
-        // announce seq on the same slot, and from other slots' announce/
-        // dispose seqs).  See AUTOPUB_SEDP_DISPOSE_BASE_SEQ.
+        // A fixed unique dispose seq per slot, distinct from that slot's
+        // announce seq and from other slots'.  See AUTOPUB_SEDP_DISPOSE_BASE_SEQ.
         using RaftRuntime::RTPS::Runtime::AutoPub::AUTOPUB_SEDP_DISPOSE_BASE_SEQ;
         const uint64_t disposeSeq = AUTOPUB_SEDP_DISPOSE_BASE_SEQ + slotIdx;
         int disposedTo = 0;
         for (const auto& remote : _discovered)
         {
-            const uint32_t msgLen = _sedpHandler.buildPublicationDisposeMessage(
-                _sendBuf, sizeof(_sendBuf),
-                _participant, remote.guidPrefix,
-                pRegEntry->entityId, disposeSeq);
-            if (msgLen == 0)
-                continue;
-            struct sockaddr_in dest = {};
-            dest.sin_family = AF_INET;
-            dest.sin_port = htons(remote.metatrafficPort);
-            dest.sin_addr.s_addr = remote.ipAddr;
-            const int sent = sendto(_metatrafficSock, _sendBuf, msgLen, 0,
-                                    (struct sockaddr*)&dest, sizeof(dest));
-            if (sent > 0)
+            if (_autoPubBackend.disposeAtPeer(slotIdx, remote, disposeSeq))
                 disposedTo++;
         }
-        LOG_I(MODULE_PREFIX,
-              "autoPubDispose devID=%s slot=%u eid=%02x%02x%02x%02x disposedTo=%d peers",
-              devID.toString().c_str(), (unsigned)slotIdx,
-              pRegEntry->entityId[0], pRegEntry->entityId[1],
-              pRegEntry->entityId[2], pRegEntry->entityId[3],
-              disposedTo);
+        if (disposedTo > 0)
+        {
+            LOG_I(MODULE_PREFIX, "autoPubDispose devID=%s slot=%u disposedTo=%d peers",
+                  devID.toString().c_str(), (unsigned)slotIdx, disposedTo);
+        }
     };
 
     disposeSlot(static_cast<uint8_t>(slot));

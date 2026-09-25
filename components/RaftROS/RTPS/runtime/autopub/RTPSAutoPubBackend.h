@@ -51,10 +51,19 @@ struct RTPSAutoPubBackendDeps
     const int* userDataSock = nullptr;      ///< Read each publish: sockets are recreated on reconnect
     uint8_t* sendBuf = nullptr;             ///< Scratch for one datagram (loop task only)
     uint32_t sendBufLen = 0;
+    const int* metatrafficSock = nullptr;   ///< Discovery (SEDP announce/dispose)
+    uint8_t* metaSendBuf = nullptr;         ///< Scratch for one discovery datagram
+    uint32_t metaSendBufLen = 0;
+    const uint32_t* myIpAddr = nullptr;     ///< Announced in SEDP locators
 
     bool isValid() const
     {
         return participant && sedpHandler && discovered && userDataSock && sendBuf && (sendBufLen > 0);
+    }
+
+    bool isDiscoveryValid() const
+    {
+        return isValid() && metatrafficSock && metaSendBuf && (metaSendBufLen > 0) && myIpAddr;
     }
 };
 
@@ -130,6 +139,55 @@ public:
         return emission.result;
     }
 
+    /// @brief Announce one endpoint to one discovered participant (SEDP
+    /// publication DATA).  `heartbeatLastSN` is the participant-wide SEDP
+    /// publications high-water mark, which the SysMod owns because it spans
+    /// every announced endpoint, not just auto-published ones.
+    bool announceToPeer(uint8_t slot, const DiscoveredParticipant& remote, uint64_t heartbeatLastSN)
+    {
+        if (!_deps.isDiscoveryValid())
+            return false;
+        const auto* pEntry = _lifecycle.get(slot);
+        if (!pEntry || !pEntry->inUse || !pEntry->topic || !pEntry->type)
+            return false;
+
+        // The SEDP publications sequence is a fixed unique value per slot,
+        // assigned at allocate(): re-announces reuse it so a remote treats
+        // them as retransmits rather than new samples.
+        const auto qos = RaftRuntime::AutoPub::AutoPubQoSProfile_get(
+            static_cast<RaftRuntime::AutoPub::AutoPubQoSProfileId>(pEntry->qosProfileId));
+        const uint32_t payloadLen = _deps.sedpHandler->buildPublicationMessage(
+            _deps.metaSendBuf, _deps.metaSendBufLen,
+            *_deps.participant, remote.guidPrefix,
+            pEntry->entityId, pEntry->topic, pEntry->type,
+            qos.reliability, qos.durability,
+            pEntry->sedpSeqNum, *_deps.myIpAddr, /*heartbeatCount*/ 0,
+            heartbeatLastSN);
+        if (payloadLen == 0)
+            return false;
+        sendToPeerMetatraffic(remote, payloadLen);
+        return true;
+    }
+
+    /// @brief Dispose one endpoint at one participant so it drops the writer
+    /// promptly instead of waiting for the participant lease to expire.
+    /// Must run before the slot is released - the live entity id is needed.
+    bool disposeAtPeer(uint8_t slot, const DiscoveredParticipant& remote, uint64_t disposeSeq)
+    {
+        if (!_deps.isDiscoveryValid())
+            return false;
+        const auto* pEntry = _lifecycle.get(slot);
+        if (!pEntry || !pEntry->inUse)
+            return false;
+        const uint32_t msgLen = _deps.sedpHandler->buildPublicationDisposeMessage(
+            _deps.metaSendBuf, _deps.metaSendBufLen,
+            *_deps.participant, remote.guidPrefix,
+            pEntry->entityId, disposeSeq);
+        if (msgLen == 0)
+            return false;
+        return sendToPeerMetatraffic(remote, msgLen) > 0;
+    }
+
     /// @brief Entity id for a slot, for the SysMod's SEDP announce/dispose
     const uint8_t* entityIdForSlot(uint8_t slot) const
     {
@@ -146,6 +204,16 @@ public:
     const RTPSAutoPubLifecycle& lifecycle() const { return _lifecycle; }
 
 private:
+    int sendToPeerMetatraffic(const DiscoveredParticipant& remote, uint32_t len)
+    {
+        struct sockaddr_in dest = {};
+        dest.sin_family = AF_INET;
+        dest.sin_port = htons(remote.metatrafficPort);
+        dest.sin_addr.s_addr = remote.ipAddr;
+        return sendto(*_deps.metatrafficSock, _deps.metaSendBuf, len, 0,
+                      (struct sockaddr*)&dest, sizeof(dest));
+    }
+
     RTPSAutoPubLifecycle _lifecycle;
     RTPSAutoPubBackendDeps _deps;
 };
