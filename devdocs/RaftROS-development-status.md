@@ -706,6 +706,11 @@ and has been validated on hardware against native ROS 2 Jazzy on Linux.
   it is a real graph-attribution bug rather than a WSL artefact; a rare ~101 ms
   loop stall around SPDP sends is unexplained; raw decoding, decoder
   allocation, attach/detach and transport lifecycle still live in RaftROS.
+  *(2026-09-26: O6 no longer reproduces on either RMW, and the loop now times
+  each phase and every datagram it sends, so a recurrence of the SPDP stall will
+  say so with a breakdown - at ~0.8 ms per datagram, a multi-destination SPDP
+  burst is a plausible cause. See "Loop Budget Under Load" and "Liveliness
+  Sequence 0".)*
 
 ### Shared Sample Dispatch and First Firmware Compile (2026-09-18)
 
