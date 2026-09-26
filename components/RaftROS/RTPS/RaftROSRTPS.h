@@ -163,7 +163,12 @@ private:
     uint64_t _sedpSeqNum = 1;     // seq 1 on SEDP pubs writer = ros_disc_info publication
     uint64_t _sedpSubSeqNum = 1;  // always 1 (single SEDP sub, never changes)
     uint64_t _rosDiscSeqNum = 1;  // bumped on autopub attach/detach (writer keeps only latest sample, firstSN==lastSN==seq)
-    uint64_t _livelinessSeqNum = 0; // incremented each liveliness send
+    // Starts at 1, not 0: RTPS sequence numbers begin at 1, and the initial
+    // announce publishes this counter's current value without advancing it, so
+    // a 0 here put a DATA with writerSN 0 and a HEARTBEAT with firstSN/lastSN 0
+    // on the wire - which CycloneDDS rejects as a malformed packet, dropping
+    // our first liveliness assertion to every participant.
+    uint64_t _livelinessSeqNum = 1; // advanced on each periodic liveliness send
     uint32_t _heartbeatCount = 0;
     uint32_t _acknackCount = 0;
 

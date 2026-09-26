@@ -527,6 +527,62 @@ int main()
     }
 
     //=================================================================
+    // Liveliness (ParticipantMessageData): RTPS sequence numbers start at 1.
+    // Sending sequence 0 put writerSN 0 in the DATA and firstSN/lastSN 0 in the
+    // HEARTBEAT, and CycloneDDS discards that whole datagram as malformed - so
+    // the first liveliness assertion to every participant was silently lost.
+    //=================================================================
+    {
+        printf("Test: liveliness ParticipantMessageData rejects sequence 0\n");
+
+        RTPSParticipant part;
+        part.init(0, "liveliness_test", 0, nullptr);
+        uint8_t mac[6] = {0x02, 0x04, 0x06, 0x08, 0x0A, 0x0C};
+        part.setGuidPrefixFromMAC(mac);
+        uint8_t destGP[12] = {1,2,3,4,5,6,7,8,9,10,11,12};
+
+        SEDPHandler sedp;
+        uint8_t msgBuf[512];
+        TEST_ASSERT(sedp.buildParticipantMessageData(msgBuf, sizeof(msgBuf), part, destGP,
+                                                     /*sequenceNumber=*/0, 1) == 0,
+                    "liveliness build refuses sequence 0 rather than sending an invalid sample");
+
+        const uint32_t msgLen = sedp.buildParticipantMessageData(msgBuf, sizeof(msgBuf), part, destGP,
+                                                                 /*sequenceNumber=*/1, 1);
+        TEST_ASSERT(msgLen > 0, "liveliness build accepts sequence 1");
+
+        // The HEARTBEAT must advertise the current sample, not an empty writer
+        uint8_t gp[12];
+        uint32_t off = RTPSMessage::parseHeader(msgBuf, msgLen, gp);
+        bool checkedHeartbeat = false, checkedData = false;
+        while (off < msgLen) {
+            RTPSSubmessageId id; uint8_t fl; const uint8_t* pc; uint32_t cl;
+            const uint32_t sz = RTPSMessage::parseSubmessage(msgBuf+off, msgLen-off, id, fl, pc, cl);
+            if (sz == 0) break;
+            if (id == SUBMSG_HEARTBEAT && cl >= 28) {
+                // readerId, writerId, firstSN (high, low), lastSN (high, low)
+                const uint32_t firstLow = (uint32_t)pc[12] | ((uint32_t)pc[13] << 8) |
+                                         ((uint32_t)pc[14] << 16) | ((uint32_t)pc[15] << 24);
+                const uint32_t lastLow  = (uint32_t)pc[20] | ((uint32_t)pc[21] << 8) |
+                                         ((uint32_t)pc[22] << 16) | ((uint32_t)pc[23] << 24);
+                TEST_ASSERT(firstLow == 1 && lastLow == 1,
+                            "liveliness HEARTBEAT advertises the current sample, never sequence 0");
+                checkedHeartbeat = true;
+            }
+            if (id == SUBMSG_DATA && cl >= 20) {
+                // extraFlags, octetsToInlineQos, readerId, writerId, then writerSN
+                const uint32_t writerSNLow = (uint32_t)pc[16] | ((uint32_t)pc[17] << 8) |
+                                             ((uint32_t)pc[18] << 16) | ((uint32_t)pc[19] << 24);
+                TEST_ASSERT(writerSNLow == 1, "liveliness DATA carries writerSN 1");
+                checkedData = true;
+            }
+            off += sz;
+        }
+        TEST_ASSERT(checkedHeartbeat && checkedData,
+                    "liveliness message contains both a DATA and a HEARTBEAT to check");
+    }
+
+    //=================================================================
     // ACKNACK action plan: VOLATILE /chatter HEARTBEAT firstSN must equal
     // the current sequence number (Fix 15 regression guard).
     // This ensures newly-matched VOLATILE subscribers do not NACK historical

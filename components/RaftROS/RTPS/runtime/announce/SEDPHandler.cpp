@@ -743,7 +743,11 @@ uint32_t SEDPHandler::buildParticipantMessageData(
     uint64_t sequenceNumber,
     uint32_t heartbeatCount)
 {
-    if (!pBuf || bufLen < 120)
+    // Sequence number 0 is not a sample: RTPS numbers them from 1, so a 0 here
+    // would put a DATA with writerSN 0 and a HEARTBEAT with firstSN/lastSN 0 on
+    // the wire, and a strict parser (CycloneDDS) discards the whole datagram.
+    // Refusing to build it keeps a caller's off-by-one off the network.
+    if (!pBuf || bufLen < 120 || sequenceNumber == 0)
         return 0;
 
     uint32_t pos = 0;

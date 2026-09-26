@@ -222,6 +222,42 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### Liveliness Sequence 0, and Two Open RTPS Items That No Longer Reproduce (2026-09-26)
+
+**A real bug, found by reading a rejected packet.** CycloneDDS's complaint from
+the 2026-09-25 run included `wid 0xc2000200 ... first 0 last 0` - a HEARTBEAT on
+the participant-message (liveliness) writer advertising `firstSN = lastSN = 0`.
+RTPS numbers samples from 1, and an empty writer advertises `firstSN = lastSN +
+1`, so 0/0 is invalid and the matching DATA carried `writerSN 0`. The cause:
+`_livelinessSeqNum` started at 0 in the ESP SysMod, and the initial-announce
+path publishes that counter's current value **without** advancing it (only the
+periodic heartbeat pass pre-increments). The Linux standalone already started
+this counter at 1, which is why it never showed the fault.
+
+Fixed at both ends: the counter starts at 1, and
+`SEDPHandler::buildParticipantMessageData` now refuses a sequence number of 0
+rather than putting an invalid sample on the wire. Regression test asserts the
+refusal, and that a sequence of 1 yields `writerSN 1` and `firstSN/lastSN 1`.
+
+**What this fix did *not* do.** An A/B on hardware (revert both halves, reflash,
+re-measure) shows the symptoms below are absent either way, so the fix is
+hardening rather than their cure. Stated plainly because the temptation was to
+claim it:
+
+| Item | Yesterday | Today, 10 fresh participant starts |
+| --- | --- | --- |
+| CycloneDDS "malformed packet" | 2 reports in one run | **0** |
+| FastDDS `ros2 topic info -v` | `_NODE_NAME_UNKNOWN_` (O6) | `Node name: raft_esp32` |
+| Node, publisher count, type hash | partial under FastDDS | correct under both RMWs |
+
+Conditions covered: 5 participant starts per RMW, the first seconds after boot
+as well as a settled device, and RSSI -82 - as weak a link as yesterday's, so
+link quality does not explain it either. Both items therefore move from "open
+defect" to **not reproducible**: the malformed-packet wart and O6 are gone on
+this firmware, but nothing in this session's RTPS changes explains when they
+went, so they are worth re-checking rather than declared solved. One untested
+suspicion for yesterday's O6 reading: a stale `ros2 daemon` cache.
+
 ### Zenoh Reaches Parity: Subscriptions and /chatter (2026-09-25)
 
 The Zenoh build now does everything the RTPS build does, through the same
@@ -438,6 +474,11 @@ which is an independent check on both.
 
 ### Open: one malformed SEDP subscription packet per remote participant (2026-09-25)
 
+> **Update 2026-09-26: no longer reproducible.** 10 fresh participant starts
+> across CycloneDDS and FastDDS produced zero malformed reports - see "Liveliness
+> Sequence 0, and Two Open RTPS Items That No Longer Reproduce". The account
+> below is kept because nothing in the code explains when it stopped.
+
 After the `PID_TYPE_CONSISTENCY` fix, CycloneDDS reports exactly **one**
 malformed packet per participant it starts (reproducible, 1 per run):
 
@@ -461,6 +502,13 @@ correctness wart rather than a functional failure. Worth resolving before
 claiming strict-parser cleanliness.
 
 ### O6 RESOLVED for CycloneDDS — malformed SEDP subscriptions (2026-09-25)
+
+> **Update 2026-09-26:** FastDDS now resolves the node too
+> (`Node name: raft_esp32`, correct publisher count and type hash), so the
+> FastDDS half of O6 no longer reproduces either. See "Liveliness Sequence 0,
+> and Two Open RTPS Items That No Longer Reproduce" for the evidence and for
+> what was ruled out as the cause.
+
 
 **Root cause:** `SEDPHandler::buildSubscriptionMessage` emitted
 `PID_TYPE_CONSISTENCY` with a declared parameter length of 8 but wrote **9**
