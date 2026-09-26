@@ -346,6 +346,27 @@ private:
     /// @brief Advance the ros_discovery_info sequence after endpoints have gone
     void autoPubOnEndpointsDetached();
 
+    // Loop-budget diagnostics: worst pass since boot, and a rate limit on the
+    // breakdown log.  The Raft contract is 10 ms average / 50 ms worst case for
+    // any SysMod, and the receive phases are unbounded by construction.
+    uint32_t _loopPassMaxUs = 0;
+    uint32_t _rxBudgetDeferrals = 0;    ///< Times a receive drain deferred work to the next pass
+    // How much of the loop goes into the radio.  Every datagram this SysMod
+    // sends is timed, because these sends happen inside packet processing and
+    // lwIP blocks while the TX queue drains.
+    uint32_t _sendCount = 0;
+    uint64_t _sendTotalUs = 0;
+    uint32_t _sendMaxUs = 0;
+    int sendDatagram(int sock, const uint8_t* pBuf, uint32_t len, const struct sockaddr_in& dest);
+    // Per-phase receive budgets.  recvMetatraffic gets the largest share
+    // because it carries discovery and reliability traffic; recvUserData
+    // already handles one datagram per pass and needs no budget.
+    static const uint32_t RX_METATRAFFIC_BUDGET_US = 6000;
+    static const uint32_t RX_SPDP_BUDGET_US = 3000;
+    uint32_t _lastLoopBudgetLogMs = 0;
+    static const uint32_t LOOP_PASS_WARN_US = 20000;
+    static const uint32_t LOOP_BUDGET_LOG_INTERVAL_MS = 1000;
+
     // REST API handler
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
 

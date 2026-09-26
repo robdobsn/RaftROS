@@ -14,6 +14,7 @@
 #include "runtime/autopub/RTPSAutoPubQoSProfile.h"
 #include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 #include "RaftJson.h"
+#include "RaftUtils.h"
 #include "RestAPIEndpointManager.h"
 #include "RTPSTypes.h"
 #include "runtime/wire/RTPSMessage.h"
@@ -34,6 +35,8 @@
 #include "RaftBus.h"
 #include "RaftDevice.h"
 #include "esp_timer.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 // Socket / network headers (ESP-IDF / lwIP)
 #include <sys/socket.h>
@@ -261,11 +264,29 @@ void RaftROS::loop()
     if (!_isEnabled)
         return;
 
+    // Loop-budget diagnostics.  The Raft contract gives a SysMod 10 ms on
+    // average and 50 ms at worst, and the phases below are not all bounded -
+    // the receive paths drain whatever has arrived - so an overrunning pass
+    // records where the time went rather than only that it was slow.
+    struct PassTimes
+    {
+        uint32_t drainUs = 0, spdpSendUs = 0, heartbeatUs = 0, chatterUs = 0, purgeUs = 0;
+        uint32_t recvSpdpUs = 0, recvMetaUs = 0, recvUserUs = 0, announceUs = 0;
+    } pass;
+    const int64_t passStartUs = esp_timer_get_time();
+    int64_t phaseStartUs = passStartUs;
+    const auto markPhase = [&](uint32_t& slot) {
+        const int64_t nowUs = esp_timer_get_time();
+        slot = (uint32_t)(nowUs - phaseStartUs);
+        phaseStartUs = nowUs;
+    };
+
     // Emit the latest auto-published sample of every device whose bus
     // callback has stored one since the previous pass.  Runs in every state,
     // as the bus-task path did: with no discovered peers nothing is sent but
     // the writer sequence still advances once per sample.
     _autoPubSource.drainSamples();
+    markPhase(pass.drainUs);
 
     // State machine on connection state
     switch (_connState)
@@ -306,6 +327,7 @@ void RaftROS::loop()
             sendSPDP();
             _lastSpdpSendMs = now;
         }
+        markPhase(pass.spdpSendUs);
 
         // Periodic writer heartbeats + ros_discovery_info resend.  Rather than bursting
         // ~14 sendto()s (N peers x ~7 actions) in a single tick, kick off a pass here
@@ -321,6 +343,7 @@ void RaftROS::loop()
         {
             stepWriterHeartbeatPass();
         }
+        markPhase(pass.heartbeatUs);
 
         // Periodic chatter message publishing
         if (_connState == ConnState::ACTIVE &&
@@ -329,23 +352,29 @@ void RaftROS::loop()
             publishChatter();
             _lastChatterSendMs = now;
         }
+        markPhase(pass.chatterUs);
 
         // Purge stale discovered participants whose lease has expired
         purgeStaleParticipants();
+        markPhase(pass.purgeUs);
 
         // Check for incoming SPDP (non-blocking)
         recvSPDP();
+        markPhase(pass.recvSpdpUs);
 
         // Check for incoming metatraffic (SEDP, ACKNACK, etc.)
         recvMetatraffic();
+        markPhase(pass.recvMetaUs);
 
         // Check for incoming user data (ros_discovery_info from remote, etc.)
         recvUserData();
+        markPhase(pass.recvUserUs);
 
         // Drain one step of any pending initial-announce burst (spreads SEDP / liveliness
         // / ros_discovery_info sends across many loop() ticks instead of bursting them all
         // in a single iteration when a new participant is discovered).
         drainPendingAnnounces();
+        markPhase(pass.announceUs);
 
         // Diagnostic: periodic health line + detect size transitions
         if (_discovered.size() != _lastLoggedDiscoveredCount)
@@ -386,6 +415,22 @@ void RaftROS::loop()
         }
         break;
     }
+    }
+
+    // One line per second at most, naming the phases, when a pass runs long
+    const uint32_t passUs = (uint32_t)(esp_timer_get_time() - passStartUs);
+    if (passUs > _loopPassMaxUs)
+        _loopPassMaxUs = passUs;
+    if (passUs >= LOOP_PASS_WARN_US &&
+        Raft::isTimeout(millis(), _lastLoopBudgetLogMs, LOOP_BUDGET_LOG_INTERVAL_MS))
+    {
+        _lastLoopBudgetLogMs = millis();
+        LOG_W(MODULE_PREFIX,
+              "loopBudget pass=%uus (contract 10ms avg / 50ms max) drain=%u spdp=%u hb=%u chatter=%u purge=%u rxSpdp=%u rxMeta=%u rxUser=%u announce=%u peers=%u",
+              (unsigned)passUs, (unsigned)pass.drainUs, (unsigned)pass.spdpSendUs,
+              (unsigned)pass.heartbeatUs, (unsigned)pass.chatterUs, (unsigned)pass.purgeUs,
+              (unsigned)pass.recvSpdpUs, (unsigned)pass.recvMetaUs, (unsigned)pass.recvUserUs,
+              (unsigned)pass.announceUs, (unsigned)_discovered.size());
     }
 }
 
@@ -520,8 +565,7 @@ void RaftROS::sendSPDP()
     dest.sin_addr.s_addr = inet_addr(RTPS_DEFAULT_MULTICAST_ADDR);
 
     // Send with sendto (since multicast) - note that we don't need to specify the outgoing interface here since we set it on the socket with IP_MULTICAST_IF
-    int sent = sendto(_spdpSock, _sendBuf, msgLen, 0,
-                      (struct sockaddr*)&dest, sizeof(dest));
+    int sent = sendDatagram(_spdpSock, _sendBuf, msgLen, dest);
     if (sent < 0)
     {
 #ifdef WARN_SDSP_SEND_FAILURE
@@ -542,12 +586,58 @@ void RaftROS::sendSPDP()
 // Receive and process incoming SPDP (non-blocking)
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
+/// @brief Send one datagram, recording how long the call took.
+///
+/// On a weak link lwIP's sendto can block while the TX queue drains, and these
+/// sends happen inside packet processing - so a burst of received ACKNACKs turns
+/// into a burst of blocking sends on the main loop.  Routing every send through
+/// here makes that cost visible instead of leaving it inside a phase total.
+int RaftROS::sendDatagram(int sock, const uint8_t* pBuf, uint32_t len,
+                          const struct sockaddr_in& dest)
+{
+    const int64_t startUs = esp_timer_get_time();
+    const int sent = sendto(sock, pBuf, len, 0, (const struct sockaddr*)&dest, sizeof(dest));
+    const uint32_t elapsedUs = (uint32_t)(esp_timer_get_time() - startUs);
+    _sendCount++;
+    _sendTotalUs += elapsedUs;
+    if (elapsedUs > _sendMaxUs)
+        _sendMaxUs = elapsedUs;
+    return sent;
+}
+
+namespace
+{
+/// @brief Bounds a receive drain by time as well as by packet count.
+///
+/// A packet count alone is the wrong bound here: a metatraffic packet that
+/// triggers a retransmit costs far more than one that does not, so draining 32
+/// of them held the main loop for up to 68 ms - past the 50 ms the Raft contract
+/// allows any SysMod, with `recvMetatraffic` accounting for essentially all of
+/// it.  Whatever is left stays in the socket buffer for the next pass; RTPS
+/// already tolerates loss through HEARTBEAT/ACKNACK, so deferring beats
+/// overrunning.
+struct RxDrainBudget
+{
+    explicit RxDrainBudget(uint32_t budgetUs)
+        : _deadlineUs(esp_timer_get_time() + (int64_t)budgetUs) {}
+    bool expired() const { return esp_timer_get_time() >= _deadlineUs; }
+private:
+    int64_t _deadlineUs;
+};
+} // namespace
+
 void RaftROS::recvSPDP()
 {
     // Receive a bounded batch per loop tick. FastDDS discovery often arrives
     // in bursts, and this socket also carries metatraffic multicast DATA.
+    RxDrainBudget budget(RX_SPDP_BUDGET_US);
     for (uint8_t rxBudget = 0; rxBudget < 8; rxBudget++)
     {
+        if (budget.expired())
+        {
+            _rxBudgetDeferrals++;
+            return;
+        }
         struct sockaddr_in fromAddr;
         socklen_t fromLen = sizeof(fromAddr);
         int n = recvfrom(_spdpSock, _recvBuf, sizeof(_recvBuf), 0,
@@ -703,8 +793,14 @@ void RaftROS::recvMetatraffic()
     // when a new participant appears. Drain enough packets per loop to avoid
     // losing the full DATA(r) locator sample and later seeing only key-only
     // retransmits.
+    RxDrainBudget budget(RX_METATRAFFIC_BUDGET_US);
     for (uint8_t rxBudget = 0; rxBudget < 32; rxBudget++)
     {
+        if (budget.expired())
+        {
+            _rxBudgetDeferrals++;
+            return;
+        }
         struct sockaddr_in fromAddr;
         socklen_t fromLen = sizeof(fromAddr);
         int n = recvfrom(_metatrafficSock, _recvBuf, sizeof(_recvBuf), 0,
@@ -1620,24 +1716,20 @@ void RaftROS::stepWriterHeartbeatPass()
                         : remoteRef.userDataPort;
                 dest.sin_port = htons(rdiPort);
             }
-            const int primarySent = sendto(sock, self->_sendBuf, payloadLen, 0,
-                                           (struct sockaddr*)&dest, sizeof(dest));
+            const int primarySent = self->sendDatagram(sock, self->_sendBuf, payloadLen, dest);
             if (sendTarget == RTPSWriterHeartbeatSendTarget::UserData)
             {
                 patchRosDiscoveryInfoReaderId(
                     self->_sendBuf, payloadLen, ENTITYID_ROS_DISC_INFO_READER);
-                (void)sendto(sock, self->_sendBuf, payloadLen, 0,
-                              (struct sockaddr*)&dest, sizeof(dest));
+                (void)self->sendDatagram(sock, self->_sendBuf, payloadLen, dest);
                 if (remoteRef.rdiReaderUnicastPort == 0 &&
                     remoteRef.metatrafficPort != 0 &&
                     remoteRef.metatrafficPort != ntohs(dest.sin_port))
                 {
                     struct sockaddr_in metaDest = dest;
                     metaDest.sin_port = htons(remoteRef.metatrafficPort);
-                    (void)sendto(self->_metatrafficSock,
-                                  self->_sendBuf, payloadLen, 0,
-                                  (struct sockaddr*)&metaDest,
-                                  sizeof(metaDest));
+                    (void)self->sendDatagram(self->_metatrafficSock,
+                                             self->_sendBuf, payloadLen, metaDest);
                 }
             }
             if (sendTarget == RTPSWriterHeartbeatSendTarget::UserData &&
@@ -1647,8 +1739,7 @@ void RaftROS::stepWriterHeartbeatPass()
                 {
                     patchRosDiscoveryInfoReaderId(
                         self->_sendBuf, payloadLen, remoteRef.rdiReaderEntityIds[i]);
-                    (void)sendto(sock, self->_sendBuf, payloadLen, 0,
-                                  (struct sockaddr*)&dest, sizeof(dest));
+                    (void)self->sendDatagram(sock, self->_sendBuf, payloadLen, dest);
                 }
             }
             return primarySent;
@@ -1713,8 +1804,7 @@ void RaftROS::stepWriterHeartbeatPass()
             dest.sin_family = AF_INET;
             dest.sin_port = htons(remote.metatrafficPort);
             dest.sin_addr.s_addr = remote.ipAddr;
-            (void)sendto(_metatrafficSock, _sendBuf, payloadLen, 0,
-                         (struct sockaddr*)&dest, sizeof(dest));
+            (void)sendDatagram(_metatrafficSock, _sendBuf, payloadLen, dest);
         }
         _hbPass.extraSubSlot++;
         return;
@@ -1948,8 +2038,7 @@ void RaftROS::drainPendingAnnounces()
                     return -1;
             }
 
-            return sendto(sock, self->_sendBuf, payloadLen, 0,
-                          (struct sockaddr*)&dest, sizeof(dest));
+            return self->sendDatagram(sock, self->_sendBuf, payloadLen, dest);
         };
 
         callbacks.logResult = [](void* userCtx,
@@ -2018,15 +2107,13 @@ void RaftROS::drainPendingAnnounces()
             dest.sin_port = htons(entry.remote.metatrafficPort);
             dest.sin_addr.s_addr = entry.remote.ipAddr;
 #ifdef DEBUG_PARTICIPANT_PROCESSING
-            const int sent = sendto(_metatrafficSock, _sendBuf, payloadLen, 0,
-                                    (struct sockaddr*)&dest, sizeof(dest));
+            const int sent = sendDatagram(_metatrafficSock, _sendBuf, payloadLen, dest);
             LOG_I(MODULE_PREFIX,
                   "handleNewParticipant extra SEDP sub slot=%u topic=%s sent %d/%d bytes to port %d",
                   (unsigned)slot, regEntry.topic, sent, (int)payloadLen,
                   (int)entry.remote.metatrafficPort);
 #else
-            (void)sendto(_metatrafficSock, _sendBuf, payloadLen, 0,
-                         (struct sockaddr*)&dest, sizeof(dest));
+            (void)sendDatagram(_metatrafficSock, _sendBuf, payloadLen, dest);
 #endif
         }
         entry.extraSubSlot++;
@@ -2228,8 +2315,7 @@ void RaftROS::publishChatter()
             dest.sin_family = AF_INET;
             dest.sin_port = htons(remote.userDataPort);
             dest.sin_addr.s_addr = remote.ipAddr;
-            int sent = sendto(_userDataSock, _sendBuf, msgLen, 0,
-                              (struct sockaddr*)&dest, sizeof(dest));
+            int sent = sendDatagram(_userDataSock, _sendBuf, msgLen, dest);
             {
                 char destIpStr[16];
                 strncpy(destIpStr, inet_ntoa(*(struct in_addr*)&remote.ipAddr), sizeof(destIpStr));
@@ -2274,16 +2360,30 @@ String RaftROS::getStatusJSON() const
         case ConnState::ANNOUNCING:   stStr = "announcing"; break;
         case ConnState::ACTIVE:       stStr = "active"; break;
     }
-    char buf[256];
+    char buf[320];
     snprintf(buf, sizeof(buf),
-             R"({"rslt":"ok","en":%s,"domId":%d,"node":"%s","ns":"%s","conn":"%s","disc":%d,"spdpSeq":%llu})",
+             R"({"rslt":"ok","backend":"%s","en":%s,"domId":%d,"node":"%s","ns":"%s","conn":"%s",)"
+             R"("disc":%d,"spdpSeq":%llu,"devices":%u,"stackFreeB":%u,"loopMaxUs":%u,"rxDeferrals":%u,)"
+             R"("sends":%u,"sendTotalMs":%u,"sendMaxUs":%u})",
+             RAFTROS_BACKEND_NAME,
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
              _nodeNamespace.c_str(),
              stStr,
              (int)_discovered.size(),
-             (unsigned long long)_spdpSeqNum);
+             (unsigned long long)_spdpSeqNum,
+             (unsigned)_autoPubSource.attachedCount(),
+             // Headroom left on the task this SysMod runs on, which is the
+             // figure that decides whether an image fits - it is shared with
+             // every other SysMod on the loop, so it is a system number rather
+             // than this module's own cost.
+             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)),
+             (unsigned)_loopPassMaxUs,
+             (unsigned)_rxBudgetDeferrals,
+             (unsigned)_sendCount,
+             (unsigned)(_sendTotalUs / 1000),
+             (unsigned)_sendMaxUs);
     return buf;
 }
 
