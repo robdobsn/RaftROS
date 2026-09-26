@@ -157,7 +157,7 @@ struct RTPSInitialAnnounceCounterState
     uint64_t sedpRosReaderSeqNum = 0;
     uint64_t sedpChatterWriterSeqNum = 0;
     uint64_t sedpChatterReaderSeqNum = 0;
-    uint64_t livelinessSeqNum = 0;
+    uint64_t livelinessSeqNum = 1;   ///< RTPS sequence numbers start at 1
     uint64_t rosDiscoveryUserDataSeqNum = 0;
 };
 

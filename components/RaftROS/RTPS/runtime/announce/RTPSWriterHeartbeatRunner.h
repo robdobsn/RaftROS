@@ -43,7 +43,7 @@ struct RTPSWriterHeartbeatCounterState
     uint64_t sedpSubSeqNum = 0;
     uint64_t chatterSedpSeqNum = 0;
     uint64_t chatterSedpSubSeqNum = 0;
-    uint64_t livelinessSeqNum = 0;
+    uint64_t livelinessSeqNum = 1;   ///< RTPS sequence numbers start at 1
     uint64_t rosDiscSeqNum = 0;
     uint32_t heartbeatCount = 0;
     bool rosDiscDebugDumped = false;
