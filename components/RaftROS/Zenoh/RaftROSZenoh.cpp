@@ -14,6 +14,8 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -823,11 +825,11 @@ String RaftROS::getStatusJSON() const
         case ConnState::READY:        stStr = "ready"; break;
     }
     const auto stats = _autoPubBackend.stats();
-    char buf[320];
+    char buf[400];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
-             R"("subs":%u,"rxDropped":%u,"intRefused":%u})",
+             R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -842,7 +844,11 @@ String RaftROS::getStatusJSON() const
              (unsigned)stats.redeclares,
              (unsigned)_subscriptionCount,
              (unsigned)_samplesDropped,
-             (unsigned)_interestsRefused);
+             (unsigned)_interestsRefused,
+             // Headroom left on the task this SysMod runs on (shared with every
+             // other SysMod on the loop), which is what decides whether an
+             // image fits
+             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
     return buf;
 }
 

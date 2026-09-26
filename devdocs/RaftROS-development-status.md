@@ -17,7 +17,7 @@ Zenoh firmware backend, build selector or measured ESP32 footprint.
 
 | Work | State / next evidence |
 | --- | --- |
-| Z0: feasibility and baseline | In progress. Pinned host profile, release executable/stack baseline and provisional firmware review budgets recorded. Actual ESP32 app/heap/stack measurements remain open. zenoh-pico incorporation still needs explicit approval. |
+| Z0: feasibility and baseline | ESP32 measurements done: app image, free heap, stack headroom and loop timing recorded for both backends under an active subscriber (see "Loop Budget Under Load"). zenoh-pico incorporation still needs explicit approval. |
 | Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Build selection done: Kconfig picks RTPS (default) or Zenoh, both ESP32-S3 images build and link only their own backend. The Zenoh SysMod connects, declares its node token and answers interests; DeviceManager auto-publish for it awaits the shared extraction of the device plumbing. Neither image run against a router yet. |
@@ -221,6 +221,70 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Loop Budget Under Load, and Measured Resources for Both Backends (2026-09-26)
+
+Measuring the device with a ROS 2 subscriber actually consuming its topic - not
+idle, which is all the earlier numbers covered - showed the RTPS build breaching
+the Raft loop contract: **RaftROS took up to 82 ms in a single pass** against a
+ceiling of 50 ms, with the whole loop averaging 3-5 ms.
+
+Per-phase timing was added to the loop, and it named the phase immediately:
+
+```
+loopBudget pass=66230us drain=140 spdp=21 hb=2691 chatter=17 purge=32
+                        rxSpdp=128 rxMeta=62632 rxUser=524 announce=15 peers=1
+```
+
+`recvMetatraffic` was essentially the whole of it. It already had a 32-packet
+cap, but **a packet count is the wrong bound**: every datagram this SysMod sends
+is now timed, and the answer is that a send costs **~0.8 ms of main-loop time on
+average and up to 1.8 ms** (1175 sends, 939 ms total, so 13% of wall time went
+into the radio). A received ACKNACK can trigger a send, so 32 packets meant up
+to ~26 ms of sends alone. The spread is narrow, so this is the inherent cost of
+pushing a datagram through lwIP and the WiFi driver at RSSI -82, not blocking on
+a full queue - which means the fix is to send fewer datagrams per pass, not to
+make the socket non-blocking.
+
+Receive drains now carry a time budget as well as a packet count
+(`recvMetatraffic` 6 ms, `recvSPDP` 3 ms; `recvUserData` already took one
+datagram per pass). Whatever is left stays in the socket buffer for the next
+pass, which RTPS tolerates by design through HEARTBEAT/ACKNACK.
+
+| Under an active subscriber | Before | After |
+| --- | --- | --- |
+| Worst RaftROS pass | 82 ms (contract: 50 ms) | 14 ms |
+| Worst whole-loop pass | 54 ms | 17 ms |
+| Whole-loop average | 3.0-5.3 ms (contract: 10 ms) | 2.8-4.3 ms |
+| Samples delivered | 4.8 Hz | 4.8 Hz (290 in 60 s, none lost) |
+
+**Both backends, same board, same sensor, equivalent load** (a subscriber
+consuming the device topic). This closes the resource measurements Z0 had open:
+
+| | RTPS | Zenoh |
+| --- | --- | --- |
+| App image | 1268 kB (28% of slot free) | 1258 kB (29% free) |
+| Whole-loop average | 2.8-4.3 ms | **0.60 ms** |
+| Whole-loop max | 14-17 ms | **2.7-3.0 ms** |
+| Worst RaftROS pass | 14 ms | **2.4 ms** |
+| Minimum free heap | 178.5 kB | 168.7 kB |
+| Main-task stack headroom | 6280 B | 5480 B |
+| Delivered | 290 Range in 60 s | 250 Range + 51 chatter, zero lost |
+
+The Zenoh backend is an order of magnitude cheaper on the loop, and the reason
+is structural rather than incidental: it sends **at most one datagram per pass**
+by construction, where RTPS fans out to every peer within a pass. Zenoh pays for
+it in RAM - about 10 kB, which is close to the 11 kB its 16 endpoint slots
+reserve for keys and tokens.
+
+New diagnostics on `GET /api/rosstat`, both backends: `stackFreeB`, and on RTPS
+also `loopMaxUs`, `rxDeferrals`, `sends`, `sendTotalMs`, `sendMaxUs`. A pass over
+20 ms logs its phase breakdown, at most once a second.
+
+Not done: bounding datagrams *per pass* on RTPS (the direct expression of the
+finding) or moving its sends off the loop task. The contract is met with room to
+spare now, so neither is urgent - but if RTPS ever needs to serve more peers,
+that is where the headroom has to come from.
 
 ### Liveliness Sequence 0, and Two Open RTPS Items That No Longer Reproduce (2026-09-26)
 
