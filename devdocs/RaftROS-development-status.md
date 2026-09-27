@@ -25,7 +25,7 @@ subscriptions.
 | Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Complete. Kconfig selects the backend - Zenoh by default since 2026-09-27, RTPS as the opt-in - and each image links only its own backend. The router address is layered (Kconfig < SysTypes < posted settings) and an unreachable router is reported with its cause and the fix. |
-| Z4-Z6: parity and release | Feature parity reached and verified with the ROS 2 tools on both transports: node/topic/graph queries, both publishers, both subscriptions and per-topic routing. Remaining: QoS coverage beyond the built-in profiles, dynamic-sensor hot-plug on Zenoh, and a release pass. |
+| Z4-Z6: parity and release | Feature parity verified with the ROS 2 tools on both transports; `qosProfiles` overrides now reach subscriptions as well as publishers, shown in the graph on both. Remaining: dynamic-sensor hot-plug on Zenoh (needs someone at the board) and a release pass. |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -225,6 +225,69 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### The Malformed SEDP Packet, Found and Fixed; Subscription QoS From Profiles (2026-09-27)
+
+**The "one malformed packet per participant" wart is a real bug, and it is
+fixed.** It came back the moment a CycloneDDS participant ran `ros2 topic info
+-v` against the RTPS build - a tool that stays around and ACKNACKs, where `ros2
+topic list` (ten clean participants on 2026-09-26) exits before it can. This
+time the wire was captured on the receiving host and every datagram's
+submessage chain parsed: two datagrams of exactly 256 bytes, **unicast to the
+peer's host at the SPDP port 7400**, each an SEDP-publications DATA whose
+header claims 504 bytes with 204 present - one per `topic info` participant, and
+the same size as our genuine SPDP announcement. The truncated bytes name
+`ros_discovery_info` / `ParticipantEntitiesInfo_`, cut off inside the
+parameter list.
+
+Cause: the initial-announce sequence's `SpdpDiscoveryPortCopy` step was built
+as `RTPSInitialAnnounceBuildKind::ReusePrevious` - "send the previous step's
+bytes again, to the discovery port". The sequence is drained **one step per
+loop pass**, and between passes the shared `_sendBuf` is used by heartbeats,
+auto-publish announces and ACKNACK replies. So the step sent the previous
+step's *length* (256, the SPDP reply) over whatever the buffer held by then -
+an SEDP announcement of `ros_discovery_info` some ACKNACK had just provoked.
+It needed a peer active between the two passes, which is exactly what
+`topic info` provides. Yesterday's note that "nothing in the code explains when
+it stopped" was right for the wrong reason: nothing had stopped - the trigger
+had.
+
+Fix: the step now builds the SPDP announcement afresh (`ReusePrevious` is no
+longer emitted by the plan; a test asserts no step in either flavour relies on
+the buffer surviving between passes). Verified on hardware: five `topic info -v`
+participants, **zero malformed reports**, and a parse of all 2228 datagrams the
+device sent during them shows **zero overruns** - previously one per
+participant, every time. CycloneDDS's "length 256" was the datagram length
+after all; the 2026-09-25 captures on the sender's WiFi interface missed it,
+and its "not reproduced" verdict came from looking at the wrong port.
+
+**Subscriptions now take their QoS from the same profiles as publishers**, on
+both transports. `AutoPubDeviceSource::resolveSubscriptionQoS(rosTopic)`
+applies a `qosProfiles` alias override for the topic's last segment and
+otherwise returns `FallbackString` (RELIABLE, VOLATILE, depth 10) - which is
+what both builds announced for readers before, so nothing changes by default.
+It is resolved when the reader is announced (RTPS SEDP) or its token declared
+(Zenoh), not when the application subscribes, so SysMod setup order does not
+matter. Proven through the ROS graph on both transports, with an overlay posted
+at runtime:
+
+```
+qosProfiles: {"chatter_in": "event"}
+                      /chatter_in                   /chatter_in2
+Zenoh  (rmw_zenoh)    RELIABLE / TRANSIENT_LOCAL     RELIABLE / VOLATILE
+RTPS   (CycloneDDS)   RELIABLE / TRANSIENT_LOCAL     RELIABLE / VOLATILE
+default (no overlay)  RELIABLE / VOLATILE            RELIABLE / VOLATILE
+```
+
+Two tooling notes from getting that table: under CycloneDDS every `ros2` CLI
+call is a fresh participant, so a query can land before our slot-0 reader
+announce reaches it (`Unknown topic`) - retry, or wait a few seconds; and use
+`--no-daemon`, because a `ros2 daemon` left over from an `rmw_zenoh` run answers
+CycloneDDS queries with an empty graph. Neither applies to Zenoh, where the
+router already holds the graph.
+
+- Tests: **1035** unit (+2), **141** Zenoh firmware pieces (+3); 1271 session,
+  2218 codec unchanged.
 
 ### Zenoh by Default, a Configurable Router, and a RaftCore Bug It Exposed (2026-09-27)
 
@@ -659,10 +722,11 @@ which is an independent check on both.
 
 ### Open: one malformed SEDP subscription packet per remote participant (2026-09-25)
 
-> **Update 2026-09-26: no longer reproducible.** 10 fresh participant starts
-> across CycloneDDS and FastDDS produced zero malformed reports - see "Liveliness
-> Sequence 0, and Two Open RTPS Items That No Longer Reproduce". The account
-> below is kept because nothing in the code explains when it stopped.
+> **Resolved 2026-09-27.** Root cause found on the wire and fixed - the
+> `ReusePrevious` initial-announce step sent a stale buffer with the SPDP length.
+> It only triggers with a peer that ACKNACKs between announce steps, which is why
+> `ros2 topic list` never showed it and `ros2 topic info -v` always did. See
+> "The Malformed SEDP Packet, Found and Fixed".
 
 After the `PID_TYPE_CONSISTENCY` fix, CycloneDDS reports exactly **one**
 malformed packet per participant it starts (reproducible, 1 per run):

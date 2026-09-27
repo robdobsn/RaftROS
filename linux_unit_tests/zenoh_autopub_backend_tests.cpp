@@ -388,6 +388,24 @@ int main()
                     "all endpoints are declared and holding slots");
     }
 
+    std::printf("Test: built-in QoS profiles map onto the Zenoh encoding\n");
+    {
+        using RaftRuntime::AutoPub::AutoPubQoSProfileId;
+        const auto fast = ZenohAutoPubBackend::qosForProfile(AutoPubQoSProfileId::FastSensor);
+        TEST_ASSERT(fast.reliability == ZenohROSCodec::Reliability::BestEffort &&
+                    fast.durability == ZenohROSCodec::Durability::Volatile && fast.depth == 10,
+                    "fast_sensor announces best-effort, volatile, depth 10");
+        const auto event = ZenohAutoPubBackend::qosForProfile(AutoPubQoSProfileId::Event);
+        TEST_ASSERT(event.reliability == ZenohROSCodec::Reliability::Reliable &&
+                    event.durability == ZenohROSCodec::Durability::TransientLocal && event.depth == 20,
+                    "event announces reliable, transient-local, depth 20");
+        const auto fallback = ZenohAutoPubBackend::qosForProfile(AutoPubQoSProfileId::FallbackString);
+        TEST_ASSERT(fallback.reliability == ZenohROSCodec::Reliability::Reliable &&
+                    fallback.durability == ZenohROSCodec::Durability::Volatile && fallback.depth == 10,
+                    "fallback_string - the subscription default - is reliable, volatile, depth 10, "
+                    "which is what readers were announced as before profiles applied to them");
+    }
+
     std::printf("Test: router interests are matched, or refused rather than guessed at\n");
     {
         using RaftRuntime::Zenoh::ZenohInterestMatch;

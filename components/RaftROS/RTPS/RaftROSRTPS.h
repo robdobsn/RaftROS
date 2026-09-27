@@ -346,6 +346,9 @@ private:
     /// @brief Advance the ros_discovery_info sequence after endpoints have gone
     void autoPubOnEndpointsDetached();
 
+    /// @brief Reader QoS for a subscription topic, from the shared qosProfiles resolution
+    void subscriptionQoSKinds(const char* ddsTopic, uint32_t& reliabilityKind, uint32_t& durabilityKind) const;
+
     // Loop-budget diagnostics: worst pass since boot, and a rate limit on the
     // breakdown log.  The Raft contract is 10 ms average / 50 ms worst case for
     // any SysMod, and the receive phases are unbounded by construction.

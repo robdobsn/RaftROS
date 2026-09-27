@@ -124,7 +124,14 @@ RTPSInitialAnnounceBuildSpec RTPSInitialAnnouncePlan_getBuildSpec(
             return { RTPSInitialAnnounceBuildKind::SpdpAnnouncement,
                      RTPSInitialAnnounceSedpEndpointProfile::None };
         case RTPSInitialAnnounceAction::SpdpDiscoveryPortCopy:
-            return { RTPSInitialAnnounceBuildKind::ReusePrevious,
+            // Built afresh, not ReusePrevious.  The sequence is drained one step
+            // per loop pass, and between passes the shared send buffer is used
+            // by heartbeats, auto-publish announces and ACKNACK replies - so
+            // "reuse the previous step's bytes" sent the previous step's
+            // *length* over whatever was in the buffer by then: a 256-byte
+            // truncated SEDP announcement to the peer's discovery port, once per
+            // participant that stayed around long enough to ACKNACK in between.
+            return { RTPSInitialAnnounceBuildKind::SpdpAnnouncement,
                      RTPSInitialAnnounceSedpEndpointProfile::None };
         case RTPSInitialAnnounceAction::SedpRosDiscoveryWriter:
             return { RTPSInitialAnnounceBuildKind::SedpPublication,

@@ -125,7 +125,7 @@ public:
         const uint64_t entityId = _nextEntityId;
         const ZenohROSCodec::NodeIdentity node = nodeIdentity();
         const ZenohROSCodec::Endpoint endpoint{entityId, ZenohROSCodec::EndpointKind::Publisher,
-            desc.topic, desc.type, typeHash, qosFor(desc.qosProfileId)};
+            desc.topic, desc.type, typeHash, qosForProfile(desc.qosProfileId)};
         if (!ZenohROSCodec::formatTopicKey(entry.key, sizeof(entry.key), node.domainId,
                                            endpoint.topic, endpoint.wireType, endpoint.typeHash) ||
             !ZenohROSCodec::formatEndpointToken(entry.token, sizeof(entry.token), node, endpoint) ||
@@ -346,6 +346,20 @@ public:
     };
     Stats stats() const { return {_published, _redeclares, _declareFailures}; }
 
+    /// @brief The Zenoh QoS a built-in profile announces.  Public because a
+    /// subscription's liveliness token carries the same encoding.
+    static ZenohROSCodec::QoS qosForProfile(RaftRuntime::AutoPub::AutoPubQoSProfileId profileId)
+    {
+        const auto profile = RaftRuntime::AutoPub::AutoPubQoSProfile_get(profileId);
+        ZenohROSCodec::QoS qos;
+        qos.reliability = profile.reliability == RaftRuntime::AutoPub::AUTOPUB_RELIABILITY_RELIABLE ?
+            ZenohROSCodec::Reliability::Reliable : ZenohROSCodec::Reliability::BestEffort;
+        qos.durability = profile.durability == RaftRuntime::AutoPub::AUTOPUB_DURABILITY_TRANSIENT_LOCAL ?
+            ZenohROSCodec::Durability::TransientLocal : ZenohROSCodec::Durability::Volatile;
+        qos.depth = profile.historyDepth;
+        return qos;
+    }
+
 private:
     struct Entry
     {
@@ -372,17 +386,6 @@ private:
                 _deps.nodeNamespace, _deps.nodeName};
     }
 
-    static ZenohROSCodec::QoS qosFor(RaftRuntime::AutoPub::AutoPubQoSProfileId profileId)
-    {
-        const auto profile = RaftRuntime::AutoPub::AutoPubQoSProfile_get(profileId);
-        ZenohROSCodec::QoS qos;
-        qos.reliability = profile.reliability == RaftRuntime::AutoPub::AUTOPUB_RELIABILITY_RELIABLE ?
-            ZenohROSCodec::Reliability::Reliable : ZenohROSCodec::Reliability::BestEffort;
-        qos.durability = profile.durability == RaftRuntime::AutoPub::AUTOPUB_DURABILITY_TRANSIENT_LOCAL ?
-            ZenohROSCodec::Durability::TransientLocal : ZenohROSCodec::Durability::Volatile;
-        qos.depth = profile.historyDepth;
-        return qos;
-    }
 
     ZenohAutoPubBackendDeps _deps;
     Entry _entries[ZENOH_AUTOPUB_CAPACITY];

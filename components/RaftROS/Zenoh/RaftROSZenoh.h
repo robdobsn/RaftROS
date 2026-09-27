@@ -175,6 +175,9 @@ private:
         char type[RaftRuntime::AutoPub::AUTOPUB_TYPE_MAX_LEN] = {};
         char key[RaftRuntime::Zenoh::ZENOH_AUTOPUB_KEY_MAX] = {};
         char token[RaftRuntime::Zenoh::ZENOH_AUTOPUB_TOKEN_MAX] = {};
+        const char* typeHash = nullptr;         ///< Static literal from the class map
+        RaftRuntime::AutoPub::AutoPubQoSProfileId qosProfileId =
+            RaftRuntime::AutoPub::AutoPubQoSProfileId::FallbackString;   ///< Resolved when declared
         bool tokenDeclared = false;
         uint64_t entityId = 0;
         uint32_t received = 0;

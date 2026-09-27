@@ -527,6 +527,32 @@ int main()
     }
 
     //=================================================================
+    // Initial announce: no step may reuse the send buffer's previous contents.
+    // The sequence drains one step per loop pass and other senders share the
+    // buffer in between, so a ReusePrevious step sent the previous step's
+    // length over whatever was there by then - a truncated SEDP announcement.
+    //=================================================================
+    {
+        printf("Test: initial-announce steps never reuse the previous buffer contents\n");
+        RTPSInitialAnnouncePlan plan;
+        bool anyReuse = false;
+        for (auto flavor : {RTPSInitialAnnounceRuntimeFlavor::EspStyle, RTPSInitialAnnounceRuntimeFlavor::LinuxStyle})
+        {
+            RTPSInitialAnnounceSequence seq = RTPSInitialAnnouncePlan_buildSequence(plan, flavor);
+            for (uint8_t i = 0; i < seq.numSteps; i++)
+            {
+                const auto spec = RTPSInitialAnnouncePlan_getBuildSpec(seq.steps[i].action);
+                if (spec.buildKind == RTPSInitialAnnounceBuildKind::ReusePrevious)
+                    anyReuse = true;
+            }
+        }
+        TEST_ASSERT(!anyReuse, "no initial-announce step relies on the send buffer being untouched between passes");
+        TEST_ASSERT(RTPSInitialAnnouncePlan_getBuildSpec(RTPSInitialAnnounceAction::SpdpDiscoveryPortCopy).buildKind
+                        == RTPSInitialAnnounceBuildKind::SpdpAnnouncement,
+                    "the discovery-port copy of the SPDP reply is built afresh");
+    }
+
+    //=================================================================
     // Liveliness (ParticipantMessageData): RTPS sequence numbers start at 1.
     // Sending sequence 0 put writerSN 0 in the DATA and firstSN/lastSN 0 in the
     // HEARTBEAT, and CycloneDDS discards that whole datagram as malformed - so
