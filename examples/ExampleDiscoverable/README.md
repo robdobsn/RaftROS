@@ -63,7 +63,7 @@ ROS 2 can be reached two ways, and one is compiled into an image - there is no
 runtime switch, and the RTPS runtime and the Zenoh session are never both
 linked.
 
-| | RTPS / DDS (default) | Zenoh |
+| | RTPS / DDS | Zenoh (default) |
 | --- | --- | --- |
 | How it reaches ROS 2 | directly, over multicast and unicast UDP | one TCP session to a router |
 | Needs | nothing beyond the network | a reachable `rmw_zenohd`, and ROS 2 peers running `rmw_zenoh` |
@@ -71,25 +71,46 @@ linked.
 | Device auto-publish | yes | yes |
 | `/chatter` publisher and string subscriptions | yes | yes |
 
-Select Zenoh in `systypes/SysTypeMain/sdkconfig.defaults`:
+Zenoh is the default. To build the RTPS image instead, in
+`systypes/SysTypeMain/sdkconfig.defaults`:
 
 ```
-CONFIG_RAFTROS_BACKEND_ZENOH=y
+CONFIG_RAFTROS_BACKEND_RTPS=y
 ```
 
-and point the device at the router in `systypes/SysTypeMain/SysTypes.json`:
+Delete `build/SysTypeMain/sdkconfig` after changing `sdkconfig.defaults`, or
+the old selection is kept.
 
-```json
-"RaftROS": {
-    "routerHost": "192.168.86.192",
-    "routerPort": 7447
-}
-```
+### Telling the device where the router is
+
+The router address is layered, each level overriding the one before:
+
+1. **Built-in default** - `CONFIG_RAFTROS_ZENOH_ROUTER_HOST` in menuconfig
+   (`192.168.86.192:7447` as shipped).
+2. **SysTypes** - `"routerHost"` / `"routerPort"` in the `RaftROS` block of
+   `systypes/SysTypeMain/SysTypes.json`.
+3. **Runtime, no rebuild** - post a settings overlay from any host on the
+   network; it persists in NVS and the device reboots into it:
+
+   ```bash
+   curl -X POST http://<device-ip>/api/postsettings/reboot \
+        -d '{"RaftROS":{"routerHost":"192.168.1.50"}}'
+   curl http://<device-ip>/api/getsettings/nv      # see what is set
+   curl http://<device-ip>/api/clearsettings       # back to SysTypes/default
+   ```
 
 `routerHost` must be an IPv4 address: resolving a name would block the main
 loop for as long as the DNS query takes, so the SysMod refuses a hostname and
-says so in the log. Delete `build/SysTypeMain/sdkconfig` after changing
-`sdkconfig.defaults`, or the old selection is kept.
+says so in the log.
+
+**If the router isn't there, the device says so.** After three failed connection
+attempts, and every 30 s while it stays unreachable, the log carries a
+`ROUTER UNREACHABLE` warning that names the address, says whether the host
+answered (no router running there) or not (wrong address), says whether the
+address is the built-in default that was set for another network, and gives the
+`curl` line to change it. `GET /api/rosstat` reports the same:
+`"routerSource":"default"|"config"`, `"routerReachable"`, `"connectFails"`,
+`"lastSessionAgoS"`.
 
 ## Demonstrating the Zenoh build
 
@@ -98,7 +119,8 @@ tools. This is verified end to end against `rmw_zenoh_cpp` 0.2.10 on ROS 2
 Jazzy - node, both publishers, both subscriptions and per-topic routing:
 
 ```bash
-ros2 run rmw_zenoh_cpp rmw_zenohd            # the router
+ros2 run rmw_zenoh_cpp rmw_zenohd            # the router (start it detached from any ssh
+                                             #  session, or it dies with the session)
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 ros2 node list                               # expect /raft_esp32
 ros2 topic echo /chatter                     # expect one message a second
@@ -140,7 +162,8 @@ restarting either tool is a fair test of reconnection.
 The SysMod's own view is on `GET /api/rosstat`:
 
 ```json
-{"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":2,"samples":204,"subs":2,"rxDropped":0}
+{"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":2,"samples":204,"subs":2,
+ "rxDropped":0,"routerSource":"default","routerReachable":true,"connectFails":0,"lastSessionAgoS":41}
 ```
 
 ## Configuration

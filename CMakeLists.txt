@@ -2,11 +2,7 @@
 # components/RaftROS/RaftROSBackendSelect.h.  The RTPS runtime and the Zenoh
 # SysMod are never linked together; the auto-publish pipeline below the backend
 # contract (CDR, device mapping, publisher pool) is shared and always built.
-if(CONFIG_RAFTROS_BACKEND_ZENOH)
-    set(RAFTROS_BACKEND_SRCS
-      "components/RaftROS/Zenoh/RaftROSZenoh.cpp"
-    )
-else()
+if(CONFIG_RAFTROS_BACKEND_RTPS)
     set(RAFTROS_BACKEND_SRCS
       "components/RaftROS/RTPS/RaftROSRTPS.cpp"
       "components/RaftROS/RTPS/runtime/core/RTPSParticipant.cpp"
@@ -23,6 +19,10 @@ else()
       "components/RaftROS/RTPS/runtime/reliability/RTPSReaderRuntime.cpp"
       "components/RaftROS/RTPS/runtime/reliability/RTPSReaderRunner.cpp"
       "components/RaftROS/RTPS/runtime/wire/RTPSMessage.cpp"
+    )
+else()
+    set(RAFTROS_BACKEND_SRCS
+      "components/RaftROS/Zenoh/RaftROSZenoh.cpp"
     )
 endif()
 

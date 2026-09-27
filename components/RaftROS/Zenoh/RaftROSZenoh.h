@@ -109,6 +109,22 @@ private:
     };
     ConnState _connState = ConnState::DISCONNECTED;
     int _sock = -1;
+
+    /// @brief Is the router there?  A device that cannot reach it publishes
+    /// nothing to ROS 2 and would otherwise just retry quietly with a growing
+    /// backoff, so after a few failures it says so - naming the address, where
+    /// the address came from, and how to change it without a rebuild.
+    bool _routerFromConfig = false;         ///< routerHost set in SysTypes/settings, not the Kconfig default
+    uint32_t _connectFailures = 0;          ///< Consecutive attempts that did not reach a session
+    uint32_t _firstFailureMs = 0;           ///< When the current run of failures began (0 = none)
+    uint32_t _lastSessionMs = 0;            ///< Last time a session was established (0 = never)
+    uint32_t _lastUnreachableLogMs = 0;
+    const char* _lastFailureReason = "";
+    uint32_t _localIpForLog = 0;            ///< Device address, for the curl line in the warning
+    static const uint32_t UNREACHABLE_WARN_AFTER = 3;
+    static const uint32_t UNREACHABLE_LOG_INTERVAL_MS = 30000;
+    void noteConnectFailure(const char* reason);
+    void warnRouterUnreachable();
     uint32_t _lastConnectAttemptMs = 0;
     uint32_t _connectStartedMs = 0;
     uint32_t _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;

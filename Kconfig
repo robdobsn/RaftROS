@@ -2,10 +2,12 @@ menu "RaftROS"
 
     choice RAFTROS_BACKEND
         prompt "ROS 2 transport backend"
-        default RAFTROS_BACKEND_RTPS
+        default RAFTROS_BACKEND_ZENOH
         help
             Which ROS 2 transport this image speaks.  Exactly one backend is
-            compiled and linked; there is no runtime switch.
+            compiled and linked; there is no runtime switch.  Zenoh is the
+            default: it needs a reachable rmw_zenohd router, and costs an order
+            of magnitude less main-loop time than RTPS on the same workload.
 
         config RAFTROS_BACKEND_RTPS
             bool "RTPS / DDS (native ROS 2 over UDP)"
@@ -23,11 +25,15 @@ menu "RaftROS"
 
     config RAFTROS_ZENOH_ROUTER_HOST
         string "Zenoh router host"
-        default "192.168.1.1"
+        default "192.168.86.192"
         depends on RAFTROS_BACKEND_ZENOH
         help
-            IPv4 address of the Zenoh router to connect to.  Overridden by the
-            "routerHost" setting in the SysMod's SysTypes configuration.
+            IPv4 address of the Zenoh router to connect to.  This is only the
+            built-in default: "routerHost" in the SysMod's SysTypes
+            configuration overrides it, and a device can be re-pointed without
+            a rebuild by posting {"RaftROS":{"routerHost":"<ip>"}} to
+            /api/postsettings/reboot.  A device that cannot reach its router
+            says so in the log, and says which of these its address came from.
 
             This must be an address, not a hostname: resolving a name blocks
             for as long as the DNS query takes, which would break the Raft

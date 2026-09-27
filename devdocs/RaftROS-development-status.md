@@ -24,7 +24,7 @@ subscriptions.
 | Z0: feasibility and baseline | ESP32 measurements done: app image, free heap, stack headroom and loop timing recorded for both backends under an active subscriber (see "Loop Budget Under Load"). zenoh-pico incorporation still needs explicit approval. |
 | Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
-| Z3: isolated firmware builds | Build selection done: Kconfig picks RTPS (default) or Zenoh, both ESP32-S3 images build and link only their own backend. The Zenoh SysMod connects, declares its node token and answers interests; DeviceManager auto-publish for it awaits the shared extraction of the device plumbing. Neither image run against a router yet. |
+| Z3: isolated firmware builds | Complete. Kconfig selects the backend - Zenoh by default since 2026-09-27, RTPS as the opt-in - and each image links only its own backend. The router address is layered (Kconfig < SysTypes < posted settings) and an unreachable router is reported with its cause and the fix. |
 | Z4-Z6: parity and release | Feature parity reached and verified with the ROS 2 tools on both transports: node/topic/graph queries, both publishers, both subscriptions and per-topic routing. Remaining: QoS coverage beyond the built-in profiles, dynamic-sensor hot-plug on Zenoh, and a release pass. |
 
 Runtime transport switching is deferred. Services/parameters remain future
@@ -225,6 +225,73 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Zenoh by Default, a Configurable Router, and a RaftCore Bug It Exposed (2026-09-27)
+
+**Zenoh is now the default backend.** `Kconfig` defaults the choice to
+`RAFTROS_BACKEND_ZENOH`, `CMakeLists.txt` treats RTPS as the opt-in, and
+`RaftROSBackendSelect.h` follows the same rule when there is no Kconfig. A clean
+build of the example with no backend line in `sdkconfig.defaults` links only
+`RaftROSZenoh` (4 objects); `CONFIG_RAFTROS_BACKEND_RTPS=y` still links the RTPS
+runtime (18 objects).
+
+**The router address is layered**, each level overriding the last:
+`CONFIG_RAFTROS_ZENOH_ROUTER_HOST` (built-in default, now `192.168.86.192`) <
+`RaftROS.routerHost` in SysTypes < a settings overlay posted to
+`/api/postsettings/reboot` (persisted in NVS, cleared with `/api/clearsettings`).
+The example's SysTypes no longer carries the address, so the layering is real.
+
+**If the router isn't there, the device says so.** After three failed attempts,
+and then on each further failure at most every 30 s, three `ROUTER UNREACHABLE`
+lines name the address, diagnose the failure, say where the address came from,
+and give the fix - the rebuild-free one first. Both diagnoses were captured on
+hardware:
+
+```
+W ROUTER UNREACHABLE: 192.168.86.192:7447 - 3 attempts over 6s, last: connect refused.
+  The host answers but no router is listening there - start one with:
+  ros2 run rmw_zenoh_cpp rmw_zenohd  Nothing reaches ROS 2 until this is fixed.
+W ROUTER UNREACHABLE: the address is the built-in default (CONFIG_RAFTROS_ZENOH_ROUTER_HOST),
+  which was set for a different network and probably needs changing for this one.
+W ROUTER UNREACHABLE: to change it without a rebuild, from any host on the network:
+  curl -X POST http://192.168.86.230/api/postsettings/reboot -d '{"RaftROS":{"routerHost":"<router-ip>"}}'
+  - or set RaftROS.routerHost in SysTypes.json, or CONFIG_RAFTROS_ZENOH_ROUTER_HOST in menuconfig, and rebuild.
+
+W ROUTER UNREACHABLE: 192.168.86.250:7447 - 3 attempts over 26s, last: connect timeout.
+  The host is not answering - is this the right address for this network? ...
+W ROUTER UNREACHABLE: the address is RaftROS.routerHost from SysTypes or posted settings.
+```
+
+`GET /api/rosstat` carries the same: `routerSource` (`default`|`config`),
+`routerReachable`, `connectFails`, `lastSessionAgoS`. When the router returns the
+log says so and the counters reset.
+
+**The RaftCore bug.** Testing "change it without a rebuild" showed posted
+settings did not survive a reboot: `/api/postsettings` answered ok and
+`getsettings/nv` showed the value, but after any reset the overlay was `{}`.
+`RaftJsonNVS::setJsonDoc` updates its RAM copy *before* writing NVS, so the
+read-back proved nothing; the write itself succeeded. The cause is static
+initialisation order: NVS is initialised by a file-scope static in
+`RaftJsonNVS.cpp` (`_nvsInitialised = initNVS(true)`), while `RaftCoreApp` is a
+global in the application's `main.cpp` whose `_systemConfig("sys")` constructor
+reads NVS - and C++ gives no ordering between static initialisers in different
+translation units. On this build the read ran first, failed silently (no logger
+yet), and the document came up empty every boot; writes later worked because
+NVS was initialised by then.
+
+Fix: `ensureNVSInitialised()`, a construct-on-first-use accessor called at both
+NVS access points, replacing the file-scope static. Applied to the fetched copy
+under `examples/ExampleDiscoverable/raftdevlibs/RaftCore` (git-ignored, so it
+vanishes on a refetch) and saved as
+[devdocs/patches/raftcore-nvs-init-order.patch](patches/raftcore-nvs-init-order.patch),
+which `git apply --check` accepts against RaftCore `ed73abf`. Not applied to the
+RaftCore repo - that is the user's call. With it, a posted `routerHost` survives
+`/postsettings/reboot` and a plain `/api/reset`, the SysMod reports
+`routerSource:"config"`, and `clearsettings` returns it to the default.
+
+One operational note for demos: `ros2 run rmw_zenoh_cpp rmw_zenohd` started from
+an ssh session dies with that session. Start it detached
+(`ssh -n -f host "nohup bash -lc '...' &"`); the device reconnects on its own.
 
 ### Verified With the ROS 2 Tools Over Zenoh (2026-09-27)
 
@@ -2072,6 +2139,12 @@ interval.
 | `components/RaftROS/RTPS/runtime/autopub/RTPSAutoPubQoSProfile.h` | 4 built-in profiles + override resolver |
 
 ## Raft Library Follow-ups — TODO
+
+- **RaftJsonNVS static-initialisation order** (2026-09-27): the boot-time NVS
+  read can run before NVS is initialised, so persisted settings never load.
+  Patch: [patches/raftcore-nvs-init-order.patch](patches/raftcore-nvs-init-order.patch),
+  applies cleanly to RaftCore `ed73abf`. Currently only in the fetched
+  `raftdevlibs` copy.
 
 Found while bench-testing RaftROS on a UM ProS3 and an Adafruit ESP32-S3 TFT
 Feather (2026-09-18/21). These are changes to RaftCore/RaftSysMods, not RaftROS.

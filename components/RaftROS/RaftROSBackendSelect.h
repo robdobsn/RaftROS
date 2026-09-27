@@ -10,11 +10,11 @@
 //
 // Select with menuconfig (`RaftROS` menu) or in sdkconfig.defaults:
 //
-//     CONFIG_RAFTROS_BACKEND_RTPS=y      # default
-//     CONFIG_RAFTROS_BACKEND_ZENOH=y
+//     CONFIG_RAFTROS_BACKEND_ZENOH=y     # default
+//     CONFIG_RAFTROS_BACKEND_RTPS=y
 //
-// Host builds have no Kconfig, so they default to RTPS unless
-// RAFTROS_BACKEND_ZENOH is defined on the compiler command line.
+// Host builds have no Kconfig, so they default to Zenoh unless
+// RAFTROS_BACKEND_RTPS is defined on the compiler command line.
 //
 // Rob Dobson 2026
 //
@@ -32,21 +32,21 @@
 #if defined(CONFIG_RAFTROS_BACKEND_ZENOH) || defined(CONFIG_RAFTROS_BACKEND_RTPS)
     #undef RAFTROS_BACKEND_ZENOH
     #undef RAFTROS_BACKEND_RTPS
-    #if defined(CONFIG_RAFTROS_BACKEND_ZENOH)
-        #define RAFTROS_BACKEND_ZENOH 1
-        #define RAFTROS_BACKEND_RTPS  0
-    #else
+    #if defined(CONFIG_RAFTROS_BACKEND_RTPS)
         #define RAFTROS_BACKEND_ZENOH 0
         #define RAFTROS_BACKEND_RTPS  1
+    #else
+        #define RAFTROS_BACKEND_ZENOH 1
+        #define RAFTROS_BACKEND_RTPS  0
     #endif
-#elif defined(RAFTROS_BACKEND_ZENOH) && RAFTROS_BACKEND_ZENOH
-    #undef RAFTROS_BACKEND_RTPS
-    #define RAFTROS_BACKEND_RTPS 0
+#elif defined(RAFTROS_BACKEND_RTPS) && RAFTROS_BACKEND_RTPS
+    #undef RAFTROS_BACKEND_ZENOH
+    #define RAFTROS_BACKEND_ZENOH 0
 #else
     #undef RAFTROS_BACKEND_ZENOH
     #undef RAFTROS_BACKEND_RTPS
-    #define RAFTROS_BACKEND_ZENOH 0
-    #define RAFTROS_BACKEND_RTPS  1
+    #define RAFTROS_BACKEND_ZENOH 1
+    #define RAFTROS_BACKEND_RTPS  0
 #endif
 
 #if (RAFTROS_BACKEND_RTPS + RAFTROS_BACKEND_ZENOH) != 1
