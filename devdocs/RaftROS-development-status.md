@@ -25,7 +25,7 @@ subscriptions.
 | Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Complete. Kconfig selects the backend - Zenoh by default since 2026-09-27, RTPS as the opt-in - and each image links only its own backend. The router address is layered (Kconfig < SysTypes < posted settings) and an unreachable router is reported with its cause and the fix. |
-| Z4-Z6: parity and release | Feature parity verified with the ROS 2 tools on both transports; `qosProfiles` overrides now reach subscriptions as well as publishers, shown in the graph on both. Remaining: dynamic-sensor hot-plug on Zenoh (needs someone at the board) and a release pass. |
+| Z4-Z6: parity and release | Feature parity verified with the ROS 2 tools on both transports; `qosProfiles` overrides reach subscriptions as well as publishers; device hot-plug over Zenoh verified on hardware (withdraw on loss, fresh endpoint on return, no session churn). Remaining: a release pass, and a long soak to read the heap trend. |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -225,6 +225,30 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Device Hot-Plug Over Zenoh (2026-09-27)
+
+The VL6180 was unplugged and, some time later, plugged back in while the device
+ran the Zenoh build against `rmw_zenohd`, with the device log and a ROS-side
+graph watcher recording.
+
+| | Device | ROS 2 graph |
+| --- | --- | --- |
+| Unplug (12:31:11) | `online=3` (PENDING_DELETION), `autoPubDetach slot=1` after 11,888 samples; slot released (`pubs` 2 -> 1) | `/raft/range_1_29` gone from `ros2 topic list` in the same 2 s sample; stayed gone for 26 min |
+| Replug | re-attached at once: `devices:1`, `pubs:2`, `pending:0`; sequence restarted (499 two minutes in); every sample `pub=1` to one peer | topic back, publisher count 1, node `raft_esp32`, BEST_EFFORT/VOLATILE; `ros2 topic echo` gives `range: 0.255` |
+| Throughout | session count stayed 1, no re-declare of other endpoints, no `loopBudget` or `ROUTER` warnings; loop 556 us average / 2.5 ms max | `/chatter` and both subscriptions untouched |
+
+So an endpoint's whole life over Zenoh - declare, publish, withdraw on loss,
+declare again on return - works on hardware against the real router, with no
+session churn. The backend slot was reused (slot 1 again) but the endpoint
+identity was not: entity ids only go up, so the returned publisher is a new
+endpoint to the graph, which is what a subscriber should see.
+
+One thing to watch rather than act on: after 55 minutes of uptime and a day of
+tests, the device's minimum free heap since boot was 145.7 kB, against the
+168.7 kB measured on a fresh boot. Some of that is the day's session restarts;
+a longer soak with a steady router is the way to tell whether any of it is a
+trend.
 
 ### The Malformed SEDP Packet, Found and Fixed; Subscription QoS From Profiles (2026-09-27)
 

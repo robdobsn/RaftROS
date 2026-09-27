@@ -146,8 +146,11 @@ python3 tools/zenoh_router_stub.py --interest
 python3 tools/zenoh_subscriber_demo.py
 ```
 
-Both print the device's node and per-endpoint tokens (topic, type and ROS
-type hash) and decode the samples by the type named in their key:
+Unplugging a sensor withdraws its topic from the graph within a scan period;
+plugging it back in announces it again as a fresh endpoint, on the same
+session. Both stand-ins print the device's node and per-endpoint tokens
+(topic, type and ROS type hash) and decode the samples by the type named in
+their key:
 
 ```
 SAMPLE #1 "Hello from raft_esp32 [35]"
