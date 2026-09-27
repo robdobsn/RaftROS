@@ -14,6 +14,7 @@
 #include "esp_mac.h"
 #include "esp_netif.h"
 #include "esp_random.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -902,12 +903,13 @@ String RaftROS::getStatusJSON() const
         case ConnState::READY:        stStr = "ready"; break;
     }
     const auto stats = _autoPubBackend.stats();
-    char buf[480];
+    char buf[540];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
              R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u,)"
-             R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d})",
+             R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d,)"
+             R"("heapFreeB":%u,"heapMinB":%u})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -930,7 +932,10 @@ String RaftROS::getStatusJSON() const
              _routerFromConfig ? "config" : "default",
              (_connState == ConnState::READY || _connState == ConnState::HANDSHAKE) ? "true" : "false",
              (unsigned)_connectFailures,
-             _lastSessionMs ? (int)((millis() - _lastSessionMs) / 1000) : -1);
+             _lastSessionMs ? (int)((millis() - _lastSessionMs) / 1000) : -1,
+             // System heap, not this module's: the figures a long soak reads
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size());
     return buf;
 }
 
