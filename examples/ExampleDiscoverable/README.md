@@ -94,7 +94,8 @@ says so in the log. Delete `build/SysTypeMain/sdkconfig` after changing
 ## Demonstrating the Zenoh build
 
 Run a router on a machine the device can reach, then use the ordinary ROS 2
-tools:
+tools. This is verified end to end against `rmw_zenoh_cpp` 0.2.10 on ROS 2
+Jazzy - node, both publishers, both subscriptions and per-topic routing:
 
 ```bash
 ros2 run rmw_zenoh_cpp rmw_zenohd            # the router
