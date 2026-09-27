@@ -158,6 +158,7 @@ static_assert(
     #define DEBUG_PURGE_STALE
     #define RAFTROS_SEND_WRITER_HEARTBEATS
     #define DEBUG_PARTICIPANT_PROCESSING
+    #define DEBUG_AUTOPUB_ANNOUNCE
     #define DEBUG_PUBLISH_CHATTER
     #define DEBUG_SEDP_SUB_ACK
     #define DEBUG_AUTOPUB_SEDP_ANNOUNCE
@@ -399,6 +400,7 @@ void RaftROS::loop()
             // can see registry occupancy + ros_discovery_info seq across time
             // even on release builds while investigating the graph-visibility
             // regression.
+#ifdef DEBUG_HEALTH_COUNTS
             const auto poolCounters = _autoPubSource.poolCounters();
             LOG_I(MODULE_PREFIX,
                   "autoPubStatus slots=%u/%u devices=%u discovered=%u rosDiscSeq=%u state=%d stale=%u busy=%u empty=%u drainSkips=%u drainGapMax=%ums drainGaps>150ms=%u",
@@ -411,6 +413,7 @@ void RaftROS::loop()
                   (unsigned)poolCounters.emptyFills, (unsigned)poolCounters.drainBusySkips,
                   (unsigned)(_autoPubSource.drainGapMaxUs() / 1000),
                   (unsigned)_autoPubSource.drainGapsOver150ms());
+#endif
             _autoPubSource.resetDrainDiagnostics();
             _lastDiscoveredHealthLogMs = now;
         }
@@ -2437,9 +2440,11 @@ void RaftROS::autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondaryS
     // seq=2 from the graph listener.
     if (!_discovered.empty())
         _rosDiscSeqNum++;
+#ifdef DEBUG_AUTOPUB_ANNOUNCE
     LOG_I(MODULE_PREFIX, "autoPubAttach slot=%u secSlot=%d (rosDiscSeqNum now %u discovered=%u)",
           (unsigned)primarySlot, (int)(int8_t)secondarySlot,
           (unsigned)_rosDiscSeqNum, (unsigned)_discovered.size());
+#endif
 }
 
 void RaftROS::autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondarySlot)
@@ -2461,11 +2466,15 @@ void RaftROS::autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondary
             if (_autoPubBackend.disposeAtPeer(slotIdx, remote, disposeSeq))
                 disposedTo++;
         }
+#ifdef DEBUG_AUTOPUB_ANNOUNCE
         if (disposedTo > 0)
         {
             LOG_I(MODULE_PREFIX, "autoPubDispose slot=%u disposedTo=%d peers",
                   (unsigned)slotIdx, disposedTo);
         }
+#else
+        (void)disposedTo;
+#endif
     };
 
     disposeSlot(primarySlot);

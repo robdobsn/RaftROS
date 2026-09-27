@@ -28,6 +28,14 @@
 
 static const char* MODULE_PREFIX = "RaftROS";
 
+// Verbose logging for bring-up.  Console writes block the loop task, so the
+// default build says what happened (connected, declared node, subscribed to a
+// topic) and keeps the key expressions and tokens for when they are wanted.
+// #define RAFTROS_VERBOSE_LOGGING
+#ifdef RAFTROS_VERBOSE_LOGGING
+    #define DEBUG_ZENOH_KEYS            // full key expressions and liveliness tokens
+#endif
+
 using namespace RaftRuntime::Zenoh;
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -505,7 +513,10 @@ bool RaftROS::stepDeclarations(uint32_t nowMs)
     if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
         return false;
     _nodeTokenState = NodeTokenState::DECLARED;
-    LOG_I(MODULE_PREFIX, "declared node token %s", _nodeToken);
+    LOG_I(MODULE_PREFIX, "declared node %s%s", _nodeNamespace.c_str(), _nodeName.c_str());
+#ifdef DEBUG_ZENOH_KEYS
+    LOG_I(MODULE_PREFIX, "node token %s", _nodeToken);
+#endif
     return true;
 }
 
@@ -721,7 +732,9 @@ int RaftROS::addStringSubscription(const char* topic, const char* type, StringMe
     subscription.state = Subscription::State::PENDING_DECLARE;
     subscription.tokenDeclared = false;
     const int slot = _subscriptionCount++;
+#ifdef DEBUG_ZENOH_KEYS
     LOG_I(MODULE_PREFIX, "addStringSubscription slot=%d topic=%s type=%s", slot, rosTopic, type);
+#endif
     return slot;
 }
 
@@ -747,7 +760,9 @@ bool RaftROS::stepSubscriptionDeclarations(uint32_t nowMs)
             if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
                 return false;
             subscription.state = Subscription::State::DECLARED;
-            LOG_I(MODULE_PREFIX, "subscribed to %s", subscription.key);
+#ifdef DEBUG_ZENOH_KEYS
+            LOG_I(MODULE_PREFIX, "subscriber declared on %s", subscription.key);
+#endif
             return true;
         }
         if (subscription.state == Subscription::State::DECLARED && !subscription.tokenDeclared)
@@ -774,7 +789,7 @@ bool RaftROS::stepSubscriptionDeclarations(uint32_t nowMs)
             if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
                 return false;
             subscription.tokenDeclared = true;
-            LOG_I(MODULE_PREFIX, "subscription %s announced with qos=%s", subscription.rosTopic,
+            LOG_I(MODULE_PREFIX, "subscribed to %s (qos=%s)", subscription.rosTopic,
                   RaftRuntime::AutoPub::AutoPubQoSProfile_name(subscription.qosProfileId));
             return true;
         }

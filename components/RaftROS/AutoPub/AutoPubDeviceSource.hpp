@@ -10,6 +10,14 @@
 
 #include "Logger.h"
 
+// Diagnostic logging for the device pipeline.  Off by default: console writes
+// block the calling task even with nothing reading the console, and the
+// per-sample line alone was measured costing ~5% of auto-published samples on
+// an ESP32-S3.  Attach, detach and every warning always log; these switches
+// add the noise that is only useful while bringing something up.
+// #define AUTOPUB_DEBUG_STATUS_CB     // every DeviceManager status callback
+// #define AUTOPUB_DEBUG_SAMPLES       // one line per 100 published samples, per device
+
 namespace RaftRuntime::AutoPub
 {
 
@@ -37,6 +45,7 @@ template <typename Backend, uint8_t CAPACITY>
 void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceStatusChange(
         RaftDevice& device, const BusAddrStatus& addrStatus)
 {
+#ifdef AUTOPUB_DEBUG_STATUS_CB
     LOG_I(AUTOPUB_SOURCE_PREFIX,
           "autoPubStatusCb devID=%s typeIdx=%u online=%d isChange=%d isNewlyId=%d",
           device.getDeviceID().toString().c_str(),
@@ -44,6 +53,7 @@ void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceStatusChange(
           (int)addrStatus.onlineState,
           (int)addrStatus.isChange,
           (int)addrStatus.isNewlyIdentified);
+#endif
 
     // Act on either an online/offline transition (isChange) or on the
     // first-identification event for an already-online device
@@ -516,6 +526,7 @@ void AutoPubDeviceSource<Backend, CAPACITY>::drainSamples()
                   (unsigned)pCtx->structSize, (unsigned)pCtx->fieldCount,
                   (unsigned)sample.produced);
         }
+#ifdef AUTOPUB_DEBUG_SAMPLES
         else if (pCtx->secondarySlot == INVALID_SLOT)
         {
             LOG_I(AUTOPUB_SOURCE_PREFIX,
@@ -547,6 +558,7 @@ void AutoPubDeviceSource<Backend, CAPACITY>::drainSamples()
                   (unsigned)results[1].publishResult,
                   (unsigned)sample.overwritten, (unsigned)sample.produced);
         }
+#endif
     });
 }
 
