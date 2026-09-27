@@ -25,7 +25,7 @@ subscriptions.
 | Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Complete. Kconfig selects the backend - Zenoh by default since 2026-09-27, RTPS as the opt-in - and each image links only its own backend. The router address is layered (Kconfig < SysTypes < posted settings) and an unreachable router is reported with its cause and the fix. |
-| Z4-Z6: parity and release | Feature parity verified with the ROS 2 tools on both transports; `qosProfiles` overrides reach subscriptions as well as publishers; device hot-plug over Zenoh verified on hardware (withdraw on loss, fresh endpoint on return, no session churn). Remaining: a release pass, and a long soak to read the heap trend. |
+| Z4-Z6: parity and release | Complete for the initial Zenoh milestone: parity verified with the ROS 2 tools on both transports, `qosProfiles` reach subscriptions, hot-plug verified, bring-up logging moved behind per-file switches. A 12 h soak is recording heap, stack headroom and session state once a minute; reading it is the last open item. |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -225,6 +225,51 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Release Pass: A Demo Log That Says What Happened (2026-09-27)
+
+Logging that was written for bring-up was left on. Console writes block the
+calling task, so this is loop time as well as noise. What a default build now
+prints in its first 45 s, against a real router, is every event and nothing
+else:
+
+```
+RaftROS: setup auto-publish listener registered with DeviceManager
+RaftROS: setup backend=zenoh router=192.168.86.192:7447 domain=0 node=/raft_esp32 session=1723...
+MainSysMod: Registered /chatter_in string message handler (per-topic slot)
+MainSysMod: Registered /chatter_in2 string message handler (per-topic slot)
+RaftROS: autoPubAttach devID=1_29 typeIdx=6 slot=1 topic=/raft/range_1_29 type=sensor_msgs::msg::dds_::Range_ qos=fast_sensor
+RaftROS: connected to router 192.168.86.192:7447, opening session
+RaftROS: session established batch=4096 lease=60000ms
+RaftROS: declared node /raft_esp32
+RaftROS: subscribed to /chatter_in (qos=fallback_string)
+RaftROS: subscribed to /chatter_in2 (qos=fallback_string)
+```
+
+Before, the same window held twelve RaftROS lines of which seven were
+`autoPubStatusCb` callbacks, per-sample `autoPubData` counters and
+`addStringSubscription` echoes of what MainSysMod had just said - and the raw
+liveliness tokens and key expressions ran to 200 characters a line.
+
+What moved behind a switch, and where the switch is (each file's own, since a
+SysMod's `#define` block sits after its includes and cannot reach a shared
+header):
+
+| Switch | File | Restores |
+| --- | --- | --- |
+| `AUTOPUB_DEBUG_STATUS_CB` | `AutoPub/AutoPubDeviceSource.hpp` | every DeviceManager status callback |
+| `AUTOPUB_DEBUG_SAMPLES` | same | one line per 100 samples per device, with sequence, peers and callback-gap histogram |
+| `RAFTROS_VERBOSE_LOGGING` -> `DEBUG_ZENOH_KEYS` | `Zenoh/RaftROSZenoh.cpp` | full node token, subscriber key expressions, `addStringSubscription` |
+| `RAFTROS_VERBOSE_LOGGING` -> `DEBUG_AUTOPUB_ANNOUNCE`, `DEBUG_HEALTH_COUNTS` | `RTPS/RaftROSRTPS.cpp` | per-peer SEDP announce/dispose of auto-published writers; the 5 s `autoPubStatus` health line |
+
+Attach, detach, connection events, and every warning are unconditional. All of
+the demoted counters are on `GET /api/rosstat`, which is where a soak reads
+them anyway.
+
+Also in this pass: both RaftCore patches are now upstream (`b8e1f9b` and
+`5494416` on RaftCore `main`), so the copies under `devdocs/patches/` are
+history rather than instructions; and the fetched `raftdevlibs` copy tracks
+that `main`.
 
 ### Device Hot-Plug Over Zenoh (2026-09-27)
 
@@ -2230,9 +2275,11 @@ interval.
 
 - **RaftJsonNVS static-initialisation order** (2026-09-27): the boot-time NVS
   read can run before NVS is initialised, so persisted settings never load.
-  Patch: [patches/raftcore-nvs-init-order.patch](patches/raftcore-nvs-init-order.patch),
-  applies cleanly to RaftCore `ed73abf`. Currently only in the fetched
-  `raftdevlibs` copy.
+  Patch: [patches/raftcore-nvs-init-order.patch](patches/raftcore-nvs-init-order.patch)
+  - **applied upstream as RaftCore `b8e1f9b`**; the two remaining NVS entry
+  points (`ArPreferences::begin`, `NetworkSystem` before `esp_wifi_init`) as
+  [patches/raftcore-nvs-init-order-2.patch](patches/raftcore-nvs-init-order-2.patch),
+  **applied upstream as `5494416`**.
 
 Found while bench-testing RaftROS on a UM ProS3 and an Adafruit ESP32-S3 TFT
 Feather (2026-09-18/21). These are changes to RaftCore/RaftSysMods, not RaftROS.

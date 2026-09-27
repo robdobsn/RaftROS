@@ -172,6 +172,18 @@ from any host with `curl` once a minute:
  "stackFreeB":5480,"heapFreeB":177012,"heapMinB":168400}
 ```
 
+### Logging
+
+A default build logs events only - setup, device attach/detach, connection,
+node and subscription announcements, and every warning. The bring-up detail is
+behind per-file switches: `RAFTROS_VERBOSE_LOGGING` near the top of
+`Zenoh/RaftROSZenoh.cpp` or `RTPS/RaftROSRTPS.cpp` (full key expressions and
+tokens, per-peer announce traffic, the 5 s health line), and
+`AUTOPUB_DEBUG_STATUS_CB` / `AUTOPUB_DEBUG_SAMPLES` in
+`AutoPub/AutoPubDeviceSource.hpp` (every DeviceManager callback; a per-100-
+samples counter line per device). Console writes block the main loop, so leave
+them off for a demo; the counters are all on `GET /api/rosstat`.
+
 ## Configuration
 
 The RaftROS SysMod and the overall system configuration live in `systypes/SysTypeMain/SysTypes.json`. The relevant RaftROS fields are the domain ID, the ROS 2 node name (`raft_esp32` by default), the SPDP announce interval and participant lease duration (RTPS), and the router address (Zenoh).
