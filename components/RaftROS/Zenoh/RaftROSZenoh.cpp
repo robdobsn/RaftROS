@@ -54,6 +54,12 @@ void RaftROS::setup()
     _domainId = configGetLong("domainId", 0);
     _nodeName = configGetString("nodeName", "raft_esp32");
     _nodeNamespace = configGetString("nodeNamespace", "/");
+    // The router address is layered: the Kconfig default, overridden by
+    // "routerHost" in SysTypes, overridden by a value posted to
+    // /api/postsettings (persisted in NVS).  Remember which, so a device that
+    // cannot reach its router can say whether it is running on a default that
+    // was never set for this network.
+    _routerFromConfig = configGetString("routerHost", "").length() > 0;
 #ifdef CONFIG_RAFTROS_ZENOH_ROUTER_HOST
     _routerHost = configGetString("routerHost", CONFIG_RAFTROS_ZENOH_ROUTER_HOST);
     _routerPort = configGetLong("routerPort", CONFIG_RAFTROS_ZENOH_ROUTER_PORT);
@@ -210,6 +216,7 @@ uint32_t RaftROS::getLocalIP()
     esp_netif_ip_info_t ipInfo;
     if (esp_netif_get_ip_info(netif, &ipInfo) != ESP_OK)
         return 0;
+    _localIpForLog = ipInfo.ip.addr;
     return ipInfo.ip.addr;
 }
 
@@ -323,6 +330,12 @@ void RaftROS::serviceSession(uint32_t nowMs)
         _connState = ConnState::READY;
         _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
         _lastEstablishedMs = nowMs;
+        _lastSessionMs = nowMs;
+        if (_connectFailures)
+            LOG_I(MODULE_PREFIX, "router %s:%u reachable again after %u failed attempts",
+                  _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_connectFailures);
+        _connectFailures = 0;
+        _firstFailureMs = 0;
         ++_sessionCount;
         LOG_I(MODULE_PREFIX, "session established batch=%u lease=%ums",
               (unsigned)_session.negotiatedBatch(), (unsigned)_session.remoteLeaseMs());
@@ -393,6 +406,10 @@ bool RaftROS::flushToRouter()
 /// is down does not turn into a reconnect storm
 void RaftROS::closeConnection(const char* reason)
 {
+    // A close before the session was up is a failed attempt to reach the
+    // router; a close of a live session is not (the router was there)
+    if (_connState == ConnState::CONNECTING || _connState == ConnState::HANDSHAKE)
+        noteConnectFailure(reason);
     if (_sock >= 0)
     {
         close(_sock);
@@ -419,6 +436,52 @@ void RaftROS::closeConnection(const char* reason)
     _lastConnectAttemptMs = millis();
     _reconnectDelayMs = _reconnectDelayMs >= RECONNECT_DELAY_MAX_MS ?
         RECONNECT_DELAY_MAX_MS : _reconnectDelayMs * 2;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Router reachability
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+void RaftROS::noteConnectFailure(const char* reason)
+{
+    const uint32_t nowMs = millis();
+    ++_connectFailures;
+    _lastFailureReason = reason;
+    if (_firstFailureMs == 0)
+        _firstFailureMs = nowMs;
+    if (_connectFailures >= UNREACHABLE_WARN_AFTER &&
+        (_lastUnreachableLogMs == 0 ||
+         Raft::isTimeout(nowMs, _lastUnreachableLogMs, UNREACHABLE_LOG_INTERVAL_MS)))
+    {
+        _lastUnreachableLogMs = nowMs;
+        warnRouterUnreachable();
+    }
+}
+
+/// @brief Say, once every UNREACHABLE_LOG_INTERVAL_MS, that the router cannot
+/// be reached - and what to do about it.  Written for whoever is looking at
+/// the log of a device that has gone quiet in ROS 2: which address, why it
+/// might be wrong, and each way to change it, the rebuild-free one first.
+void RaftROS::warnRouterUnreachable()
+{
+    const bool refused = strcmp(_lastFailureReason, "connect refused") == 0;
+    const uint32_t forSecs = (millis() - _firstFailureMs) / 1000;
+    LOG_W(MODULE_PREFIX,
+          "ROUTER UNREACHABLE: %s:%u - %u attempts over %us, last: %s. %s Nothing reaches ROS 2 until this is fixed.",
+          _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_connectFailures, (unsigned)forSecs,
+          _lastFailureReason,
+          refused ? "The host answers but no router is listening there - start one with: ros2 run rmw_zenoh_cpp rmw_zenohd"
+                  : "The host is not answering - is this the right address for this network?");
+    LOG_W(MODULE_PREFIX,
+          "ROUTER UNREACHABLE: the address is %s.",
+          _routerFromConfig
+              ? "RaftROS.routerHost from SysTypes or posted settings"
+              : "the built-in default (CONFIG_RAFTROS_ZENOH_ROUTER_HOST), which was set for a different network and probably needs changing for this one");
+    LOG_W(MODULE_PREFIX,
+          "ROUTER UNREACHABLE: to change it without a rebuild, from any host on the network: "
+          "curl -X POST http://%s/api/postsettings/reboot -d '{\"RaftROS\":{\"routerHost\":\"<router-ip>\"}}' "
+          "- or set RaftROS.routerHost in SysTypes.json, or CONFIG_RAFTROS_ZENOH_ROUTER_HOST in menuconfig, and rebuild.",
+          inet_ntoa(*(struct in_addr*)&(uint32_t&)_localIpForLog));
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -825,11 +888,12 @@ String RaftROS::getStatusJSON() const
         case ConnState::READY:        stStr = "ready"; break;
     }
     const auto stats = _autoPubBackend.stats();
-    char buf[400];
+    char buf[480];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
-             R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u})",
+             R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u,)"
+             R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -848,7 +912,11 @@ String RaftROS::getStatusJSON() const
              // Headroom left on the task this SysMod runs on (shared with every
              // other SysMod on the loop), which is what decides whether an
              // image fits
-             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)));
+             (unsigned)(uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t)),
+             _routerFromConfig ? "config" : "default",
+             (_connState == ConnState::READY || _connState == ConnState::HANDSHAKE) ? "true" : "false",
+             (unsigned)_connectFailures,
+             _lastSessionMs ? (int)((millis() - _lastSessionMs) / 1000) : -1);
     return buf;
 }
 
