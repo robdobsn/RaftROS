@@ -162,11 +162,14 @@ SAMPLE #1 range=0.0170 m
 everything on the new session and carries on from the next sequence number, so
 restarting either tool is a fair test of reconnection.
 
-The SysMod's own view is on `GET /api/rosstat`:
+The SysMod's own view is on `GET /api/rosstat` - session state, counters, and
+the system's stack headroom and free/minimum heap, so a long soak can be read
+from any host with `curl` once a minute:
 
 ```json
 {"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":2,"samples":204,"subs":2,
- "rxDropped":0,"routerSource":"default","routerReachable":true,"connectFails":0,"lastSessionAgoS":41}
+ "rxDropped":0,"routerSource":"default","routerReachable":true,"connectFails":0,"lastSessionAgoS":41,
+ "stackFreeB":5480,"heapFreeB":177012,"heapMinB":168400}
 ```
 
 ## Configuration

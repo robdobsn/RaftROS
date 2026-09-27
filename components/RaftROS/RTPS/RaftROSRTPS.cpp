@@ -35,6 +35,7 @@
 #include "RaftBus.h"
 #include "RaftDevice.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -2371,11 +2372,11 @@ String RaftROS::getStatusJSON() const
         case ConnState::ANNOUNCING:   stStr = "announcing"; break;
         case ConnState::ACTIVE:       stStr = "active"; break;
     }
-    char buf[320];
+    char buf[400];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"%s","en":%s,"domId":%d,"node":"%s","ns":"%s","conn":"%s",)"
              R"("disc":%d,"spdpSeq":%llu,"devices":%u,"stackFreeB":%u,"loopMaxUs":%u,"rxDeferrals":%u,)"
-             R"("sends":%u,"sendTotalMs":%u,"sendMaxUs":%u})",
+             R"("sends":%u,"sendTotalMs":%u,"sendMaxUs":%u,"heapFreeB":%u,"heapMinB":%u})",
              RAFTROS_BACKEND_NAME,
              _isEnabled ? "true" : "false",
              (int)_domainId,
@@ -2394,7 +2395,10 @@ String RaftROS::getStatusJSON() const
              (unsigned)_rxBudgetDeferrals,
              (unsigned)_sendCount,
              (unsigned)(_sendTotalUs / 1000),
-             (unsigned)_sendMaxUs);
+             (unsigned)_sendMaxUs,
+             // System heap, not this module's: the figures a long soak reads
+             (unsigned)esp_get_free_heap_size(),
+             (unsigned)esp_get_minimum_free_heap_size());
     return buf;
 }
 
