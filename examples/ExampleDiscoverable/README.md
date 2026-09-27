@@ -170,6 +170,19 @@ The SysMod's own view is on `GET /api/rosstat`:
 
 The RaftROS SysMod and the overall system configuration live in `systypes/SysTypeMain/SysTypes.json`. The relevant RaftROS fields are the domain ID, the ROS 2 node name (`raft_esp32` by default), the SPDP announce interval and participant lease duration (RTPS), and the router address (Zenoh).
 
+### QoS for subscriptions
+
+The `qosProfiles` block applies to subscriptions as well as published devices.
+An alias override keyed on the topic's last segment picks the profile a reader
+is announced with; without one, readers use `fallback_string` (RELIABLE,
+VOLATILE, depth 10). It can be set at runtime like the router address:
+
+```bash
+curl -X POST http://<device-ip>/api/postsettings/reboot \
+     -d '{"RaftROS":{"qosProfiles":{"chatter_in":"event"}}}'
+ros2 topic info -v /chatter_in     # Reliability: RELIABLE  Durability: TRANSIENT_LOCAL
+```
+
 ## Auto-publishing bus devices (Phase 4)
 
 With `RaftROS.enable = 1` and `DevMan.enable = 1`, every device that

@@ -703,16 +703,16 @@ int RaftROS::addStringSubscription(const char* topic, const char* type, StringMe
     // Entity ids come from the same monotonic space as published endpoints so
     // a subscription and a publisher are never confused for one another
     subscription.entityId = _nextSubscriptionEntityId++;
-    const ZenohROSCodec::NodeIdentity node = nodeIdentity();
-    const ZenohROSCodec::Endpoint endpoint{subscription.entityId,
-        ZenohROSCodec::EndpointKind::Subscription, subscription.rosTopic, subscription.type, typeHash,
-        {ZenohROSCodec::Reliability::Reliable, ZenohROSCodec::Durability::Volatile, 10}};
-    if (!ZenohROSCodec::formatTopicKey(subscription.key, sizeof(subscription.key), node.domainId,
-                                       endpoint.topic, endpoint.wireType, endpoint.typeHash) ||
-        !ZenohROSCodec::formatEndpointToken(subscription.token, sizeof(subscription.token), node, endpoint))
+    subscription.typeHash = typeHash;
+    // The key does not depend on QoS.  The liveliness token does, and the
+    // QoS comes from the qosProfiles configuration, which another SysMod may
+    // not have finished setting up yet - so the token is built when it is
+    // declared, not here.
+    if (!ZenohROSCodec::formatTopicKey(subscription.key, sizeof(subscription.key), _domainId,
+                                       subscription.rosTopic, subscription.type, typeHash))
     {
-        LOG_W(MODULE_PREFIX, "addStringSubscription cannot express '%s' as a Zenoh endpoint", rosTopic);
-        subscription.key[0] = subscription.token[0] = '\0';
+        LOG_W(MODULE_PREFIX, "addStringSubscription cannot express '%s' as a Zenoh key", rosTopic);
+        subscription.key[0] = '\0';
         return -1;
     }
 
@@ -751,16 +751,30 @@ bool RaftROS::stepSubscriptionDeclarations(uint32_t nowMs)
         }
         if (subscription.state == Subscription::State::DECLARED && !subscription.tokenDeclared)
         {
-            const size_t msgLen = ZenohNetworkMessage::declareToken(
-                _msgBuf, sizeof(_msgBuf), SUBSCRIBER_TOKEN_ID_BASE + index, subscription.token);
+            // Resolve the QoS now and build the token that announces it.  The
+            // same resolution a publisher gets: a qosProfiles alias override
+            // for the topic, otherwise FallbackString.
+            subscription.qosProfileId = _autoPubSource.resolveSubscriptionQoS(subscription.rosTopic);
+            const ZenohROSCodec::Endpoint endpoint{subscription.entityId,
+                ZenohROSCodec::EndpointKind::Subscription, subscription.rosTopic, subscription.type,
+                subscription.typeHash, ZenohAutoPubBackend::qosForProfile(subscription.qosProfileId)};
+            size_t msgLen = 0;
+            if (ZenohROSCodec::formatEndpointToken(subscription.token, sizeof(subscription.token),
+                                                   nodeIdentity(), endpoint))
+                msgLen = ZenohNetworkMessage::declareToken(
+                    _msgBuf, sizeof(_msgBuf), SUBSCRIBER_TOKEN_ID_BASE + index, subscription.token);
             if (msgLen == 0)
             {
+                LOG_W(MODULE_PREFIX, "subscription '%s' token will not build - it will receive but not appear in the graph",
+                      subscription.rosTopic);
                 subscription.tokenDeclared = true;      // do not retry a message that cannot be built
                 continue;
             }
             if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
                 return false;
             subscription.tokenDeclared = true;
+            LOG_I(MODULE_PREFIX, "subscription %s announced with qos=%s", subscription.rosTopic,
+                  RaftRuntime::AutoPub::AutoPubQoSProfile_name(subscription.qosProfileId));
             return true;
         }
     }

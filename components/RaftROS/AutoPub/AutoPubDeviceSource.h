@@ -158,6 +158,17 @@ public:
     uint8_t mailboxInUseCount() const { return _pool.inUseCount(); }
     auto poolCounters() const { return _pool.counters(); }
 
+    /// @brief QoS profile for a subscription on a ROS topic, resolved the same
+    /// way a publisher's is: a `qosProfiles` alias override for the topic's
+    /// last segment wins, otherwise FallbackString (RELIABLE, VOLATILE, depth
+    /// 10 - what both transports announced for readers before this existed).
+    /// Resolved when the reader is announced or declared rather than when the
+    /// application subscribes, so the order SysMods set up in does not matter.
+    AutoPubQoSProfileId resolveSubscriptionQoS(const char* rosTopic) const
+    {
+        return resolveQoSProfileId(AutoPubAttachPlan_topicAlias(rosTopic), nullptr, 0, nullptr);
+    }
+
 private:
     /// @brief One attached device: what it publishes, how to decode it, and the
     /// mailbox handle its bus callbacks carry

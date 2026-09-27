@@ -1634,16 +1634,19 @@ void RaftROS::stepWriterHeartbeatPass()
                         sequenceNumber, self->_myIpAddr, heartbeatCount,
                         self->computeSedpPubHeartbeatLastSN());
                 case RTPSWriterHeartbeatAction::SedpChatterSubscription:
+                {
+                    uint32_t reliabilityKind = 0, durabilityKind = 0;
+                    self->subscriptionQoSKinds(self->_subscriptionTopic.c_str(), reliabilityKind, durabilityKind);
                     return self->_sedpHandler.buildSubscriptionMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
                         ENTITYID_CHATTER_READER,
                         self->_subscriptionTopic.c_str(),
                         self->_subscriptionType.c_str(),
-                        RELIABILITY_RELIABLE,
-                        DURABILITY_VOLATILE,
+                        reliabilityKind, durabilityKind,
                         sequenceNumber, self->_myIpAddr, heartbeatCount,
                         self->computeSedpSubHeartbeatLastSN());
+                }
                 case RTPSWriterHeartbeatAction::ParticipantMessageData:
                     return self->_sedpHandler.buildParticipantMessageData(
                         self->_sendBuf, sizeof(self->_sendBuf),
@@ -1792,11 +1795,13 @@ void RaftROS::stepWriterHeartbeatPass()
     {
         const uint8_t slot = _hbPass.extraSubSlot;
         const auto& entry = _subscriptionRegistry.entries[slot];
+        uint32_t reliabilityKind = 0, durabilityKind = 0;
+        subscriptionQoSKinds(entry.topic, reliabilityKind, durabilityKind);
         const uint32_t payloadLen = _sedpHandler.buildSubscriptionMessage(
             _sendBuf, sizeof(_sendBuf),
             _participant, remote.guidPrefix,
             entry.entityId, entry.topic, entry.type,
-            RELIABILITY_RELIABLE, DURABILITY_VOLATILE,
+            reliabilityKind, durabilityKind,
             _extraSubscriptionSeqNums[slot], _myIpAddr);
         if (payloadLen != 0)
         {
@@ -1959,6 +1964,10 @@ void RaftROS::drainPendingAnnounces()
                             sequenceNumber, self->_myIpAddr, sedpHeartbeatForBuild,
                             self->computeSedpPubHeartbeatLastSN());
                     }
+                    uint32_t readerReliability = sedpSpec.reliabilityKind;
+                    uint32_t readerDurability = sedpSpec.durabilityKind;
+                    if (buildSpec.sedpEndpointProfile == RTPSInitialAnnounceSedpEndpointProfile::ChatterReader)
+                        self->subscriptionQoSKinds(self->_subscriptionTopic.c_str(), readerReliability, readerDurability);
                     return self->_sedpHandler.buildSubscriptionMessage(
                         self->_sendBuf, sizeof(self->_sendBuf),
                         self->_participant, remoteRef.guidPrefix,
@@ -1967,7 +1976,7 @@ void RaftROS::drainPendingAnnounces()
                             ? self->_subscriptionTopic.c_str() : sedpSpec.topicName,
                         (buildSpec.sedpEndpointProfile == RTPSInitialAnnounceSedpEndpointProfile::ChatterReader)
                             ? self->_subscriptionType.c_str() : sedpSpec.typeName,
-                        sedpSpec.reliabilityKind, sedpSpec.durabilityKind,
+                        readerReliability, readerDurability,
                         sequenceNumber, self->_myIpAddr, sedpHeartbeatForBuild,
                         self->computeSedpSubHeartbeatLastSN());
                 }
@@ -2094,11 +2103,13 @@ void RaftROS::drainPendingAnnounces()
     {
         const uint8_t slot = entry.extraSubSlot;
         const auto& regEntry = _subscriptionRegistry.entries[slot];
+        uint32_t reliabilityKind = 0, durabilityKind = 0;
+        subscriptionQoSKinds(regEntry.topic, reliabilityKind, durabilityKind);
         const uint32_t payloadLen = _sedpHandler.buildSubscriptionMessage(
             _sendBuf, sizeof(_sendBuf),
             _participant, entry.remote.guidPrefix,
             regEntry.entityId, regEntry.topic, regEntry.type,
-            RELIABILITY_RELIABLE, DURABILITY_VOLATILE,
+            reliabilityKind, durabilityKind,
             _extraSubscriptionSeqNums[slot], _myIpAddr);
         if (payloadLen > 0)
         {
@@ -2455,6 +2466,18 @@ void RaftROS::autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondary
 
     disposeSlot(primarySlot);
     disposeSlot(secondarySlot);
+}
+
+/// @brief Reliability/durability to announce for a reader on `ddsTopic`,
+/// from the same qosProfiles resolution a publisher gets.  The registry holds
+/// DDS names ("rt/chatter_in"); the resolver keys on the ROS topic's last
+/// segment, which is the same either way.
+void RaftROS::subscriptionQoSKinds(const char* ddsTopic, uint32_t& reliabilityKind, uint32_t& durabilityKind) const
+{
+    const auto profile = RaftRuntime::AutoPub::AutoPubQoSProfile_get(
+        _autoPubSource.resolveSubscriptionQoS(ddsTopic ? ddsTopic : ""));
+    reliabilityKind = (uint32_t)profile.reliability;   // numerically the RTPS kinds
+    durabilityKind = (uint32_t)profile.durability;
 }
 
 void RaftROS::autoPubOnEndpointsDetached()
