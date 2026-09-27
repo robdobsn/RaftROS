@@ -12,16 +12,20 @@ new forward work. ROS metadata/identity code and host-only native ROS graph/data
 control tests pass. The connected Linux probe now sends ROS node/publisher
 declarations, Raft-CDR String or Range samples and token withdrawals over its own TCP
 session. A late independent ROS process also discovers and receives samples.
-Host release sizes and fixed storage are now measured; there is still no
-Zenoh firmware backend, build selector or measured ESP32 footprint.
+Host release sizes and fixed storage are measured, and as of 2026-09-27 the
+Zenoh firmware backend, the build selector and the ESP32 footprint are all done:
+a Zenoh image auto-publishes bus devices, publishes `/chatter` and subscribes to
+strings through the same application API as the RTPS image, and `rmw_zenohd`
+plus the ordinary ROS 2 tools resolve the node, its publishers and its
+subscriptions.
 
 | Work | State / next evidence |
 | --- | --- |
 | Z0: feasibility and baseline | ESP32 measurements done: app image, free heap, stack headroom and loop timing recorded for both backends under an active subscriber (see "Loop Budget Under Load"). zenoh-pico incorporation still needs explicit approval. |
-| Z1: native ROS proof | String/Range, late ROS process and withdrawal pass. Scripted direct interests and native explicit publisher/peer restarts also pass. General upstream discovery, resource/topology budgets, automatic reconnect and firmware integration remain open; Z1 is not declared complete. |
+| Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Build selection done: Kconfig picks RTPS (default) or Zenoh, both ESP32-S3 images build and link only their own backend. The Zenoh SysMod connects, declares its node token and answers interests; DeviceManager auto-publish for it awaits the shared extraction of the device plumbing. Neither image run against a router yet. |
-| Z4-Z6: parity and release | Feature parity reached: both builds auto-publish bus devices, publish `/chatter` and subscribe to strings through one pipeline and one application API, verified on hardware with reconnect proven. ROS-tooling verification over Zenoh (needs `rmw_zenoh` installed), QoS coverage and resource budgets remain. |
+| Z4-Z6: parity and release | Feature parity reached and verified with the ROS 2 tools on both transports: node/topic/graph queries, both publishers, both subscriptions and per-topic routing. Remaining: QoS coverage beyond the built-in profiles, dynamic-sensor hot-plug on Zenoh, and a release pass. |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -222,6 +226,59 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### Verified With the ROS 2 Tools Over Zenoh (2026-09-27)
+
+`ros-jazzy-rmw-zenoh-cpp` 0.2.10 installed on the ROS host, `ros2 run
+rmw_zenoh_cpp rmw_zenohd` as the router, `RMW_IMPLEMENTATION=rmw_zenoh_cpp`, and
+the device pointed at it. Everything the RTPS build does with the ordinary ROS 2
+tools, the Zenoh build now does too:
+
+```
+$ ros2 node list
+/raft_esp32
+
+$ ros2 node info /raft_esp32
+  Subscribers:
+    /chatter_in: std_msgs/msg/String
+    /chatter_in2: std_msgs/msg/String
+  Publishers:
+    /chatter: std_msgs/msg/String
+    /raft/range_1_29: sensor_msgs/msg/Range
+
+$ ros2 topic info -v /raft/range_1_29
+Publisher count: 1
+Node name: raft_esp32            Node namespace: /
+Topic type hash: RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a
+  Reliability: BEST_EFFORT       Durability: VOLATILE
+
+$ ros2 topic echo --once /raft/range_1_29
+range: 0.014999999664723873      variance: 0.0
+
+$ ros2 topic echo --once /chatter
+data: Hello from raft_esp32 [28]
+
+$ ros2 topic pub --once /chatter_in  std_msgs/msg/String "{data: 'hello from ros2 zenoh 1'}"
+$ ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'second slot over zenoh'}"
+  -> device: chatter_in #1..#3 "hello from ros2 zenoh 1..3"
+             chatter_in2 #1     "second slot over zenoh"
+```
+
+Worth noting:
+
+- The QoS the graph reports (`BEST_EFFORT` / `VOLATILE`) is the `fast_sensor`
+  profile the class map picked for a range device, so the profile survives all
+  the way into the ROS graph rather than only into our own token.
+- Per-topic routing works: `/chatter_in` and `/chatter_in2` land on their own
+  handler slots. Each `ros2 topic pub --once` appears with a different publisher
+  GID, as it should - a new publisher per invocation.
+- The installed `rmw_zenoh` is 0.2.10 while our attachment advertises 0.2.11.
+  It interoperates, so that string is not part of matching.
+
+This was the last item standing between the Zenoh backend and parity: every
+earlier check went through our own wire reading or a stand-in router, both of
+which could have agreed with a shared misunderstanding. The ROS 2 tools could
+not.
+
 ### Loop Budget Under Load, and Measured Resources for Both Backends (2026-09-26)
 
 Measuring the device with a ROS 2 subscriber actually consuming its topic - not
@@ -377,11 +434,8 @@ Hardware (ESP32-S3 Feather, VL6180, real Zenoh router and ROS 2 Jazzy):
 - App image: Zenoh 1256528 B, RTPS 1268464 B.
 - Tests: **1028** unit, **2218** codec, **1271** session, **138** Zenoh firmware
   pieces - 0 failed.
-- Still open: `ros2 node list` over Zenoh is unproven because `rmw_zenoh` is not
-  installed on the ROS host (`sudo apt install ros-jazzy-rmw-zenoh-cpp`); the
-  liveliness tokens it reads are correct and queryable, but that is one step
-  short of the ROS tools themselves. Our `rmw` version string says 0.2.11 while
-  Jazzy currently packages 0.2.10.
+- ROS-tooling verification over Zenoh: **done 2026-09-27**, see "Verified With
+  the ROS 2 Tools Over Zenoh".
 
 ### Zenoh Publishes Devices, Verified on Hardware (2026-09-25)
 
