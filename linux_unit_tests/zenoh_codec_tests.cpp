@@ -223,14 +223,20 @@ int main(int argc, char** argv)
     }
     const std::string_view invalidTypes[] = {
         "", "std_msgs/msg/String", "std_msgs::msg::dds_::String", "::msg::dds_::String_",
-        "std_msgs::msg::dds_::_", "std_msgs::srv::dds_::String_", "std_msgs::msg::dds_::Str*ing_",
-        "std_msgs::msg::dds_::String_/other", "0pkg::msg::dds_::String_"
+        "std_msgs::msg::dds_::_", "std_msgs::action::dds_::String_", "std_msgs::msg::dds_::Str*ing_",
+        "std_msgs::msg::dds_::String_/other", "0pkg::msg::dds_::String_", "std_srvs::srv::dds_::",
+        "std_srvs::srv::dds_::Trigger"
     };
     for (const auto type : invalidTypes)
     {
         TEST_ASSERT(!ZenohROSCodec::formatTopicKey(key, sizeof(key), 0, "/chatter", type, stringHash) &&
                     key[0] == '\0', "unsupported or malformed wire type rejected");
     }
+    // A service key carries a "::srv::" type; rmw_zenoh forms it like a topic key
+    TEST_ASSERT(ZenohROSCodec::formatTopicKey(key, sizeof(key), 0, "/raft_esp32/devices",
+                                              "std_srvs::srv::dds_::Trigger_", stringHash) &&
+                std::string_view(key) == "0/raft_esp32/devices/std_srvs::srv::dds_::Trigger_/" + std::string(stringHash),
+                "service wire type forms a key");
     for (const std::string& hash : {
         std::string(), std::string(stringHash).substr(0, 70), std::string(stringHash) + "0",
         "RIHS00_" + std::string(64, '0'), "RIHS01_" + std::string(64, 'g'),

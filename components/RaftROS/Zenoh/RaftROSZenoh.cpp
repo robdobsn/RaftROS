@@ -15,6 +15,7 @@
 #include "esp_netif.h"
 #include "esp_random.h"
 #include "esp_system.h"
+#include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -194,27 +195,49 @@ void RaftROS::loop()
     if (!_isEnabled)
         return;
     const uint32_t nowMs = millis();
+    const int64_t passStartUs = esp_timer_get_time();
 
     // Emit the latest sample of every device whose bus callback has stored one
     // since the previous pass.  Runs in every state, as the RTPS build does:
     // with no session nothing is sent, but nothing backs up either.
     _autoPubSource.drainSamples();
+    noteMax(_loopDrainMaxUs, passStartUs);
 
     switch (_connState)
     {
         case ConnState::DISCONNECTED:
+            warnRouterUnreachable();        // the remaining lines of a warning in progress, one per pass
             if (Raft::isTimeout(nowMs, _lastConnectAttemptMs, _reconnectDelayMs) && getLocalIP() != 0)
+            {
+                const int64_t startUs = esp_timer_get_time();
                 startConnect();
+                noteMax(_loopConnMaxUs, startUs);
+            }
             break;
         case ConnState::CONNECTING:
+        {
+            const int64_t startUs = esp_timer_get_time();
             stepConnect();
+            noteMax(_loopConnMaxUs, startUs);
             break;
+        }
         case ConnState::HANDSHAKE:
         case ConnState::READY:
             serviceSession(nowMs);
             publishChatter(nowMs);
             break;
     }
+
+    const uint32_t passUs = (uint32_t)(esp_timer_get_time() - passStartUs);
+    if (passUs > _loopPassMaxUs)
+        _loopPassMaxUs = passUs;
+}
+
+void RaftROS::warnIfSlow(const char* what, int64_t startUs)
+{
+    const uint32_t elapsedUs = (uint32_t)(esp_timer_get_time() - startUs);
+    if (elapsedUs > SLOW_CALL_WARN_US)
+        LOG_W(MODULE_PREFIX, "%s took %u us on the main loop", what, (unsigned)elapsedUs);
 }
 
 uint32_t RaftROS::getLocalIP()
@@ -238,7 +261,9 @@ uint32_t RaftROS::getLocalIP()
 void RaftROS::startConnect()
 {
     _lastConnectAttemptMs = millis();
+    const int64_t startUs = esp_timer_get_time();
     _sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    warnIfSlow("socket()", startUs);
     if (_sock < 0)
     {
         LOG_W(MODULE_PREFIX, "connect socket failed errno=%d", errno);
@@ -258,7 +283,9 @@ void RaftROS::startConnect()
     dest.sin_family = AF_INET;
     dest.sin_port = htons((uint16_t)_routerPort);
     inet_aton(_routerHost.c_str(), &dest.sin_addr);
+    const int64_t connectUs = esp_timer_get_time();
     const int rslt = connect(_sock, (struct sockaddr*)&dest, sizeof(dest));
+    warnIfSlow("connect()", connectUs);
     if (rslt < 0 && errno != EINPROGRESS)
     {
         LOG_W(MODULE_PREFIX, "connect to %s:%u failed errno=%d", _routerHost.c_str(),
@@ -277,7 +304,9 @@ void RaftROS::stepConnect()
     FD_ZERO(&writeSet);
     FD_SET(_sock, &writeSet);
     struct timeval noWait = {0, 0};
+    const int64_t selectUs = esp_timer_get_time();
     const int ready = select(_sock + 1, nullptr, &writeSet, nullptr, &noWait);
+    warnIfSlow("select()", selectUs);
     if (ready < 0)
     {
         closeConnection("select failed");
@@ -293,8 +322,7 @@ void RaftROS::stepConnect()
     socklen_t errorLen = sizeof(soError);
     if (getsockopt(_sock, SOL_SOCKET, SO_ERROR, &soError, &errorLen) < 0 || soError != 0)
     {
-        LOG_W(MODULE_PREFIX, "connect to %s:%u refused errno=%d", _routerHost.c_str(),
-              (unsigned)_routerPort, soError);
+        _closeDetail = soError;
         closeConnection("connect refused");
         return;
     }
@@ -320,16 +348,21 @@ void RaftROS::serviceSession(uint32_t nowMs)
     // The backend publishes on the device pipeline's schedule, not ours, so it
     // needs the time every pass - not only on the passes where it is serviced
     _autoPubBackend.setNow(nowMs);
-    if (!receiveFromRouter(nowMs))
+    const int64_t rxStartUs = esp_timer_get_time();
+    const bool rxOk = receiveFromRouter(nowMs);
+    noteMax(_loopRxMaxUs, rxStartUs);
+    if (!rxOk)
         return;
+    const int64_t txStartUs = esp_timer_get_time();
 
     _session.service(nowMs);
+    const int64_t stepStartUs = esp_timer_get_time();
     if (_session.state() != ZenohTCPSession::State::Established)
     {
         if (_session.state() == ZenohTCPSession::State::Failed ||
             _session.state() == ZenohTCPSession::State::Closed)
         {
-            LOG_W(MODULE_PREFIX, "session ended error=%d", (int)_session.error());
+            _closeDetail = (int)_session.error();
             closeConnection("session ended");
             return;
         }
@@ -340,14 +373,16 @@ void RaftROS::serviceSession(uint32_t nowMs)
         _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
         _lastEstablishedMs = nowMs;
         _lastSessionMs = nowMs;
-        if (_connectFailures)
-            LOG_I(MODULE_PREFIX, "router %s:%u reachable again after %u failed attempts",
-                  _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_connectFailures);
+        ++_sessionCount;
+        LOG_I(MODULE_PREFIX, "session %u established batch=%u lease=%ums%s%u%s",
+              (unsigned)_sessionCount, (unsigned)_session.negotiatedBatch(), (unsigned)_session.remoteLeaseMs(),
+              _connectFailures ? " - router reachable again after " : "", (unsigned)_connectFailures,
+              _connectFailures ? " failed attempts" : "");
         _connectFailures = 0;
         _firstFailureMs = 0;
-        ++_sessionCount;
-        LOG_I(MODULE_PREFIX, "session established batch=%u lease=%ums",
-              (unsigned)_session.negotiatedBatch(), (unsigned)_session.remoteLeaseMs());
+        // The node token goes next pass: one console line per pass, since a
+        // write to an unattended USB-Serial-JTAG console stalls for ~10 ms
+        return;
     }
 
     // One outbound message per pass, in priority order: the node token (until a
@@ -356,11 +391,28 @@ void RaftROS::serviceSession(uint32_t nowMs)
     if (_connState == ConnState::READY && _session.outputSize() == 0)
     {
         if (!stepDeclarations(nowMs) && !stepSubscriptionDeclarations(nowMs) &&
+            !stepServiceDeclarations(nowMs) && !stepServiceReplies(nowMs) &&
             !stepInterestReplies(nowMs))
             _autoPubBackend.service(nowMs);
     }
+    // Run at most SERVICE_DISPATCH_BUDGET handlers per pass and expire deferred
+    // requests; the replies they stage go out above, one per pass
+    if (_connState == ConnState::READY)
+        _services.service(nowMs, SERVICE_DISPATCH_BUDGET);
+    const int64_t flushStartUs = esp_timer_get_time();
 
     flushToRouter();
+
+    // Place a new worst send-side pass: session bookkeeping / declarations
+    // and replies / socket send
+    const int64_t endUs = esp_timer_get_time();
+    if ((uint32_t)(endUs - txStartUs) > _loopTxMaxUs)
+    {
+        _loopTxMaxUs = (uint32_t)(endUs - txStartUs);
+        _loopTxMaxSessionUs = (uint32_t)(stepStartUs - txStartUs);
+        _loopTxMaxStepUs = (uint32_t)(flushStartUs - stepStartUs);
+        _loopTxMaxFlushUs = (uint32_t)(endUs - flushStartUs);
+    }
 }
 
 /// @brief Read whatever has arrived, once.  @return false if the connection died
@@ -369,7 +421,7 @@ bool RaftROS::receiveFromRouter(uint32_t nowMs)
     const int count = recv(_sock, _rxBuf, sizeof(_rxBuf), 0);
     if (count > 0)
     {
-        if (!_session.receive(_rxBuf, (size_t)count, nowMs, onDiscoveryThunk, this, onSampleThunk))
+        if (!_session.receive(_rxBuf, (size_t)count, nowMs, onDiscoveryThunk, this, onSampleThunk, onRequestThunk))
         {
             LOG_W(MODULE_PREFIX, "session rejected router data error=%d", (int)_session.error());
             closeConnection("bad router data");
@@ -397,7 +449,9 @@ bool RaftROS::flushToRouter()
     const size_t pending = _session.outputSize();
     if (pending == 0)
         return true;
+    const int64_t sendUs = esp_timer_get_time();
     const int sent = send(_sock, _session.outputData(), pending, 0);
+    warnIfSlow("send()", sendUs);
     if (sent > 0)
     {
         _session.consumeOutput((size_t)sent, millis());
@@ -421,14 +475,20 @@ void RaftROS::closeConnection(const char* reason)
         noteConnectFailure(reason);
     if (_sock >= 0)
     {
+        const int64_t closeUs = esp_timer_get_time();
         close(_sock);
+        warnIfSlow("close()", closeUs);
         _sock = -1;
     }
     if (_connState != ConnState::DISCONNECTED)
     {
-        LOG_I(MODULE_PREFIX, "disconnected (%s), retrying in %ums", reason, (unsigned)_reconnectDelayMs);
+        // One line for the whole event: each console line costs ~10 ms of loop
+        // time when no host is reading the USB-Serial-JTAG port
+        LOG_W(MODULE_PREFIX, "disconnected from %s:%u (%s%s%d), retrying in %ums", _routerHost.c_str(),
+              (unsigned)_routerPort, reason, _closeDetail ? " code=" : "", _closeDetail, (unsigned)_reconnectDelayMs);
         _connState = ConnState::DISCONNECTED;
     }
+    _closeDetail = 0;
     _session.linkLost();
     // Let the backend see the dead session so it re-stages its declarations
     _autoPubBackend.service(millis());
@@ -442,6 +502,10 @@ void RaftROS::closeConnection(const char* reason)
             _subscriptions[index].state = Subscription::State::PENDING_DECLARE;
         _subscriptions[index].tokenDeclared = false;
     }
+    // ... and our services: key expression, queryable and token all go with it
+    for (auto& slot : _serviceSlots)
+        if (slot.state != ServiceSlot::State::FREE)
+            slot.state = ServiceSlot::State::PENDING_KEYEXPR;
     _lastConnectAttemptMs = millis();
     _reconnectDelayMs = _reconnectDelayMs >= RECONNECT_DELAY_MAX_MS ?
         RECONNECT_DELAY_MAX_MS : _reconnectDelayMs * 2;
@@ -463,7 +527,7 @@ void RaftROS::noteConnectFailure(const char* reason)
          Raft::isTimeout(nowMs, _lastUnreachableLogMs, UNREACHABLE_LOG_INTERVAL_MS)))
     {
         _lastUnreachableLogMs = nowMs;
-        warnRouterUnreachable();
+        _routerWarnLine = 1;            // printed from the next passes, one line each
     }
 }
 
@@ -471,26 +535,43 @@ void RaftROS::noteConnectFailure(const char* reason)
 /// be reached - and what to do about it.  Written for whoever is looking at
 /// the log of a device that has gone quiet in ROS 2: which address, why it
 /// might be wrong, and each way to change it, the rebuild-free one first.
+/// Three lines, one per loop pass: a console write blocks the main loop for
+/// the line's duration at the UART rate (~9 ms per 100 characters), and the
+/// three together measured 53 ms in one pass - over the 50 ms loop contract.
 void RaftROS::warnRouterUnreachable()
 {
-    const bool refused = strcmp(_lastFailureReason, "connect refused") == 0;
-    const uint32_t forSecs = (millis() - _firstFailureMs) / 1000;
-    LOG_W(MODULE_PREFIX,
-          "ROUTER UNREACHABLE: %s:%u - %u attempts over %us, last: %s. %s Nothing reaches ROS 2 until this is fixed.",
-          _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_connectFailures, (unsigned)forSecs,
-          _lastFailureReason,
-          refused ? "The host answers but no router is listening there - start one with: ros2 run rmw_zenoh_cpp rmw_zenohd"
-                  : "The host is not answering - is this the right address for this network?");
-    LOG_W(MODULE_PREFIX,
-          "ROUTER UNREACHABLE: the address is %s.",
-          _routerFromConfig
-              ? "RaftROS.routerHost from SysTypes or posted settings"
-              : "the built-in default (CONFIG_RAFTROS_ZENOH_ROUTER_HOST), which was set for a different network and probably needs changing for this one");
-    LOG_W(MODULE_PREFIX,
-          "ROUTER UNREACHABLE: to change it without a rebuild, from any host on the network: "
-          "curl -X POST http://%s/api/postsettings/reboot -d '{\"RaftROS\":{\"routerHost\":\"<router-ip>\"}}' "
-          "- or set RaftROS.routerHost in SysTypes.json, or CONFIG_RAFTROS_ZENOH_ROUTER_HOST in menuconfig, and rebuild.",
-          inet_ntoa(*(struct in_addr*)&(uint32_t&)_localIpForLog));
+    switch (_routerWarnLine)
+    {
+        case 1:
+        {
+            const bool refused = strcmp(_lastFailureReason, "connect refused") == 0;
+            const uint32_t forSecs = (millis() - _firstFailureMs) / 1000;
+            LOG_W(MODULE_PREFIX,
+                  "ROUTER UNREACHABLE: %s:%u - %u attempts over %us, last: %s. %s Nothing reaches ROS 2 until this is fixed.",
+                  _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_connectFailures, (unsigned)forSecs,
+                  _lastFailureReason,
+                  refused ? "The host answers but no router is listening there - start one with: ros2 run rmw_zenoh_cpp rmw_zenohd"
+                          : "The host is not answering - is this the right address for this network?");
+            break;
+        }
+        case 2:
+            LOG_W(MODULE_PREFIX,
+                  "ROUTER UNREACHABLE: the address is %s.",
+                  _routerFromConfig
+                      ? "RaftROS.routerHost from SysTypes or posted settings"
+                      : "the built-in default (CONFIG_RAFTROS_ZENOH_ROUTER_HOST), which was set for a different network and probably needs changing for this one");
+            break;
+        case 3:
+            LOG_W(MODULE_PREFIX,
+                  "ROUTER UNREACHABLE: to change it without a rebuild, from any host on the network: "
+                  "curl -X POST http://%s/api/postsettings/reboot -d '{\"RaftROS\":{\"routerHost\":\"<router-ip>\"}}' "
+                  "- or set RaftROS.routerHost in SysTypes.json, or CONFIG_RAFTROS_ZENOH_ROUTER_HOST in menuconfig, and rebuild.",
+                  inet_ntoa(*(struct in_addr*)&(uint32_t&)_localIpForLog));
+            break;
+        default:
+            return;
+    }
+    ++_routerWarnLine;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -547,9 +628,18 @@ bool RaftROS::stepInterestReplies(uint32_t nowMs)
         tokenId = ZenohAutoPubBackend::tokenId((uint8_t)interest.cursor);
     }
 
+    else if (interest.cursor < (int16_t)(_autoPubBackend.capacity() + MAX_SERVICES))
+    {
+        const uint8_t svc = (uint8_t)(interest.cursor - _autoPubBackend.capacity());
+        if (_serviceSlots[svc].state == ServiceSlot::State::DECLARED)
+        {
+            key = _serviceSlots[svc].token;
+            tokenId = SERVICE_TOKEN_ID_BASE + svc;
+        }
+    }
     if (key)
         msgLen = ZenohNetworkMessage::declareToken(_msgBuf, sizeof(_msgBuf), tokenId, key, &interest.id);
-    else if (interest.cursor >= (int16_t)_autoPubBackend.capacity())
+    else if (interest.cursor >= (int16_t)(_autoPubBackend.capacity() + MAX_SERVICES))
         msgLen = ZenohNetworkMessage::declareFinal(_msgBuf, sizeof(_msgBuf), &interest.id);
 
     if (msgLen == 0)
@@ -894,6 +984,159 @@ bool RaftROS::onSample(const ZenohNetworkMessage::SampleMessage& sample)
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Services
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+int RaftROS::addService(const char* name, const char* type, ServiceHandler handler)
+{
+    using namespace RaftRuntime::AutoPub;
+    if (!name || !*name || !type)
+        return -1;
+    const AutoPubServiceKind kind = AutoPubServiceCodec_kindForWireType(type);
+    const char* typeHash = AutoPubClassMap_serviceTypeHash(type);
+    if (kind == AutoPubServiceKind::Unknown || !typeHash)
+    {
+        LOG_W(MODULE_PREFIX, "addService '%s': type '%s' is not one this build can serve", name, type);
+        return -1;
+    }
+    // ROS service names are absolute; accept a missing leading slash
+    char rosName[AUTOPUB_SERVICE_NAME_MAX];
+    if (snprintf(rosName, sizeof(rosName), "%s%s", name[0] == '/' ? "" : "/", name) >= (int)sizeof(rosName))
+        return -1;
+
+    const uint8_t slot = _services.add(rosName, kind, std::move(handler));
+    if (slot == decltype(_services)::INVALID_SLOT)
+    {
+        LOG_W(MODULE_PREFIX, "addService '%s': table full or name already served", rosName);
+        return -1;
+    }
+    ServiceSlot& svc = _serviceSlots[slot];
+    svc.typeHash = typeHash;
+    svc.entityId = _nextServiceEntityId++;
+    if (!ZenohROSCodec::formatTopicKey(svc.key, sizeof(svc.key), _domainId, rosName, type, typeHash))
+    {
+        LOG_W(MODULE_PREFIX, "addService '%s' cannot be expressed as a Zenoh key", rosName);
+        _services.remove(slot);
+        return -1;
+    }
+    svc.state = ServiceSlot::State::PENDING_KEYEXPR;
+    LOG_I(MODULE_PREFIX, "serving %s (%s)", rosName, type);
+    return slot;
+}
+
+/// @brief Send the next piece of a service's declaration: its key-expression
+/// id, then the queryable on that id, then the SS token.  One message per pass.
+bool RaftROS::stepServiceDeclarations(uint32_t nowMs)
+{
+    for (uint8_t index = 0; index < MAX_SERVICES; ++index)
+    {
+        ServiceSlot& svc = _serviceSlots[index];
+        size_t msgLen = 0;
+        ServiceSlot::State next = svc.state;
+        switch (svc.state)
+        {
+            case ServiceSlot::State::PENDING_KEYEXPR:
+                msgLen = ZenohNetworkMessage::declareKeyExpr(_msgBuf, sizeof(_msgBuf),
+                                                             SERVICE_KEYEXPR_ID_BASE + index, svc.key);
+                next = ServiceSlot::State::PENDING_QUERYABLE;
+                break;
+            case ServiceSlot::State::PENDING_QUERYABLE:
+                msgLen = ZenohNetworkMessage::declareQueryable(_msgBuf, sizeof(_msgBuf),
+                                                               SERVICE_QUERYABLE_ID_BASE + index,
+                                                               SERVICE_KEYEXPR_ID_BASE + index);
+                next = ServiceSlot::State::PENDING_TOKEN;
+                break;
+            case ServiceSlot::State::PENDING_TOKEN:
+            {
+                const ZenohROSCodec::Endpoint endpoint{svc.entityId, ZenohROSCodec::EndpointKind::Service,
+                    _services.rosName(index), RaftRuntime::AutoPub::AutoPubServiceCodec_wireType(_services.kind(index)),
+                    svc.typeHash, {ZenohROSCodec::Reliability::Reliable, ZenohROSCodec::Durability::Volatile, 10}};
+                if (ZenohROSCodec::formatEndpointToken(svc.token, sizeof(svc.token), nodeIdentity(), endpoint))
+                    msgLen = ZenohNetworkMessage::declareToken(_msgBuf, sizeof(_msgBuf),
+                                                               SERVICE_TOKEN_ID_BASE + index, svc.token);
+                next = ServiceSlot::State::DECLARED;
+                break;
+            }
+            default:
+                continue;
+        }
+        if (msgLen == 0)
+        {
+            LOG_W(MODULE_PREFIX, "service %s: declaration will not build - skipping that step",
+                  _services.rosName(index));
+            svc.state = next;               // do not retry a message that cannot be built
+            continue;
+        }
+        if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
+            return false;
+        svc.state = next;
+        if (next == ServiceSlot::State::DECLARED)
+            LOG_I(MODULE_PREFIX, "service %s announced", _services.rosName(index));
+        return true;
+    }
+    return false;
+}
+
+/// @brief A request arrived (session receive path).  Match its key id to a
+/// service and hand it to the registry; the handler runs later in service().
+bool RaftROS::onRequest(const ZenohNetworkMessage::RequestMessage& request)
+{
+    if (request.keyId >= SERVICE_KEYEXPR_ID_BASE && request.keyId < SERVICE_KEYEXPR_ID_BASE + MAX_SERVICES)
+    {
+        const uint8_t slot = (uint8_t)(request.keyId - SERVICE_KEYEXPR_ID_BASE);
+        if (_serviceSlots[slot].state == ServiceSlot::State::DECLARED ||
+            _serviceSlots[slot].state == ServiceSlot::State::PENDING_TOKEN)
+        {
+            _services.accept(slot, request.requestId,
+                             reinterpret_cast<const uint8_t*>(request.payload.data()), (uint32_t)request.payload.size(),
+                             reinterpret_cast<const uint8_t*>(request.attachment.data()), (uint32_t)request.attachment.size(),
+                             request.timeoutMs, millis());
+            return true;
+        }
+    }
+    // Not ours, or not yet declared: the client times out; the session is fine
+    ++_requestsUnknownKey;
+    return true;
+}
+
+/// @brief Send what the registry has staged: a response (or error) on one
+/// pass, its final on the next
+bool RaftROS::stepServiceReplies(uint32_t nowMs)
+{
+    using RaftRuntime::AutoPub::AutoPubServiceSend;
+    const AutoPubServiceSend send = _services.next();
+    if (send.kind == AutoPubServiceSend::Kind::None)
+        return false;
+    const char* key = _serviceSlots[send.slot].key;
+    size_t msgLen = 0;
+    switch (send.kind)
+    {
+        case AutoPubServiceSend::Kind::Response:
+            msgLen = ZenohNetworkMessage::writeReply(_msgBuf, sizeof(_msgBuf), send.requestId, key,
+                                                     send.payload, send.payloadLen,
+                                                     send.attachment, RaftRuntime::AutoPub::AUTOPUB_SERVICE_ATTACHMENT_SIZE);
+            break;
+        case AutoPubServiceSend::Kind::Error:
+            msgLen = ZenohNetworkMessage::writeReplyError(_msgBuf, sizeof(_msgBuf), send.requestId, key, send.reason);
+            break;
+        case AutoPubServiceSend::Kind::Final:
+            msgLen = ZenohNetworkMessage::writeResponseFinal(_msgBuf, sizeof(_msgBuf), send.requestId);
+            break;
+        default:
+            return false;
+    }
+    if (msgLen == 0)
+    {
+        _services.sent();                   // cannot build it; move on rather than wedge
+        return false;
+    }
+    if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
+        return false;
+    _services.sent();
+    return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // API / status
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -918,13 +1161,16 @@ String RaftROS::getStatusJSON() const
         case ConnState::READY:        stStr = "ready"; break;
     }
     const auto stats = _autoPubBackend.stats();
-    char buf[540];
+    const auto svcStats = _services.stats();
+    char buf[700];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
              R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u,)"
              R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d,)"
-             R"("heapFreeB":%u,"heapMinB":%u})",
+             R"("heapFreeB":%u,"heapMinB":%u,"loopMaxUs":%u,"loopMaxDrainUs":%u,"loopMaxConnUs":%u,"loopMaxRxUs":%u,"loopMaxTxUs":%u,"loopMaxTxParts":"%u/%u/%u",)"
+             R"("services":%u,"svcAccepted":%u,"svcCompleted":%u,"svcDeferred":%u,"svcTimedOut":%u,)"
+             R"("svcRefused":%u,"svcUnknownKey":%u})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -950,7 +1196,15 @@ String RaftROS::getStatusJSON() const
              _lastSessionMs ? (int)((millis() - _lastSessionMs) / 1000) : -1,
              // System heap, not this module's: the figures a long soak reads
              (unsigned)esp_get_free_heap_size(),
-             (unsigned)esp_get_minimum_free_heap_size());
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)_loopPassMaxUs, (unsigned)_loopDrainMaxUs, (unsigned)_loopConnMaxUs,
+             (unsigned)_loopRxMaxUs, (unsigned)_loopTxMaxUs,
+             (unsigned)_loopTxMaxSessionUs, (unsigned)_loopTxMaxStepUs, (unsigned)_loopTxMaxFlushUs,
+             (unsigned)_services.inUseCount(),
+             (unsigned)svcStats.accepted, (unsigned)svcStats.completed,
+             (unsigned)svcStats.deferred, (unsigned)svcStats.timedOut,
+             (unsigned)(svcStats.refusedBusy + svcStats.refusedBad + svcStats.refusedByHandler),
+             (unsigned)_requestsUnknownKey);
     return buf;
 }
 

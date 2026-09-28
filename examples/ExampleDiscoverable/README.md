@@ -133,6 +133,42 @@ The application code is the same either way: `MainSysMod` calls
 arguments on both builds, so nothing in the example is conditional on the
 transport.
 
+### Services
+
+The Zenoh build also serves two ROS 2 services (the RTPS build compiles the
+same application code; its `addService` logs a warning and returns -1):
+
+```bash
+ros2 service list -t                         # expect both, with their types
+ros2 service call /raft_esp32/devices std_srvs/srv/Trigger
+#   success=True, message='1 device(s) attached, chatter on, chatter_in rx 0/0, heap free 173356 B'
+ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: false}"
+ros2 topic echo --once /chatter              # nothing arrives until ...
+ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: true}"
+```
+
+A handler runs on the main loop and answers from state it already holds
+(`MainSysMod.cpp`):
+
+```cpp
+pRaftROS->addService("/raft_esp32/chatter_enable", "std_srvs::srv::dds_::SetBool_",
+    [pRaftROS](const RaftROS::ServiceRequest& request, RaftROS::ServiceReply& reply)
+    {
+        pRaftROS->setChatterEnabled(request.fields.data);
+        reply.fields.success = true;
+        reply.fields.message = request.fields.data ? "chatter on" : "chatter off";
+        return RaftROS::ServiceOutcome::Replied;
+    });
+```
+
+A handler that needs a bus transaction returns `Deferred` and calls
+`completeService(token, reply)` from a later loop pass; the request is
+answered with an error at the client's timeout if that never happens. The
+types this build can serve are `std_srvs` `Trigger`, `SetBool` and `Empty`;
+up to four services, four requests in flight. `GET /api/rosstat` counts
+`svcAccepted`, `svcCompleted`, `svcDeferred`, `svcTimedOut`, `svcRefused` and
+`svcUnknownKey`.
+
 With no router to hand, `tools/` has two stand-ins that need no ROS install:
 
 ```bash
@@ -169,7 +205,8 @@ from any host with `curl` once a minute:
 ```json
 {"backend":"zenoh","conn":"ready","sessions":1,"devices":1,"pubs":2,"samples":204,"subs":2,
  "rxDropped":0,"routerSource":"default","routerReachable":true,"connectFails":0,"lastSessionAgoS":41,
- "stackFreeB":5480,"heapFreeB":177012,"heapMinB":168400}
+ "stackFreeB":5480,"heapFreeB":177012,"heapMinB":168400,"loopMaxUs":2357,
+ "services":2,"svcAccepted":56,"svcCompleted":56,"svcDeferred":0,"svcTimedOut":0,"svcRefused":0,"svcUnknownKey":0}
 ```
 
 ### Logging
@@ -183,6 +220,14 @@ tokens, per-peer announce traffic, the 5 s health line), and
 `AutoPub/AutoPubDeviceSource.hpp` (every DeviceManager callback; a per-100-
 samples counter line per device). Console writes block the main loop, so leave
 them off for a demo; the counters are all on `GET /api/rosstat`.
+
+On a board whose console is USB-Serial-JTAG (the ProS3, the Feather), a log
+line costs about 10 ms of main-loop time whenever no host is reading the
+port, whatever its length - and under 1 ms when a terminal is attached. So
+the SysMod never writes more than one line in a loop pass, and the loop
+figures on `rosstat` (`loopMaxUs` and the per-phase `loopMaxDrainUs`,
+`loopMaxConnUs`, `loopMaxRxUs`, `loopMaxTxUs`) should be read with no
+terminal open: that is the number an unattended device sees.
 
 ## Configuration
 

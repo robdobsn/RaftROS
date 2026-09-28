@@ -236,12 +236,20 @@ private:
         return false;
     }
 
+    /// @brief "pkg::msg::dds_::Type_" for a topic, "pkg::srv::dds_::Type_" for a service
     static bool isMessageType(std::string_view name)
     {
-        constexpr std::string_view separator = "::msg::dds_::";
         if (name.size() > MAX_TYPE_NAME_SIZE)
             return false;
-        const size_t split = name.find(separator);
+        constexpr std::string_view msgSeparator = "::msg::dds_::";
+        constexpr std::string_view srvSeparator = "::srv::dds_::";
+        std::string_view separator = msgSeparator;
+        size_t split = name.find(separator);
+        if (split == std::string_view::npos)
+        {
+            separator = srvSeparator;
+            split = name.find(separator);
+        }
         if (split == std::string_view::npos || !isIdentifier(name.substr(0, split)))
             return false;
         const auto message = name.substr(split + separator.size());

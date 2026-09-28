@@ -33,6 +33,8 @@
 #include "RaftSysMod.h"
 #include "AutoPub/AutoPubDeviceSource.h"
 #include "AutoPub/AutoPubStringMessage.h"
+#include "AutoPub/AutoPubServiceRegistry.h"
+#include "esp_timer.h"
 #include "ZenohAutoPubBackend.h"
 #include "ZenohInterestMatch.h"
 #include "ZenohROSCodec.h"
@@ -83,6 +85,34 @@ public:
         _defaultHandler = std::move(handler);
     }
 
+    // ---- Services (server side) ----
+    // A handler runs on the loop task and must not block: it answers from
+    // state it already holds (Replied), hands the request back to be completed
+    // later (Deferred), or refuses it (Refused).  See AutoPubServiceRegistry.
+    using ServiceHandler = RaftRuntime::AutoPub::AutoPubServiceHandler;
+    using ServiceRequest = RaftRuntime::AutoPub::AutoPubServiceRequest;
+    using ServiceReply = RaftRuntime::AutoPub::AutoPubServiceReply;
+    using ServiceOutcome = RaftRuntime::AutoPub::AutoPubServiceOutcome;
+
+    /// @brief Serve a ROS 2 service.
+    /// @param name ROS service name, e.g. "/raft_esp32/devices"
+    /// @param type wire type name, e.g. "std_srvs::srv::dds_::Trigger_"
+    ///        (only the std_srvs types are known: Trigger, SetBool, Empty)
+    /// @return slot, or -1 if the table is full or the type is unknown
+    int addService(const char* name, const char* type, ServiceHandler handler);
+
+    /// @brief Complete a request a handler deferred (loop task only)
+    bool completeService(uint32_t token, const ServiceReply& reply)
+    {
+        return _services.complete(token, reply);
+    }
+
+    /// @brief Turn the 1 Hz /chatter publisher on or off at run time (the
+    /// publisher stays declared; only the sends stop)
+    void setChatterEnabled(bool enabled) { _chatterEnabled = enabled; }
+    bool isChatterEnabled() const { return _chatterEnabled; }
+    uint8_t attachedDeviceCount() const { return _autoPubSource.attachedCount(); }
+
     /// @brief SysMod factory, registered by the application as "RaftROS"
     static RaftSysMod* create(const char* pModuleName, RaftJsonIF& sysConfig)
     {
@@ -125,6 +155,8 @@ private:
     static const uint32_t UNREACHABLE_LOG_INTERVAL_MS = 30000;
     void noteConnectFailure(const char* reason);
     void warnRouterUnreachable();
+    int _closeDetail = 0;               ///< errno / session error for the next "disconnected" line
+    uint8_t _routerWarnLine = 0;        ///< Next line of the unreachable warning to print (1..3), 0/4 = none
     uint32_t _lastConnectAttemptMs = 0;
     uint32_t _connectStartedMs = 0;
     uint32_t _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
@@ -206,6 +238,59 @@ private:
     static const uint8_t MAX_REMOTE_KEY_IDS = 8;
     RemoteKeyId _remoteKeyIds[MAX_REMOTE_KEY_IDS];
     uint8_t _remoteKeyIdCount = 0;
+
+    /// @brief One served service, as the transport sees it: a key expression
+    /// we give an id (the router addresses requests by that id), a queryable
+    /// on it, and an SS liveliness token so the graph shows the server.  All
+    /// three are staged and sent one per pass like every other declaration.
+    struct ServiceSlot
+    {
+        enum class State : uint8_t { FREE, PENDING_KEYEXPR, PENDING_QUERYABLE, PENDING_TOKEN, DECLARED };
+        State state = State::FREE;
+        char key[RaftRuntime::Zenoh::ZENOH_AUTOPUB_KEY_MAX] = {};
+        char token[RaftRuntime::Zenoh::ZENOH_AUTOPUB_TOKEN_MAX] = {};
+        const char* typeHash = nullptr;
+        uint64_t entityId = 0;
+    };
+    static const uint8_t MAX_SERVICES = 4;
+    /// @brief Id spaces kept clear of the publisher (2..), subscriber (100..)
+    /// and subscription-token (200..) ids
+    static const uint32_t SERVICE_KEYEXPR_ID_BASE = 300;
+    static const uint32_t SERVICE_QUERYABLE_ID_BASE = 400;
+    static const uint32_t SERVICE_TOKEN_ID_BASE = 500;
+    static const uint8_t SERVICE_DISPATCH_BUDGET = 2;    ///< Handlers run per loop pass
+    ServiceSlot _serviceSlots[MAX_SERVICES];
+    RaftRuntime::AutoPub::AutoPubServiceRegistry<MAX_SERVICES, 4, 256> _services;
+    uint64_t _nextServiceEntityId = 2000;
+    uint32_t _requestsUnknownKey = 0;    ///< Requests for a key no service holds
+
+    bool stepServiceDeclarations(uint32_t nowMs);
+    bool stepServiceReplies(uint32_t nowMs);
+    bool onRequest(const RaftRuntime::Zenoh::ZenohNetworkMessage::RequestMessage& request);
+    static bool onRequestThunk(void* context,
+                               const RaftRuntime::Zenoh::ZenohNetworkMessage::RequestMessage& request)
+    {
+        return static_cast<RaftROS*>(context)->onRequest(request);
+    }
+
+    // Loop-budget diagnostics, as on the RTPS build: the worst pass since boot
+    // and the worst of each phase within a pass, so a slow pass can be placed
+    uint32_t _loopPassMaxUs = 0;
+    uint32_t _loopDrainMaxUs = 0;       ///< device sample drain
+    uint32_t _loopConnMaxUs = 0;        ///< socket create / connect poll
+    uint32_t _loopRxMaxUs = 0;          ///< recv and message parsing
+    uint32_t _loopTxMaxUs = 0;          ///< declarations, replies, samples, flush
+    uint32_t _loopTxMaxSessionUs = 0, _loopTxMaxStepUs = 0, _loopTxMaxFlushUs = 0;   ///< its parts
+    static void noteMax(uint32_t& maxUs, int64_t startUs)
+    {
+        const uint32_t elapsed = (uint32_t)(esp_timer_get_time() - startUs);
+        if (elapsed > maxUs)
+            maxUs = elapsed;
+    }
+    /// @brief A socket call is expected to return at once; one that does not
+    /// is worth a line, because it is charged to the loop budget
+    static const uint32_t SLOW_CALL_WARN_US = 5000;
+    static void warnIfSlow(const char* what, int64_t startUs);
 
     /// @brief One router interest still being answered.  A reply is a run of
     /// token declarations followed by a final, all tagged with the interest id,

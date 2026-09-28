@@ -226,6 +226,55 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### Services on the Board; the Console Is the Loop's Worst Case (2026-09-28)
+
+Services S3 and S4 of the [implementation plan](RaftROS-services-implementation-plan.md)
+went onto the ProS3 in one flash. A service is three staged declarations on
+the session - a key-expression id (`300+slot`, so the router's requests name
+it by id), a queryable on that id (`400+slot`) and the `SS` liveliness token
+(`500+slot`) - sent one per pass through the same priority chain as
+subscriptions, and re-staged with them when a session closes. Requests come
+in through the session's `onRequest` callback, are matched to a slot by key id
+and handed to `AutoPubServiceRegistry`; handlers run under a two-per-pass
+budget, and the reply and its `RESPONSE_FINAL` go out on consecutive passes
+ahead of interest replies and samples. The example serves
+`/raft_esp32/devices` (Trigger) and `/raft_esp32/chatter_enable` (SetBool);
+the RTPS build compiles the same application code with an `addService` that
+warns and returns -1.
+
+Against `rmw_zenohd` 0.2.10: `ros2 service list -t` and `ros2 node info`
+show both services with their types; 50 `Trigger` calls in a loop all
+returned `success=True` (0.31 s per call, the `ros2` CLI's own start-up);
+`rosstat` counted 56 accepted / 56 completed and nothing refused or
+unknown; `chatter_enable false` silenced `/chatter` and `true` restored it;
+a router restart re-declared both within 5 s and a call succeeded on session
+2. The loop's worst pass did not move during any of it. The codec's wire-type
+check had to admit `::srv::` names; the codec suite now pins a service key.
+Image +5.2 kB.
+
+What did move `loopMaxUs` was found by adding per-phase maxima to `rosstat`
+(`loopMaxDrainUs`, `loopMaxConnUs`, `loopMaxRxUs`, `loopMaxTxUs` and the
+send phase's parts): **53 ms** in one pass with the router down, and 22 ms at
+session open - both entirely console output. On this board the console is
+USB-Serial-JTAG, and with no host reading the port each log line stalls the
+writer for **~10.5 ms whatever its length** (1 line 10.9-11.3 ms, 2 lines
+20.8, 3 lines 31-32.5, 5 lines 53); with `raft monitor` attached the same
+passes take under 3 ms, which is why every earlier loop figure was clean.
+Every earlier maximum was read with a terminal open. The fix is a rule, not a
+driver change: **one log line per loop pass.** The three-line
+`ROUTER UNREACHABLE` diagnosis is now staged one line per pass from the
+passes after the failed attempt; "connect refused" and its errno ride on the
+single "disconnected" line; "reachable again" rides on the "session
+established" line, and the node token declaration waits one pass after it.
+Socket calls themselves (`socket`, `connect`, `select`, `send`, `close`) each
+carry a 5 ms warning and none has fired. With the rule applied and no terminal
+attached: worst connect-phase pass 11.8 ms with the router down (was 53),
+worst send-phase pass 12.4 ms at session open (was 22-31), of which 11.3 ms
+is the one log line. One 35 ms pass remains, in the sample-drain phase, once
+per boot in the first seconds and never again; CommsMan stalls 11 ms in the
+same window, so it is a whole-system stall (a flash sector erase freezes
+every task) rather than anything on the drain path. Not chased further.
+
 ### Twelve-Hour Soak: No Leak, One Session (2026-09-28)
 
 `/api/rosstat` sampled once a minute from the ROS host for 12 h, Zenoh build

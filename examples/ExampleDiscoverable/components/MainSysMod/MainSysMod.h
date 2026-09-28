@@ -42,4 +42,8 @@ private:
 
     // Separate receive counter for the second subscription (rt/chatter_in2).
     uint32_t _rxCount2 = 0;
+
+    // Reply text for the /raft_esp32/devices service; encoded before the
+    // handler returns, so one buffer serves every call
+    char _serviceMsg[160] = {};
 };

@@ -34,6 +34,7 @@
 #include "runtime/autopub/RTPSAutoPubQoSProfile.h"
 #include "AutoPub/AutoPubPublisherPool.h"
 #include "AutoPub/AutoPubDeviceSource.h"
+#include "AutoPub/AutoPubServiceRegistry.h"
 #include "RaftThreading.h"
 #include "RaftDeviceConsts.h"
 #include "DeviceTypeRecord.h"
@@ -92,6 +93,23 @@ public:
     // subsequent user-data DATA on that writer is routed to the slot's `handler`.
     // Messages arriving before the SEDP pub has been parsed fall through to the legacy
     // `_stringMessageHandler` so single-subscription applications keep working.
+    // ---- Services ----
+    // Not available on the RTPS backend yet (services plan, S6): the calls
+    // exist so an application compiles against either transport.
+    using ServiceHandler = RaftRuntime::AutoPub::AutoPubServiceHandler;
+    using ServiceRequest = RaftRuntime::AutoPub::AutoPubServiceRequest;
+    using ServiceReply = RaftRuntime::AutoPub::AutoPubServiceReply;
+    using ServiceOutcome = RaftRuntime::AutoPub::AutoPubServiceOutcome;
+    int addService(const char* name, const char* /*type*/, ServiceHandler /*handler*/)
+    {
+        LOG_W(MODULE_PREFIX, "addService '%s': services are not served by the RTPS backend", name ? name : "");
+        return -1;
+    }
+    bool completeService(uint32_t /*token*/, const ServiceReply& /*reply*/) { return false; }
+    void setChatterEnabled(bool enabled) { _chatterEnabled = enabled; }
+    bool isChatterEnabled() const { return _chatterEnabled; }
+    uint8_t attachedDeviceCount() const { return _autoPubSource.attachedCount(); }
+
     int addStringSubscription(const char* topic, const char* type, StringMessageHandler handler = {})
     {
         // Check for an existing registry entry with this topic (e.g. the slot-0 entry
@@ -211,6 +229,7 @@ private:
     uint64_t _chatterSeqNum = 0;       // increments each publish
     uint64_t _chatterSedpSeqNum = 2;   // seq 2 on SEDP pubs writer = chatter publication
     uint32_t _lastChatterSendMs = 0;
+    bool _chatterEnabled = true;
     static const uint32_t CHATTER_PUBLISH_INTERVAL_MS = 1000;
     uint32_t _chatterMsgIndex = 0;     // counter for message content
 
