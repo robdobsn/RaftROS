@@ -866,8 +866,50 @@ int main()
         TEST_ASSERT(f == 2 && buffer[0] == 0x1a && buffer[1] == 9, "the final is RESPONSE_FINAL with the request id");
         const size_t e = Message::writeReplyError(buffer, sizeof(buffer), 9, "0/raft/svc/t/h", "no such service");
         TEST_ASSERT(e > 0 && buffer[0] == 0x7b, "a refusal is a RESPONSE carrying ERR");
+        {
+            // After header, rid, keyexpr id 0 and the key comes the ERR body:
+            // 0x45 = ERR | E (encoding present), encoding 0, then the reason as
+            // a length-prefixed payload.  A router reads an ERR without E as an
+            // empty payload followed by garbage and closes the session.
+            const size_t keyLen = std::strlen("0/raft/svc/t/h");
+            const size_t bodyAt = 1 + 1 + 1 + 1 + keyLen;
+            TEST_ASSERT(buffer[bodyAt] == 0x45 && buffer[bodyAt + 1] == 0 &&
+                        buffer[bodyAt + 2] == std::strlen("no such service") &&
+                        std::memcmp(buffer + bodyAt + 3, "no such service", std::strlen("no such service")) == 0 &&
+                        e == bodyAt + 3 + std::strlen("no such service"),
+                        "ERR carries its encoding flag and the reason as the payload");
+        }
         TEST_ASSERT(Message::writeReply(buffer, sizeof(buffer), 9, "", cdr, sizeof(cdr), nullptr, 0) == 0,
                     "a reply with no key is refused");
+    }
+
+    std::printf("Test: oversized payloads are stepped over, not fatal\n");
+    {
+        using Message = RaftRuntime::Zenoh::ZenohNetworkMessage;
+        // A REQUEST whose QUERY body extension carries a 3000-byte payload:
+        // 0x1c rid=9 keyId=300 | QUERY 0x83 (Z) | ext 0x43 (ZBuf id 3) len | encoding 0 | bytes
+        std::vector<uint8_t> msg = {0x1c, 9, 0xac, 0x02, 0x83, 0x43};
+        const uint32_t bodyLen = 1 + 3000;
+        msg.push_back((uint8_t)(bodyLen & 0x7f) | 0x80); msg.push_back((uint8_t)(bodyLen >> 7));
+        msg.push_back(0);
+        msg.insert(msg.end(), 3000, 0x5a);
+        Message::RequestMessage request;
+        const size_t consumed = Message::readRequest(msg.data(), msg.size(), request);
+        TEST_ASSERT(consumed == msg.size() && request.oversized && request.payload.empty() &&
+                    request.requestId == 9 && request.keyId == 300,
+                    "an oversized request is consumed whole and flagged, with no payload");
+        std::vector<uint8_t> shortMsg(msg.begin(), msg.end() - 10);
+        TEST_ASSERT(Message::readRequest(shortMsg.data(), shortMsg.size(), request) == 0,
+                    "a payload longer than the batch is still a malformed message");
+
+        // A PUT whose payload is 3000 bytes: 0x1d keyId=7 | PUT 0x01 | len | bytes
+        std::vector<uint8_t> put = {0x1d, 7, 0x01};
+        put.push_back((uint8_t)(3000 & 0x7f) | 0x80); put.push_back((uint8_t)(3000 >> 7));
+        put.insert(put.end(), 3000, 0x5a);
+        Message::SampleMessage sample;
+        const size_t putConsumed = Message::readSample(put.data(), put.size(), sample);
+        TEST_ASSERT(putConsumed == put.size() && sample.oversized && sample.payload.empty() && sample.keyId == 7,
+                    "an oversized sample is consumed whole and flagged");
     }
 
     std::printf("Test: requests reach the session's handler\n");

@@ -271,6 +271,20 @@ backed by the SysMod's config with `postsettings`-style persistence, so
 | Oversized / undecodable request | refused, not crashed | `ERR` reply; session stays up |
 | Flash and RAM | within budget | image delta and `heapMinB` recorded in the results doc |
 
+**Status 2026-09-28** - every row shown on the ProS3 against `rmw_zenohd`:
+graph and `node info` (S3); `Trigger`, `SetBool` and `Empty`
+(`/raft_esp32/ping`) all answered from `ros2 service call`; two concurrent
+`ros2` clients on `/raft_esp32/devices` each received their reply (both
+accepted and completed, none refused); S5's `/raft_esp32/range` for the
+non-blocking handler; 50-call loop with the loop maxima unchanged; router
+restart re-declared and a call succeeded; raw zenoh-python queries at the
+Trigger key - empty payload `ERR 'bad request'`, 900 B answered, 3000 B
+`ERR 'bad request'` - and a 3000-character string published to `/chatter_in`
+(dropped, `rxDropped` 1) all with the session still up. The two defects the
+last row found (the `ERR` encoding flag, oversized payloads failing the
+batch) are in the results document. Image 1268 kB (28% of the slot free).
+Still to run: a deferred call with the sensor unplugged (needs hands).
+
 ## 6. Risks and What Retires Them
 
 - *Wire layout guessed wrong* (the `Put` lesson): retired by S0's capture-first

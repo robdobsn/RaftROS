@@ -244,6 +244,7 @@ public:
         uint32_t timeoutMs = 0;         ///< 0 when the client sent none
         std::string_view payload;
         std::string_view attachment;
+        bool oversized = false;         ///< A payload over MAX_PAYLOAD_SIZE was skipped (payload empty)
     };
 
     /// @brief Parse one REQUEST from a peer.  Everything the device does not
@@ -314,6 +315,7 @@ public:
             }
             message.payload = bodyExt.substr(value.position());
         }
+        message.oversized = reader.oversized;
         output = message;
         return reader.position();
     }
@@ -360,8 +362,12 @@ public:
         writer.integer(requestId);
         writer.byte(0);
         writer.string(key);
-        writer.byte(0x05);                  // ERR, no extensions
-        writer.integer(0);                  // encoding: default
+        // ERR with the E flag: the encoding is present (zenoh/bytes), then
+        // the reason as the payload.  Without E the varint is read as an empty
+        // payload and the reason bytes as the next message - the router then
+        // drops the whole session as malformed (found 2026-09-28).
+        writer.byte(0x45);
+        writer.integer(0);
         writer.string(reason);
         return writer.size();
     }
@@ -387,6 +393,7 @@ public:
         std::string_view key;           ///< Full key, or the suffix after `keyId`
         std::string_view payload;
         std::string_view attachment;    ///< Empty when the sample carried none
+        bool oversized = false;         ///< A payload over MAX_PAYLOAD_SIZE was skipped (payload empty)
     };
 
     /// @brief Parse one Put from a peer
@@ -455,12 +462,19 @@ public:
         if (!reader.sampleExtensions((body & 0x80) != 0, message.attachment))
             return 0;
         uint32_t payloadSize = 0;
-        if (!reader.number(payloadSize) || payloadSize > MAX_PAYLOAD_SIZE)
+        if (!reader.number(payloadSize))
             return 0;
         const uint8_t* payloadStart = nullptr;
         if (!reader.bytes(payloadSize, payloadStart))
             return 0;
-        message.payload = std::string_view(reinterpret_cast<const char*>(payloadStart), payloadSize);
+        // A payload we will not hold is stepped over, not treated as a broken
+        // batch: the message is well formed, it is just more than this device
+        // takes.  The session goes on; the caller sees an empty, flagged sample.
+        if (payloadSize > MAX_PAYLOAD_SIZE)
+            message.oversized = true;
+        else
+            message.payload = std::string_view(reinterpret_cast<const char*>(payloadStart), payloadSize);
+        message.oversized = message.oversized || reader.oversized;
         output = message;
         return reader.position();
     }
@@ -470,6 +484,7 @@ private:
     {
     public:
         Cursor(const uint8_t* input, size_t length) : _input(input), _length(input ? length : 0) {}
+        bool oversized = false;         ///< An extension buffer over MAX_PAYLOAD_SIZE was stepped over
         bool byte(uint8_t& value)
         {
             if (_offset >= _length)
@@ -613,14 +628,19 @@ private:
                     *intValue = value;
                 if ((header & 0x60) == 0x40)
                 {
-                    if (value > _length - _offset || value > MAX_PAYLOAD_SIZE)
+                    if (value > _length - _offset)
                         return false;
-                    const std::string_view view(reinterpret_cast<const char*>(_input + _offset),
-                                                static_cast<size_t>(value));
-                    if (id == 3)
-                        bufId3 = view;
-                    else if (id == 5)
-                        bufId5 = view;
+                    if (value > MAX_PAYLOAD_SIZE)
+                        oversized = true;       // well formed, too big for us: step over it
+                    else
+                    {
+                        const std::string_view view(reinterpret_cast<const char*>(_input + _offset),
+                                                    static_cast<size_t>(value));
+                        if (id == 3)
+                            bufId3 = view;
+                        else if (id == 5)
+                            bufId5 = view;
+                    }
                     _offset += static_cast<size_t>(value);
                 }
                 more = (header & 0x80) != 0;

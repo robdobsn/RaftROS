@@ -967,6 +967,13 @@ bool RaftROS::onSample(const ZenohNetworkMessage::SampleMessage& sample)
         ++_samplesDropped;
         return true;
     }
+    if (sample.oversized)
+    {
+        // Well formed but more than this device holds: dropped, counted, and
+        // the session goes on
+        ++_samplesDropped;
+        return true;
+    }
     Subscription& subscription = const_cast<Subscription&>(*pSubscription);
     ++subscription.received;
 

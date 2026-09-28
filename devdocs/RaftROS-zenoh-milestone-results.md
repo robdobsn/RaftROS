@@ -105,6 +105,17 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
 - A real router's `Put` carries timestamp and encoding fields before its
   extensions, in three encodings; misreading them cost the session on every
   sample. The captured bytes are now a test.
+- (Services, 2026-09-28) The `ERR` reply was written without its `E` flag, so
+  the router read our encoding varint as an empty payload and the reason
+  bytes as the next message - and dropped the whole session as malformed.
+  Every refusal (busy, bad request, timeout) killed the session; the host
+  test had only checked the first byte. Found by a raw empty query from
+  zenoh-python; the body is now pinned byte for byte.
+- (Same day) A request or sample with a payload over the 2 kB cap failed the
+  batch, and with it the session - a 3 kB string published to `/chatter_in`
+  was enough. The parser now steps over an oversized payload and flags the
+  message; the SysMod drops the sample (counted in `rxDropped`) or answers
+  the request `ERR bad request`, and the session goes on.
 - A publish with a stale clock made the session's lease check wrap; the backend
   now takes the time every pass and the session compares rather than subtracts.
 - The liveliness writer sent sequence number 0 on the initial announce (invalid
