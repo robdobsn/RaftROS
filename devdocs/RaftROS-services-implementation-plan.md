@@ -187,6 +187,18 @@ service with the right type; `ros2 node info /raft_esp32` lists it under
 returns `success: True` with the message; a loop of 50 calls in a script
 completes with the loop's worst pass under 5 ms and the average unchanged;
 `loopBudget` warnings zero; reconnect re-declares the queryable.
+**Met 2026-09-28** on the ProS3 against `rmw_zenohd` 0.2.10: `ros2 service
+list -t` shows both services with their types and `ros2 node info` lists them
+under *Service Servers*; every call in a 50-call `Trigger` loop returned
+`success=True` (0.31 s per call, all of it `ros2` CLI start-up); `rosstat`
+counted 56 accepted / 56 completed / 0 refused / 0 unknown-key; the loop's
+worst pass (`loopMaxUs`) did not move during the calls. A router restart
+brought both services back within 5 s on session 2 and a call succeeded.
+Service ids live in their own ranges (key-expression 300+, queryable 400+,
+token 500+); the SS token is the third of three staged messages per service.
+A service's `::srv::` wire type needed the codec's type check widened.
+Image +5.2 kB over S2. Building the RTPS variant confirmed the example
+compiles on both transports (its `addService` warns and returns -1).
 
 **S4 - Example services.** In the example: `/raft_esp32/devices`
 (`Trigger` -> JSON list of attached devices from DeviceManager, answered
@@ -196,6 +208,11 @@ section with the exact commands; the release-pass logging rules apply
 (one line per service declared, warnings unconditional).
 *Gate:* both demonstrated from the ROS host with the standard tools; the
 milestone results document gains a *Services* row.
+**Met 2026-09-28**, folded into the S3 flash: `/raft_esp32/devices` answers
+"1 device(s) attached, chatter on, chatter_in rx 0/0, heap free 173356 B";
+`/raft_esp32/chatter_enable false` stops `/chatter` (an `echo --once` gets
+nothing in 4 s) and `true` restarts it (next message within 8 s). README has
+the commands and the handler; results document has the row.
 
 **S5 - Deferred replies on hardware.** One service whose handler must go to a
 bus - e.g. `Trigger` reading the VL6180 on demand - implemented through the

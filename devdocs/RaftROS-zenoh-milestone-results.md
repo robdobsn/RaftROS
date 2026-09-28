@@ -24,6 +24,7 @@ carried before 2026-09-26.
 | QoS profiles, including subscriptions, from `qosProfiles` | yes | yes | `ros2 topic info -v` shows the profile |
 | Device hot-plug (withdraw, fresh endpoint on return) | not re-tested | yes | graph watcher + `rosstat` |
 | Reconnect after router/session loss | n/a | yes | tokens re-declared, sequence continues |
+| Services (server side; `std_srvs` Trigger, SetBool, Empty) | no (planned) | yes (2026-09-28) | `ros2 service list -t`, `ros2 service call`; 50/50 calls answered, worst loop pass unchanged; re-declared within 5 s of a router restart |
 
 The application code is identical for both: the transport is a build-time
 choice (`CONFIG_RAFTROS_BACKEND_ZENOH`, the default, or `..._RTPS`), and the
@@ -38,6 +39,7 @@ The Raft contract for a SysMod is 10 ms average / 50 ms worst case per pass.
 | Worst RaftROS pass | 82 ms (breach) | 14 ms | 2.4 ms |
 | Worst whole-loop pass | 54 ms | 17 ms | 3.0 ms |
 | Whole-loop average | 3.0-5.3 ms | 2.8-4.3 ms | **0.60 ms** |
+| Worst pass, no terminal attached (2026-09-28) | not measured | not measured | 12.4 ms at session open, 11.8 ms with the router down - one console line each (~10.5 ms per line on an unread USB-Serial-JTAG port; 53 ms before the one-line-per-pass rule) |
 | Samples delivered | 4.8 Hz | 4.8 Hz | 4.2 Hz range + 1 Hz chatter, none lost |
 
 Two numbers underneath these matter more than the table:
@@ -116,8 +118,9 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
 
 ## Not done in this milestone
 
-- Services and parameters - see
-  [RaftROS-services-assessment.md](RaftROS-services-assessment.md).
+- Services were added after the milestone (2026-09-28, Zenoh only, server
+  side) - see [RaftROS-services-implementation-plan.md](RaftROS-services-implementation-plan.md).
+  Parameters and RTPS services remain open there.
 - Runtime transport switching (deferred by design; one backend per image).
 - Hot-plug was re-verified on Zenoh only; RTPS hot-plug was verified in an
   earlier phase and not repeated after the shared pipeline extraction.

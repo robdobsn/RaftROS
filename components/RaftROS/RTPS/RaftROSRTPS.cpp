@@ -351,7 +351,8 @@ void RaftROS::loop()
         if (_connState == ConnState::ACTIVE &&
             RTPSRuntimeSchedule_isPeriodicDue(now, _lastChatterSendMs, CHATTER_PUBLISH_INTERVAL_MS, true))
         {
-            publishChatter();
+            if (_chatterEnabled)
+                publishChatter();
             _lastChatterSendMs = now;
         }
         markPhase(pass.chatterUs);
