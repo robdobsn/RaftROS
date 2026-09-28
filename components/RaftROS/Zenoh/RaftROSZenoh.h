@@ -281,6 +281,7 @@ private:
     uint32_t _loopRxMaxUs = 0;          ///< recv and message parsing
     uint32_t _loopTxMaxUs = 0;          ///< declarations, replies, samples, flush
     uint32_t _loopTxMaxSessionUs = 0, _loopTxMaxStepUs = 0, _loopTxMaxFlushUs = 0;   ///< its parts
+    uint32_t _loopRxPartsMaxUs = 0, _loopRxMaxRecvUs = 0, _loopRxMaxParseUs = 0, _loopRxMaxBytes = 0;
     static void noteMax(uint32_t& maxUs, int64_t startUs)
     {
         const uint32_t elapsed = (uint32_t)(esp_timer_get_time() - startUs);

@@ -275,6 +275,19 @@ per boot in the first seconds and never again; CommsMan stalls 11 ms in the
 same window, so it is a whole-system stall (a flash sector erase freezes
 every task) rather than anything on the drain path. Not chased further.
 
+**S5, deferred replies (same day).** `/raft_esp32/range` proves a handler
+that needs the bus never blocks the loop: it parks the request and returns
+`Deferred`; a data callback on the bus task counts VL6180 poll results; the
+loop completes the request from the first result after the call, decoded
+with `getLatestDecodedPollResponse` (the `poll_VL6180` struct from the
+generated device records). 41 calls answered with readings 39-100 ms after
+the call - the sensor's ~4 Hz poll, not a cache; a concurrent second call is
+refused and rmw_zenoh reports the `ERR` reply (`z_reply_is_ok returned
+False`). A receive-side breakdown on `rosstat` (`loopMaxRxParts`:
+recv/parse/bytes) put the request path at 0.6 + 0.4 ms for 64 bytes; the
+remaining ~12 ms receive-phase maximum is the one "disconnected" line a
+closed socket logs, not parsing.
+
 ### Twelve-Hour Soak: No Leak, One Session (2026-09-28)
 
 `/api/rosstat` sampled once a minute from the ROS host for 12 h, Zenoh build

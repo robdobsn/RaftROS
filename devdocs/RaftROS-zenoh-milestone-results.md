@@ -25,6 +25,7 @@ carried before 2026-09-26.
 | Device hot-plug (withdraw, fresh endpoint on return) | not re-tested | yes | graph watcher + `rosstat` |
 | Reconnect after router/session loss | n/a | yes | tokens re-declared, sequence continues |
 | Services (server side; `std_srvs` Trigger, SetBool, Empty) | no (planned) | yes (2026-09-28) | `ros2 service list -t`, `ros2 service call`; 50/50 calls answered, worst loop pass unchanged; re-declared within 5 s of a router restart |
+| Deferred service replies (handler never blocks the loop) | no | yes (2026-09-28) | `/raft_esp32/range` answers from the first poll result after the call (39-100 ms later); request path 1 ms in the loop; unplugged sensor -> `ERR` at the timeout |
 
 The application code is identical for both: the transport is a build-time
 choice (`CONFIG_RAFTROS_BACKEND_ZENOH`, the default, or `..._RTPS`), and the

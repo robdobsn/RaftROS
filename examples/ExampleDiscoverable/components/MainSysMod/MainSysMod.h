@@ -8,6 +8,9 @@
 
 #include "RaftArduino.h"
 #include "RaftSysMod.h"
+#include "RaftDeviceConsts.h"
+#include "RaftBusDevicesIF.h"
+#include <atomic>
 
 class MainSysMod : public RaftSysMod
 {
@@ -46,4 +49,19 @@ private:
     // Reply text for the /raft_esp32/devices service; encoded before the
     // handler returns, so one buffer serves every call
     char _serviceMsg[160] = {};
+
+    // /raft_esp32/range: a deferred service.  The handler cannot read the
+    // sensor itself (that is a bus transaction on the bus task), so it parks
+    // the request and the loop completes it from the first poll result that
+    // arrives afterwards - a reading taken after the call, not a cached one.
+    RaftDeviceID _rangeDeviceID;                  ///< The VL6180, once identified
+    bool _rangeAttached = false;
+    std::atomic<uint32_t> _rangeSampleSeq{0};     ///< Bumped by the bus task per poll result
+    bool _rangeRequestPending = false;
+    uint32_t _rangeToken = 0;
+    uint32_t _rangeSeqAtRequest = 0;
+    uint32_t _rangeRequestMs = 0;
+    RaftBusDeviceDecodeState _rangeDecodeState;
+    char _rangeMsg[96] = {};
+    void serviceRangeRequest();
 };
