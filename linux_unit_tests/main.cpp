@@ -40,6 +40,7 @@
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
 #include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
 #include "runtime/autopub/RTPSAutoPubBackend.h"
+#include "AutoPub/AutoPubServiceRegistry.h"
 #include "AutoPub/AutoPubSampleRunner.h"
 #include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 #include "AutoPub/AutoPubPublisherPool.h"
@@ -550,6 +551,142 @@ int main()
         TEST_ASSERT(RTPSInitialAnnouncePlan_getBuildSpec(RTPSInitialAnnounceAction::SpdpDiscoveryPortCopy).buildKind
                         == RTPSInitialAnnounceBuildKind::SpdpAnnouncement,
                     "the discovery-port copy of the SPDP reply is built afresh");
+    }
+
+    //=================================================================
+    // Services: codec for the std_srvs types, and the registry that holds a
+    // request from acceptance to the final without ever blocking the loop.
+    //=================================================================
+    {
+        printf("Test: service codec encodes and decodes the std_srvs types\n");
+        using namespace RaftRuntime::AutoPub;
+        // The exact request payloads a real client sent (S0 fixtures)
+        const uint8_t triggerReq[] = {0x00, 0x01, 0x00, 0x00, 0x00};
+        const uint8_t setBoolReq[] = {0x00, 0x01, 0x00, 0x00, 0x01};
+        AutoPubServiceRequestFields fields;
+        TEST_ASSERT(AutoPubServiceCodec_decodeRequest(AutoPubServiceKind::Trigger, triggerReq, sizeof(triggerReq), fields) &&
+                    fields.kind == AutoPubServiceKind::Trigger,
+                    "an empty ROS request decodes: CDR header plus the one dummy byte");
+        TEST_ASSERT(!AutoPubServiceCodec_decodeRequest(AutoPubServiceKind::Trigger, triggerReq, 4, fields),
+                    "a Trigger request without its dummy byte is refused");
+        TEST_ASSERT(AutoPubServiceCodec_decodeRequest(AutoPubServiceKind::SetBool, setBoolReq, sizeof(setBoolReq), fields) &&
+                    fields.data == true, "SetBool{data:true} decodes");
+        TEST_ASSERT(AutoPubServiceCodec_decodeRequest(AutoPubServiceKind::Empty, triggerReq, sizeof(triggerReq), fields),
+                    "an Empty request has the same shape as a Trigger request");
+        uint8_t out[64];
+        const uint32_t n = AutoPubServiceCodec_encodeResponse(AutoPubServiceKind::Trigger, {true, "hello from server"}, out, sizeof(out));
+        // What a real server sent for the same response (S0 fixture payload)
+        const uint8_t expected[] = {0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x12, 0x00, 0x00, 0x00,
+                                    'h','e','l','l','o',' ','f','r','o','m',' ','s','e','r','v','e','r', 0x00};
+        TEST_ASSERT(n == sizeof(expected) && std::memcmp(out, expected, n) == 0,
+                    "a Trigger response encodes byte for byte as a real rmw_zenoh server's");
+        const uint32_t e = AutoPubServiceCodec_encodeResponse(AutoPubServiceKind::Empty, {}, out, sizeof(out));
+        TEST_ASSERT(e == 5 && out[4] == 0, "an Empty response is the header plus the dummy byte");
+        TEST_ASSERT(AutoPubServiceCodec_encodeResponse(AutoPubServiceKind::Trigger, {true, "x"}, out, 6) == 0,
+                    "a response that does not fit is refused, not truncated");
+        TEST_ASSERT(AutoPubServiceCodec_kindForWireType("std_srvs::srv::dds_::SetBool_") == AutoPubServiceKind::SetBool &&
+                    AutoPubServiceCodec_kindForWireType("nope") == AutoPubServiceKind::Unknown,
+                    "wire type names map to kinds");
+    }
+    {
+        printf("Test: service registry answers now, later, or not at all - never blocking\n");
+        using namespace RaftRuntime::AutoPub;
+        using Registry = AutoPubServiceRegistry<4, 2, 128>;
+        Registry registry;
+        int calls = 0;
+        const uint8_t slot = registry.add("/raft/trigger", AutoPubServiceKind::Trigger,
+            [&](const AutoPubServiceRequest& req, AutoPubServiceReply& reply) {
+                ++calls; reply.fields = {true, "now"}; return AutoPubServiceOutcome::Replied;
+            });
+        TEST_ASSERT(slot == 0 && registry.inUseCount() == 1, "a service takes the first slot");
+        TEST_ASSERT(registry.add("/raft/trigger", AutoPubServiceKind::Trigger, [](const AutoPubServiceRequest&, AutoPubServiceReply&) {
+                        return AutoPubServiceOutcome::Replied; }) == Registry::INVALID_SLOT,
+                    "one server per service name");
+        TEST_ASSERT(registry.add("/raft/x", AutoPubServiceKind::Unknown, [](const AutoPubServiceRequest&, AutoPubServiceReply&) {
+                        return AutoPubServiceOutcome::Replied; }) == Registry::INVALID_SLOT,
+                    "an unknown type cannot be served");
+
+        const uint8_t req[] = {0x00, 0x01, 0x00, 0x00, 0x00};
+        uint8_t att[33] = {0}; att[0] = 42; att[16] = 16;
+        TEST_ASSERT(registry.accept(slot, 7, req, sizeof(req), att, sizeof(att), 600000, 1000),
+                    "a well-formed request is accepted");
+        TEST_ASSERT(registry.next().kind == AutoPubServiceSend::Kind::None && calls == 0,
+                    "nothing is sent and no handler runs until service()");
+        registry.service(1001, 2);
+        TEST_ASSERT(calls == 1, "service() runs the handler");
+        auto send = registry.next();
+        TEST_ASSERT(send.kind == AutoPubServiceSend::Kind::Response && send.requestId == 7 && send.slot == slot &&
+                    send.payloadLen > 4 && send.attachment && send.attachment[0] == 42,
+                    "the reply is staged with the request id and the client's attachment echoed");
+        registry.sent();
+        send = registry.next();
+        TEST_ASSERT(send.kind == AutoPubServiceSend::Kind::Final && send.requestId == 7,
+                    "the final follows the response on the next pass");
+        registry.sent();
+        TEST_ASSERT(registry.next().kind == AutoPubServiceSend::Kind::None && registry.inflightCount() == 0 &&
+                    registry.stats().completed == 1, "after the final the entry is free");
+
+        // Deferred: the handler cannot answer now; the application completes later
+        uint32_t token = 0;
+        const uint8_t deferSlot = registry.add("/raft/later", AutoPubServiceKind::SetBool,
+            [&](const AutoPubServiceRequest& r, AutoPubServiceReply&) { token = r.token; return AutoPubServiceOutcome::Deferred; });
+        const uint8_t setReq[] = {0x00, 0x01, 0x00, 0x00, 0x01};
+        registry.accept(deferSlot, 8, setReq, sizeof(setReq), att, sizeof(att), 0, 2000);
+        registry.service(2001, 2);
+        TEST_ASSERT(token != 0 && registry.next().kind == AutoPubServiceSend::Kind::None && registry.stats().deferred == 1,
+                    "a deferred request sends nothing and hands the application a token");
+        TEST_ASSERT(!registry.complete(token + 99, {}), "an unknown token is rejected");
+        TEST_ASSERT(registry.complete(token, {{true, "later"}, ""}) && registry.next().kind == AutoPubServiceSend::Kind::Response,
+                    "completing the token stages the reply");
+        registry.sent(); registry.sent();
+
+        // Timeout: a deferred request nobody completes is answered with an error
+        registry.accept(deferSlot, 9, setReq, sizeof(setReq), att, sizeof(att), 0, 3000);
+        registry.service(3001, 2);
+        // The deadline runs from acceptance (3000), not from the first service()
+        registry.service(3000 + Registry::DEFAULT_TIMEOUT_MS - 1, 2);
+        TEST_ASSERT(registry.next().kind == AutoPubServiceSend::Kind::None, "not yet timed out");
+        registry.service(3000 + Registry::DEFAULT_TIMEOUT_MS, 2);
+        send = registry.next();
+        TEST_ASSERT(send.kind == AutoPubServiceSend::Kind::Error && send.requestId == 9 &&
+                    std::strcmp(send.reason, "timeout") == 0 && registry.stats().timedOut == 1,
+                    "a deferred request that is never completed is refused with 'timeout'");
+        registry.sent(); registry.sent();
+
+        // Budget: three queued, budget two -> one waits for the next pass
+        int budgetCalls = 0;
+        const uint8_t bSlot = registry.add("/raft/b", AutoPubServiceKind::Empty,
+            [&](const AutoPubServiceRequest&, AutoPubServiceReply&) { ++budgetCalls; return AutoPubServiceOutcome::Replied; });
+        registry.remove(deferSlot);
+        Registry big;   // the registry above holds 2 in flight; use a fresh one with the same limits to show the budget
+        (void)bSlot;
+        const uint8_t bs = big.add("/raft/b", AutoPubServiceKind::Empty,
+            [&](const AutoPubServiceRequest&, AutoPubServiceReply&) { ++budgetCalls; return AutoPubServiceOutcome::Replied; });
+        TEST_ASSERT(big.accept(bs, 1, req, sizeof(req), att, sizeof(att), 0, 10) &&
+                    big.accept(bs, 2, req, sizeof(req), att, sizeof(att), 0, 10),
+                    "the table holds INFLIGHT requests");
+        TEST_ASSERT(!big.accept(bs, 3, req, sizeof(req), att, sizeof(att), 0, 10) && big.stats().refusedBusy == 1,
+                    "a request beyond the table is refused at once");
+        send = big.next();
+        TEST_ASSERT(send.kind == AutoPubServiceSend::Kind::Error && send.requestId == 3 && std::strcmp(send.reason, "busy") == 0,
+                    "the refusal is an error reply for the refused request, sent first");
+        big.sent(); big.sent();
+        big.service(11, 1);
+        TEST_ASSERT(budgetCalls == 1, "a budget of one runs one handler per pass");
+        big.service(12, 1);
+        TEST_ASSERT(budgetCalls == 2, "the next pass runs the next");
+
+        // Bad request: refused with an error, no handler runs
+        Registry bad;
+        int badCalls = 0;
+        const uint8_t badSlot = bad.add("/raft/t", AutoPubServiceKind::Trigger,
+            [&](const AutoPubServiceRequest&, AutoPubServiceReply&) { ++badCalls; return AutoPubServiceOutcome::Replied; });
+        TEST_ASSERT(!bad.accept(badSlot, 5, req, 3, att, sizeof(att), 0, 0) && bad.stats().refusedBad == 1,
+                    "an undecodable request is refused");
+        bad.service(1, 2);
+        TEST_ASSERT(badCalls == 0 && bad.next().kind == AutoPubServiceSend::Kind::Error &&
+                    std::strcmp(bad.next().reason, "bad request") == 0,
+                    "no handler runs for it and the client is told why");
     }
 
     //=================================================================
