@@ -164,6 +164,16 @@ Application API on the SysMod:
 `removeService(slot)`.
 *Gate:* host tests for registry lifecycle, budget, deferral and timeout;
 CDR round-trips for all three types including the empty-request dummy byte.
+**Met 2026-09-28:** `AutoPub/AutoPubServiceCodec.h` (a Trigger response
+encodes byte for byte as the captured real server's) and
+`AutoPub/AutoPubServiceRegistry.h` (accept / service / complete / next / sent;
+in-flight table, per-pass dispatch budget, deferred timeouts, busy and
+bad-request refusals). Unit suite 1064 passed (+29). Mutations caught: budget
+not enforced, deferred never times out, full table drops silently, attachment
+not echoed - each 1 failure. Found on the way: the host Makefile did not
+track header dependencies, so header-only changes left a stale test binary
+(the first mutation pass "passed" everything); objects now emit and read `.d`
+files.
 
 **S3 - Zenoh SysMod integration (first flash).** Service slots declare the
 queryable then the `SS` token through the same staged, one-per-pass path as

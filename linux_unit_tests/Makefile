@@ -160,14 +160,21 @@ raft_core:
 	python3 ../scripts/FetchGitRepo.py $(REPO_URL) $(DEST_DIR) $(GIT_TAG)
 
 # Compile object files into $(OBJ_DIR), mirroring source tree layout.
+# Objects are rebuilt when a header they include changes: the compiler writes
+# a .d file next to each object and make reads them.  Without this a change to
+# a header-only component (most of AutoPub/ and Zenoh/) left a stale test
+# binary running against old code - which is what a "mutation test" that
+# never fails looks like.
 define make_obj_rule
 $(call src_to_obj,$(1)): $(1)
 	@echo "Compiling $(1)..."
 	@mkdir -p $$(dir $$@)
-	$$(CC) $$(CFLAGS) $$(INCLUDES) -c $$< -o $$@
+	$$(CC) $$(CFLAGS) $$(INCLUDES) -MMD -MP -c $$< -o $$@
 endef
 
 $(foreach src,$(sort $(SOURCES) $(PROTO_SOURCES) $(STANDALONE_SRC)),$(eval $(call make_obj_rule,$(src))))
+
+-include $(patsubst %.o,%.d,$(OBJECTS) $(PROTO_OBJECTS) $(STANDALONE_OBJ))
 
 # Ensure $(OUTPUT) depends on raft_core
 $(OUTPUT): $(OBJECTS) raft_core
