@@ -110,6 +110,12 @@ void MainSysMod::setup()
                     _rangeRequestPending = true;
                     return RaftROS::ServiceOutcome::Deferred;
                 });
+            //   ros2 service call /raft_esp32/ping std_srvs/srv/Empty
+            pRaftROS->addService("/raft_esp32/ping", "std_srvs::srv::dds_::Empty_",
+                [](const RaftROS::ServiceRequest&, RaftROS::ServiceReply&)
+                {
+                    return RaftROS::ServiceOutcome::Replied;
+                });
             //   ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: false}"
             pRaftROS->addService("/raft_esp32/chatter_enable", "std_srvs::srv::dds_::SetBool_",
                 [pRaftROS](const RaftROS::ServiceRequest& request, RaftROS::ServiceReply& reply)
