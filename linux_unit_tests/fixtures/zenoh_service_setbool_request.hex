@@ -1,0 +1,4 @@
+# Captured 2026-09-28 from rmw_zenoh 0.2.10 / zenoh 1.x: setbool request.
+# Network-message bytes as carried in one FRAME (frame header and sequence stripped).
+# router -> server (what a device receives)
+9c0220a10db40226c0cf24a301c30600000100000145210100000000000000269ed670b47ad918102ccd71e92a3c582934aa9261bc8d3f4a
