@@ -28,6 +28,12 @@ public:
     /// data later must copy it.  Returning false fails the session.
     using SampleCallback = bool (*)(void*, const ZenohNetworkMessage::SampleMessage&);
 
+    /// @brief Called for each service request a peer sends us.  Borrows the
+    /// receive buffer; returning false fails the session.  With no handler a
+    /// request is skipped and counted - the client times out, the session
+    /// survives.
+    using RequestCallback = bool (*)(void*, const ZenohNetworkMessage::RequestMessage&);
+
     bool start(const std::array<uint8_t, 16>& identity, uint64_t nowMs)
     {
         if (_state == State::AwaitInitAck || _state == State::AwaitOpenAck || _state == State::Established)
@@ -40,7 +46,7 @@ public:
         _sequenceBits = 32;
         _closeReason = 0;
         _remoteLeaseMs = _remoteInitialSequence = 0;
-        _keepAlivesReceived = _frameCount = _discoveryCount = _sampleCount = 0;
+        _keepAlivesReceived = _frameCount = _discoveryCount = _sampleCount = _requestCount = 0;
         _rxSequence.fill(0);
         _txSequence = 0;
         _stageStartedMs = _lastRxMs = _lastTxMs = _queuedAtMs = nowMs;
@@ -66,7 +72,7 @@ public:
 
     bool receive(const uint8_t* bytes, size_t length, uint64_t nowMs,
                  DiscoveryCallback onDiscovery = nullptr, void* context = nullptr,
-                 SampleCallback onSample = nullptr)
+                 SampleCallback onSample = nullptr, RequestCallback onRequest = nullptr)
     {
         service(nowMs);
         if (!active())
@@ -80,7 +86,7 @@ public:
                 return fail(Error::InvalidBatch);
             if (result == ZenohStreamFramer<BATCH_CAPACITY>::Result::Complete)
             {
-                if (_framer.size() > _negotiatedBatch || !processBatch(nowMs, onDiscovery, context, onSample))
+                if (_framer.size() > _negotiatedBatch || !processBatch(nowMs, onDiscovery, context, onSample, onRequest))
                 {
                     if (_state != State::Failed)
                         fail(Error::InvalidBatch);
@@ -174,6 +180,7 @@ public:
     uint32_t frameCount() const { return _frameCount; }
     uint32_t discoveryCount() const { return _discoveryCount; }
     uint32_t sampleCount() const { return _sampleCount; }
+    uint32_t requestCount() const { return _requestCount; }
     uint8_t closeReason() const { return _closeReason; }
 
 private:
@@ -358,7 +365,7 @@ private:
     }
 
     bool processBatch(uint64_t nowMs, DiscoveryCallback onDiscovery, void* context,
-                      SampleCallback onSample = nullptr)
+                      SampleCallback onSample = nullptr, RequestCallback onRequest = nullptr)
     {
         Reader reader(_framer.data(), _framer.size());
         while (reader.remaining() != 0)
@@ -404,6 +411,21 @@ private:
                 bool hasMessage = false;
                 while (reader.remaining() && (reader.current()[0] & 0x1f) >= 0x10)
                 {
+                    if ((reader.current()[0] & 0x1f) == 0x1c)
+                    {
+                        // A service request.  Parsed even with no handler, so
+                        // a request for a service we no longer hold is skipped
+                        // rather than treated as a malformed batch.
+                        ZenohNetworkMessage::RequestMessage request;
+                        const size_t consumed = ZenohNetworkMessage::readRequest(reader.current(), reader.remaining(), request);
+                        if (!consumed || !reader.skip(consumed))
+                            return fail(Error::MalformedMessage);
+                        hasMessage = true;
+                        ++_requestCount;
+                        if (onRequest && !onRequest(context, request))
+                            return fail(Error::DiscoveryRejected);
+                        continue;
+                    }
                     if ((reader.current()[0] & 0x1f) == 0x1d)
                     {
                         // A sample.  Parsed even with no handler installed, so
@@ -446,7 +468,7 @@ private:
     uint16_t _negotiatedBatch = BATCH_CAPACITY;
     uint8_t _sequenceBits = 32, _closeReason = 0;
     uint64_t _stageStartedMs = 0, _lastRxMs = 0, _lastTxMs = 0, _queuedAtMs = 0, _remoteLeaseMs = 0;
-    uint32_t _remoteInitialSequence = 0, _keepAlivesReceived = 0, _frameCount = 0, _discoveryCount = 0, _sampleCount = 0;
+    uint32_t _remoteInitialSequence = 0, _keepAlivesReceived = 0, _frameCount = 0, _discoveryCount = 0, _sampleCount = 0, _requestCount = 0;
     std::array<uint32_t, 2> _rxSequence{};
     uint32_t _txSequence = 0;
 };

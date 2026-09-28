@@ -53,7 +53,9 @@ public:
     enum class EndpointKind : uint8_t
     {
         Publisher,
-        Subscription
+        Subscription,
+        Service,        ///< A service server ("SS" in the liveliness token)
+        Client          ///< A service client ("SC"); parsed, never declared
     };
 
     struct Endpoint
@@ -162,7 +164,9 @@ public:
             return false;
         output[0] = '\0';
         const char* kind = endpoint.kind == EndpointKind::Publisher ? "MP" :
-                           endpoint.kind == EndpointKind::Subscription ? "MS" : nullptr;
+                           endpoint.kind == EndpointKind::Subscription ? "MS" :
+                           endpoint.kind == EndpointKind::Service ? "SS" :
+                           endpoint.kind == EndpointKind::Client ? "SC" : nullptr;
         if (!kind || !isNodeIdentityValid(node.sessionId, node.enclave, node.nodeNamespace, node.nodeName) ||
             !isRosPath(endpoint.topic, false) || !isMessageType(endpoint.wireType) ||
             !isTypeHash(endpoint.typeHash))

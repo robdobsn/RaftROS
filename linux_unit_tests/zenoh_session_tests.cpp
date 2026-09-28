@@ -1,6 +1,7 @@
 #include <array>
 #include <cstdio>
 #include <cstring>
+#include <fstream>
 #include <string>
 #include <vector>
 #include "Zenoh/ZenohStreamFramer.h"
@@ -723,6 +724,183 @@ int main()
                         return false;
                     }) && refusing.state() == Session::State::Failed,
                     "a handler that refuses a sample fails the session");
+    }
+
+    std::printf("Test: service declarations round-trip\n");
+    {
+        using Message = RaftRuntime::Zenoh::ZenohNetworkMessage;
+        uint8_t buffer[512];
+        Message::DiscoveryMessage parsed;
+        const size_t ke = Message::declareKeyExpr(buffer, sizeof(buffer), 30, "0/raft_test/trigger/std_srvs::srv::dds_::Trigger_/RIHS01_x");
+        TEST_ASSERT(ke > 0 && Message::readDiscovery(buffer, ke, parsed) == ke && parsed.declaration == 0 &&
+                    parsed.id == 30 && parsed.key == "0/raft_test/trigger/std_srvs::srv::dds_::Trigger_/RIHS01_x",
+                    "a key-expression declaration carries body id 0, the id and the full key");
+        TEST_ASSERT(Message::declareKeyExpr(buffer, sizeof(buffer), 0, "0/raft/x") == 0,
+                    "key-expression id 0 is reserved and refused");
+        const size_t q = Message::declareQueryable(buffer, sizeof(buffer), 27, 30);
+        TEST_ASSERT(q == 6 && buffer[1] == 0xc4 && buffer[2] == 27 && buffer[3] == 30 && buffer[4] == 0x21 && buffer[5] == 0x01,
+                    "a queryable declaration is byte for byte what rmw_zenoh sends: c4 <id> <keyexpr> 21 01");
+        TEST_ASSERT(Message::readDiscovery(buffer, q, parsed) == q && parsed.declaration == 4 && parsed.id == 27,
+                    "a queryable declaration parses as body id 4");
+        const size_t uq = Message::undeclareQueryable(buffer, sizeof(buffer), 27);
+        TEST_ASSERT(uq > 0 && Message::readDiscovery(buffer, uq, parsed) == uq && parsed.declaration == 5 && parsed.id == 27,
+                    "withdrawing a queryable names body id 5");
+        const size_t uk = Message::undeclareKeyExpr(buffer, sizeof(buffer), 30);
+        TEST_ASSERT(uk > 0 && Message::readDiscovery(buffer, uk, parsed) == uk && parsed.declaration == 1 && parsed.id == 30,
+                    "withdrawing a key expression names body id 1");
+    }
+
+    std::printf("Test: requests captured from a real router parse completely\n");
+    {
+        using Message = RaftRuntime::Zenoh::ZenohNetworkMessage;
+        const auto loadFixture = [](const char* path) {
+            std::vector<std::vector<uint8_t>> messages;
+            std::ifstream in(path);
+            std::string line;
+            while (std::getline(in, line))
+            {
+                if (line.empty() || line[0] == '#') continue;
+                std::vector<uint8_t> bytes;
+                for (size_t i = 0; i + 1 < line.size(); i += 2)
+                    bytes.push_back(static_cast<uint8_t>(std::stoul(line.substr(i, 2), nullptr, 16)));
+                messages.push_back(bytes);
+            }
+            return messages;
+        };
+        const auto trigger = loadFixture("fixtures/zenoh_service_trigger_request.hex");
+        const auto setbool = loadFixture("fixtures/zenoh_service_setbool_request.hex");
+        TEST_ASSERT(trigger.size() == 1 && setbool.size() == 1, "request fixtures load (run from linux_unit_tests/)");
+        if (trigger.size() == 1 && setbool.size() == 1)
+        {
+            Message::RequestMessage request;
+            const auto& t = trigger[0];
+            TEST_ASSERT(Message::readRequest(t.data(), t.size(), request) == t.size(),
+                        "the Trigger request the router sent a server parses completely");
+            TEST_ASSERT(request.requestId == 1 && request.keyId == 30 && request.key.empty(),
+                        "the router addresses the request by our declared key-expression id, with no suffix");
+            TEST_ASSERT(request.timeoutMs == 600000, "the client's timeout (600 s from the CLI) is read");
+            const uint8_t triggerCdr[] = {0x00, 0x01, 0x00, 0x00, 0x00};
+            TEST_ASSERT(request.payload.size() == sizeof(triggerCdr) &&
+                        std::memcmp(request.payload.data(), triggerCdr, sizeof(triggerCdr)) == 0,
+                        "an empty ROS request is a CDR header plus the one dummy byte");
+            TEST_ASSERT(request.attachment.size() == 33 && static_cast<uint8_t>(request.attachment[0]) == 1 &&
+                        static_cast<uint8_t>(request.attachment[16]) == 16,
+                        "the client's attachment (sequence 1, 16-byte GID) is found under extension id 5");
+            const auto& b = setbool[0];
+            TEST_ASSERT(Message::readRequest(b.data(), b.size(), request) == b.size() && request.requestId == 2 &&
+                        request.keyId == 32 && request.payload.size() == 5 &&
+                        static_cast<uint8_t>(request.payload[4]) == 1,
+                        "the SetBool{data:true} request carries request id 2, key id 32 and a payload ending in 01");
+            bool everyTruncationRejected = true;
+            for (size_t n = 1; n < t.size(); ++n)
+                everyTruncationRejected &= Message::readRequest(t.data(), n, request) == 0;
+            TEST_ASSERT(everyTruncationRejected, "every truncation of a request is rejected");
+        }
+    }
+
+    std::printf("Test: our reply has the shape of a real server's\n");
+    {
+        using Message = RaftRuntime::Zenoh::ZenohNetworkMessage;
+        // A small reader for what a router would parse out of our RESPONSE
+        struct Reply { uint32_t rid = 0; std::string key; std::string payload; std::string attachment; bool ok = false; };
+        const auto readReply = [](const uint8_t* b, size_t n) {
+            Reply r;
+            size_t o = 0;
+            auto varint = [&](uint32_t& v) {
+                v = 0;
+                for (int i = 0; i < 5 && o < n; ++i)
+                {
+                    const uint8_t x = b[o++];
+                    v |= (x & 0x7f) << (7 * i);
+                    if (x < 128)
+                        return true;
+                }
+                return false;
+            };
+            auto blob = [&](std::string& out) {
+                uint32_t v = 0;
+                if (!varint(v) || o + v > n)
+                    return false;
+                out.assign(reinterpret_cast<const char*>(b + o), v);
+                o += v;
+                return true;
+            };
+            uint32_t v = 0;
+            if (n < 2 || (b[o++] & 0x1f) != 0x1b)
+                return r;
+            if (!varint(v))
+                return r;
+            r.rid = v;
+            if (!varint(v))                                   // scope
+                return r;
+            if (!blob(r.key))
+                return r;
+            if (o >= n || b[o++] != 0x04)                     // REPLY
+                return r;
+            if (o >= n)
+                return r;
+            const uint8_t put = b[o++];
+            if (put & 0x80)
+            {
+                if (o >= n || b[o++] != 0x43 || !blob(r.attachment))
+                    return r;
+            }
+            if (!blob(r.payload))
+                return r;
+            r.ok = (o == n);
+            return r;
+        };
+        uint8_t buffer[512];
+        const uint8_t cdr[] = {0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 'o', 'k', 0x00};
+        uint8_t attachment[33] = {0}; attachment[0] = 7; attachment[16] = 16;
+        const size_t n = Message::writeReply(buffer, sizeof(buffer), 9, "0/raft/svc/std_srvs::srv::dds_::Trigger_/RIHS01_x",
+                                             cdr, sizeof(cdr), attachment, sizeof(attachment));
+        const Reply reply = readReply(buffer, n);
+        TEST_ASSERT(n > 0 && reply.ok && reply.rid == 9 && reply.key == "0/raft/svc/std_srvs::srv::dds_::Trigger_/RIHS01_x",
+                    "a reply names the request id and the service key in full");
+        TEST_ASSERT(reply.payload.size() == sizeof(cdr) && reply.attachment.size() == 33 &&
+                    static_cast<uint8_t>(reply.attachment[0]) == 7,
+                    "a reply carries the CDR response and the attachment that echoes the request's sequence");
+        TEST_ASSERT(buffer[0] == 0x7b, "a reply is RESPONSE with the key named in full, as a real server sends it");
+        const size_t f = Message::writeResponseFinal(buffer, sizeof(buffer), 9);
+        TEST_ASSERT(f == 2 && buffer[0] == 0x1a && buffer[1] == 9, "the final is RESPONSE_FINAL with the request id");
+        const size_t e = Message::writeReplyError(buffer, sizeof(buffer), 9, "0/raft/svc/t/h", "no such service");
+        TEST_ASSERT(e > 0 && buffer[0] == 0x7b, "a refusal is a RESPONSE carrying ERR");
+        TEST_ASSERT(Message::writeReply(buffer, sizeof(buffer), 9, "", cdr, sizeof(cdr), nullptr, 0) == 0,
+                    "a reply with no key is refused");
+    }
+
+    std::printf("Test: requests reach the session's handler\n");
+    {
+        using Message = RaftRuntime::Zenoh::ZenohNetworkMessage;
+        std::ifstream in("fixtures/zenoh_service_trigger_request.hex");
+        std::string line, hex;
+        while (std::getline(in, line)) if (!line.empty() && line[0] != '#') hex = line;
+        std::vector<uint8_t> request;
+        for (size_t i = 0; i + 1 < hex.size(); i += 2)
+            request.push_back(static_cast<uint8_t>(std::stoul(hex.substr(i, 2), nullptr, 16)));
+        std::vector<uint8_t> frame{0x25, 37};
+        frame.insert(frame.end(), request.begin(), request.end());
+        std::vector<uint8_t> wire{static_cast<uint8_t>(frame.size()), static_cast<uint8_t>(frame.size() >> 8)};
+        wire.insert(wire.end(), frame.begin(), frame.end());
+
+        struct Capture { int count = 0; uint32_t keyId = 0; size_t payload = 0; } capture;
+        Session receiver;
+        establish(receiver);
+        receiver.consumeOutput(receiver.outputSize(), 3);
+        TEST_ASSERT(receiver.receive(wire.data(), wire.size(), 3, nullptr, &capture, nullptr,
+                    [](void* context, const Message::RequestMessage& r) {
+                        auto* c = static_cast<Capture*>(context); ++c->count; c->keyId = r.keyId; c->payload = r.payload.size(); return true;
+                    }),
+                    "a frame carrying a request is accepted");
+        TEST_ASSERT(capture.count == 1 && capture.keyId == 30 && capture.payload == 5 && receiver.requestCount() == 1,
+                    "the request reaches the handler with its key id and payload");
+        Session ignoring;
+        establish(ignoring);
+        ignoring.consumeOutput(ignoring.outputSize(), 3);
+        TEST_ASSERT(ignoring.receive(wire.data(), wire.size(), 3) && ignoring.state() == Session::State::Established &&
+                    ignoring.requestCount() == 1,
+                    "a request with no handler installed is skipped, not treated as malformed");
     }
 
     std::printf("Zenoh session: %d passed, %d failed\n", passCount, failCount);
