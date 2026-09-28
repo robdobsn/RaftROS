@@ -301,6 +301,9 @@ sudo chown $USER ~/raft_rtps.pcap
 - `examples/DemoSimple/` — host-side dynamic ROS 2 dashboard for hot-plugged RaftROS device topics.
 - `linux_unit_tests/` — Linux-hosted unit tests (388+ cases) and a standalone linux RTPS publisher (`raftros_standalone.cpp`) used as a non-embedded reference implementation.
 - `devdocs/` — design overview, development status, and implementation plan.
+  Start with `RaftROS-zenoh-milestone-results.md` (measured results: loop
+  budget, memory, the 12 h soak, defects fixed) and
+  `RaftROS-services-assessment.md` (what services would need, per transport).
 
 ## Dependencies
 
