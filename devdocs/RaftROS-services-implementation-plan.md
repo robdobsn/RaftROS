@@ -42,33 +42,48 @@ What `rmw_zenoh` does for a service server, from its source:
 - **Declaration:** a queryable, `D_QUERYABLE = 0x04` / `U_QUERYABLE = 0x05`,
   same shape as a token declaration (`0x24` with the key in full), declared
   `complete = true`. `readDiscovery` already parses ids 4/5.
-- **A request arrives as** a `REQUEST` network message (`0x1c`, flags N/M/Z as
-  `PUSH`): a varint request id, the key expression, extensions (QoS, timestamp,
-  node id, target, budget, timeout - all skippable), then a `QUERY` body
-  (`0x03`): consolidation (flag C), parameters string (flag P), and extensions
-  of which two matter - the **query body** (`ValueType`, ext id 0x03: encoding
-  + the CDR request payload) and the **attachment** (ext id 0x05: the same
-  33-byte `sequence, timestamp, gid` the publish path already encodes and
-  decodes, here the *client's*).
-- **The reply is** a `RESPONSE` network message (`0x1b`): the request id, the
-  key expression, a `REPLY` body (`0x04`: consolidation, then a `Put` carrying
-  the CDR response and an attachment with the request's sequence number, the
-  server's timestamp and the server's GID), followed by a `RESPONSE_FINAL`
-  (`0x1a`: the request id). `rmw_zenoh` correlates the reply to the call by
-  the attachment's sequence number, so it is not optional.
+- **A request arrives as** (observed, S0 capture, frames 140/249 of
+  `s0b.pcap`; fixtures in `linux_unit_tests/fixtures/`): a `REQUEST` network
+  message `0x1c|Z` with a varint request id and a key expression given as **the
+  key-expression id the server itself declared, with no suffix** (`N=0, M=0`).
+  So a device must declare a `D_KEYEXPR` id for each service key and declare
+  the queryable against that id, as `rmw_zenoh` does - the router addresses
+  requests by our id. Extensions: QoS (id 1, int), Target (id 4, int,
+  mandatory-flagged, value 2 = `AllComplete`), Timeout (id 6, int, 600000 ms
+  from the CLI). Then a `QUERY` body `0xa3` (`C|Z`): consolidation 1, no
+  parameters, and two extensions - the **query body** (id 3, buffer: one
+  varint encoding `0x00` then the CDR request, e.g. `00 01 00 00 00` for
+  `Trigger_Request`, `... 01` for `SetBool{data:true}`) and the **attachment**
+  (id 5, buffer, 33 bytes: client sequence number, timestamp, 16-byte GID -
+  the same layout the publish path already encodes and decodes).
+- **The reply is** (observed, frames 142/251): a `RESPONSE` `0x1b|N|M|Z` with
+  the request id, the key expression **in full** (`0/raft_test/trigger/...`,
+  `N=1, M=1`), extensions QoS (id 1) and ResponderId (id 3, buffer, 18 bytes =
+  16-byte session id + entity id; optional by type), then a `REPLY` body `0x04`
+  (no consolidation) containing a `Put` `0x81` whose only extension is the
+  attachment (id 3, 33 bytes: the **request's** sequence number, the server's
+  timestamp, the server's GID) and whose payload is the CDR response
+  (`00 01 00 00 | 01 | 00 00 00 | 12 00 00 00 "hello from server\0"`). In the
+  same frame follows `RESPONSE_FINAL` `0x9a`: the request id and a QoS
+  extension. `rmw_zenoh` correlates on the attachment's sequence number.
 - **Errors:** a `RESPONSE` with an `ERR` body (`0x05`) is the protocol's
-  refusal. Used when a request cannot be decoded or the handler declines.
+  refusal; not observed (nothing failed), taken from the source.
+- **What the peer model means for us:** `rmw_zenoh` nodes are *peers* and
+  link to each other directly once the router's gossip introduces them - the
+  first capture showed the request never touching port 7447. A device is a
+  pure *client* of the router, so the exchange above (server forced to client
+  mode with `ZENOH_SESSION_CONFIG_URI`) is exactly the device's, and the real
+  `ros2 service call` accepted its replies.
 - **CDR shapes** for the first types: an empty ROS request is not empty on
   the wire - `Trigger_Request` and `Empty_Request` carry one
   `uint8 structure_needs_at_least_one_member`; `SetBool_Request` is one
   `boolean`; `Trigger_Response`/`SetBool_Response` are `boolean success` then
   `string message`; all behind the 4-byte CDR encapsulation header.
 
-*Confirm by capture (S0):* the exact byte layout of `REQUEST`'s extension
-chain and the `QUERY` body as sent by `ros2 service call`, and the exact
-`RESPONSE`/`RESPONSE_FINAL` bytes as sent by a real `rmw_zenoh` server. Both
-directions are obtained from one `tshark` capture on the ROS host with the
-Python `zenoh` package standing in as client or server, and are kept as tests.
+*S0 done (2026-09-28):* both directions captured from a real `rmw_zenoh`
+server (an `rclpy` node in client mode) and the real `ros2 service call`
+client through `rmw_zenohd`, decoded to the byte, and kept as fixtures under
+`linux_unit_tests/fixtures/zenoh_service_*.hex`.
 
 ## 2. Loop, Memory and Failure Bounds
 
@@ -113,7 +128,9 @@ server (a tiny `rclpy` node), both under `tshark`. Decode every byte of
 `REQUEST`/`QUERY` and `RESPONSE`/`REPLY`/`RESPONSE_FINAL`; record them in
 section 1 of this document and as byte-array test fixtures.
 *Gate:* both captured exchanges decode completely by hand, with the request
-attachment's sequence number matching the reply's.
+attachment's sequence number matching the reply's. **Met 2026-09-28** - two
+exchanges (`Trigger`, `SetBool`), request and reply sequence numbers 1/1 and
+1/1, CLI replies `success=True`.
 
 **S1 - Wire messages (host only).** In `ZenohNetworkMessage`:
 `declareQueryable`/`undeclareQueryable`, `readRequest` (-> `RequestMessage`:
