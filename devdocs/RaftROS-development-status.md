@@ -25,7 +25,7 @@ subscriptions.
 | Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Complete. Kconfig selects the backend - Zenoh by default since 2026-09-27, RTPS as the opt-in - and each image links only its own backend. The router address is layered (Kconfig < SysTypes < posted settings) and an unreachable router is reported with its cause and the fix. |
-| Z4-Z6: parity and release | Complete for the initial Zenoh milestone: parity verified with the ROS 2 tools on both transports, `qosProfiles` reach subscriptions, hot-plug verified, bring-up logging moved behind per-file switches. A 12 h soak is recording heap, stack headroom and session state once a minute; reading it is the last open item. |
+| Z4-Z6: parity and release | **Complete** for the initial Zenoh milestone: parity verified with the ROS 2 tools on both transports, `qosProfiles` reach subscriptions, hot-plug verified, bring-up logging behind per-file switches, and a 12 h soak shows one session throughout and free heap flat to -2 bytes/hour. Next milestone: services (no plan written yet - see 2026-09-28 discussion). |
 
 Runtime transport switching is deferred. Services/parameters remain future
 work after this milestone. Do not treat pending RTPS cleanup or Task D as a
@@ -225,6 +225,32 @@ prerequisite for the initial Zenoh feasibility experiment.
   and owner **19192 B**. Resource reporting now checks the neutral symbol and
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
+
+### Twelve-Hour Soak: No Leak, One Session (2026-09-28)
+
+`/api/rosstat` sampled once a minute from the ROS host for 12 h, Zenoh build
+against `rmw_zenohd`, VL6180 attached, `/chatter` running. The last reflash was
+at 15:39 on 2026-09-27; the 675 samples (11.2 h) after it:
+
+| | Result |
+| --- | --- |
+| Session | one, for the whole run; `conn: ready` in every sample; 0 connect failures, 0 re-declares |
+| Free heap | 177.8 kB at the start, 176.9 kB at the end; trend **-2 bytes/hour**; first-hour and last-hour means 177.1 kB vs 177.0 kB |
+| Minimum free heap | fell to 143.5 kB within 12 minutes of boot (four step-downs, the last a 17.7 kB dip at 15:51) and **never lower again in the remaining 11 hours** |
+| Stack headroom | never below 5540 B |
+| Samples published | 238,425 - 5.9/s, continuous; 0 inbound dropped |
+| Sampler | 2 of 719 minutes unanswered - the two reflashes that afternoon |
+
+So the drift that prompted this (145.7 kB after a day of tests, against 168.7 kB
+fresh) was not a leak: free heap is flat to within a few hundred bytes over
+eleven hours. What the earlier figure recorded was the *transient* low-water
+mark - about 34 kB below steady state at its worst - reached early and once. The
+headroom figure for a device with this load is therefore roughly 143 kB, not
+the 177 kB steady state.
+
+The 17.7 kB transient at 15:51 was not tied to any RaftROS event in the log; the
+device was serving REST queries and the graph tools at the time. Worth
+attributing if the transient floor ever matters, not before.
 
 ### Release Pass: A Demo Log That Says What Happened (2026-09-27)
 
