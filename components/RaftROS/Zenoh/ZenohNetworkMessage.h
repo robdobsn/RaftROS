@@ -135,6 +135,58 @@ public:
         return writer.size();
     }
 
+    /// @brief Declare a key-expression id for a key.  A router addresses a
+    /// request to a queryable by the id the queryable's owner declared (S0
+    /// capture: `N=0, M=0`, key given as our id), so every service needs one.
+    static size_t declareKeyExpr(uint8_t* output, size_t capacity, uint32_t keyExprId, std::string_view key)
+    {
+        if (!validKey(key) || keyExprId == 0 || keyExprId > 65535)
+            return 0;
+        Writer writer(output, capacity);
+        writer.byte(0x1e);
+        writer.byte(0x20);                  // D_KEYEXPR, key given in full
+        writer.integer(keyExprId);
+        writer.byte(0);
+        writer.string(key);
+        return writer.size();
+    }
+
+    static size_t undeclareKeyExpr(uint8_t* output, size_t capacity, uint32_t keyExprId)
+    {
+        Writer writer(output, capacity);
+        writer.byte(0x1e);
+        writer.byte(0x01);                  // U_KEYEXPR
+        writer.integer(keyExprId);
+        return writer.size();
+    }
+
+    /// @brief Declare a queryable (a service server) on a previously declared
+    /// key-expression id, complete=true - byte for byte what rmw_zenoh declares
+    /// (`c4 <id> <keyexpr> 21 01`: body D_QUERYABLE|M|Z, then the QueryableInfo
+    /// extension with complete=1).
+    static size_t declareQueryable(uint8_t* output, size_t capacity, uint32_t queryableId, uint32_t keyExprId)
+    {
+        if (keyExprId == 0)
+            return 0;
+        Writer writer(output, capacity);
+        writer.byte(0x1e);
+        writer.byte(0xc4);                  // D_QUERYABLE | M | Z
+        writer.integer(queryableId);
+        writer.integer(keyExprId);          // wire expr: our declared id, no suffix
+        writer.byte(0x21);                  // ext QueryableInfo (ZInt id 1), last
+        writer.byte(0x01);                  // complete = 1, distance = 0
+        return writer.size();
+    }
+
+    static size_t undeclareQueryable(uint8_t* output, size_t capacity, uint32_t queryableId)
+    {
+        Writer writer(output, capacity);
+        writer.byte(0x1e);
+        writer.byte(0x05);                  // U_QUERYABLE
+        writer.integer(queryableId);
+        return writer.size();
+    }
+
     /// @brief Withdraw a subscriber
     static size_t undeclareSubscriber(uint8_t* output, size_t capacity, uint32_t subscriberId)
     {
@@ -175,6 +227,151 @@ public:
         }
         writer.integer(static_cast<uint32_t>(payloadSize));
         writer.bytes(payload, payloadSize);
+        return writer.size();
+    }
+
+    /// @brief One service request arriving from the router (a REQUEST
+    /// carrying a QUERY).  The router names our key by the key-expression id
+    /// we declared, so `keyId` is how the request is matched to a service.
+    /// `payload` is the CDR request (the query body minus its encoding
+    /// prefix); `attachment` is the client's 33-byte attachment, whose
+    /// sequence number the reply must echo.  Borrowed from the receive buffer.
+    struct RequestMessage
+    {
+        uint32_t requestId = 0;
+        uint32_t keyId = 0;
+        std::string_view key;           ///< Suffix when the router adds one (S0 capture: none)
+        uint32_t timeoutMs = 0;         ///< 0 when the client sent none
+        std::string_view payload;
+        std::string_view attachment;
+    };
+
+    /// @brief Parse one REQUEST from a peer.  Everything the device does not
+    /// use (QoS, target, budget, consolidation, parameters) is stepped over.
+    /// @return bytes consumed, or 0 if this is not a well-formed REQUEST+QUERY
+    static size_t readRequest(const uint8_t* input, size_t length, RequestMessage& output)
+    {
+        Cursor reader(input, length);
+        uint8_t header = 0;
+        if (!reader.byte(header) || (header & 0x1f) != 0x1c)
+            return 0;
+        RequestMessage message;
+        if (!reader.number(message.requestId))
+            return 0;
+        uint32_t keyId = 0;
+        if (!reader.number(keyId) || keyId > 65535)
+            return 0;
+        message.keyId = keyId;
+        if (header & 0x20)
+        {
+            uint32_t size = 0;
+            const uint8_t* start = nullptr;
+            if (!reader.number(size) || size == 0 || size > MAX_KEY_SIZE || !reader.bytes(size, start))
+                return 0;
+            message.key = std::string_view(reinterpret_cast<const char*>(start), size);
+        }
+        else if (keyId == 0)
+            return 0;
+        // Message extensions: capture the timeout (id 6), skip the rest
+        std::string_view unused;
+        uint64_t timeout = 0;
+        if (!reader.requestExtensions((header & 0x80) != 0, unused, unused, 6, &timeout))
+            return 0;
+        message.timeoutMs = static_cast<uint32_t>(timeout);
+
+        uint8_t body = 0;
+        if (!reader.byte(body) || (body & 0x1f) != 0x03)   // QUERY
+            return 0;
+        if (body & 0x20)
+        {
+            uint32_t consolidation = 0;
+            if (!reader.number(consolidation))
+                return 0;
+        }
+        if (body & 0x40)
+        {
+            uint32_t size = 0;
+            const uint8_t* start = nullptr;
+            if (!reader.number(size) || size > MAX_KEY_SIZE || !reader.bytes(size, start))
+                return 0;
+        }
+        // Query extensions: body (id 3: encoding then CDR) and attachment (id 5)
+        std::string_view bodyExt;
+        if (!reader.requestExtensions((body & 0x80) != 0, bodyExt, message.attachment, 0, nullptr))
+            return 0;
+        if (!bodyExt.empty())
+        {
+            Cursor value(reinterpret_cast<const uint8_t*>(bodyExt.data()), bodyExt.size());
+            uint32_t encoding = 0;
+            if (!value.number(encoding))
+                return 0;
+            if (encoding & 1)
+            {
+                uint32_t schemaSize = 0;
+                const uint8_t* schema = nullptr;
+                if (!value.number(schemaSize) || !value.bytes(schemaSize, schema))
+                    return 0;
+            }
+            message.payload = bodyExt.substr(value.position());
+        }
+        output = message;
+        return reader.position();
+    }
+
+    /// @brief Encode the reply to a request: a RESPONSE carrying a REPLY that
+    /// wraps a Put with the CDR response and an attachment echoing the
+    /// request's sequence number - the shape a real rmw_zenoh server sends
+    /// (S0 fixtures), minus the optional QoS and ResponderId extensions.
+    /// Send writeResponseFinal() straight after.
+    static size_t writeReply(uint8_t* output, size_t capacity, uint32_t requestId, std::string_view key,
+                             const uint8_t* payload, size_t payloadSize,
+                             const uint8_t* attachment, size_t attachmentSize)
+    {
+        if (!validKey(key) || payloadSize > MAX_PAYLOAD_SIZE || attachmentSize > MAX_ATTACHMENT_SIZE ||
+            (!payload && payloadSize) || (!attachment && attachmentSize))
+            return 0;
+        Writer writer(output, capacity);
+        writer.byte(0x7b);                  // RESPONSE | N | M
+        writer.integer(requestId);
+        writer.byte(0);
+        writer.string(key);
+        writer.byte(0x04);                  // REPLY, no consolidation, no extensions
+        writer.byte(attachmentSize ? 0x81 : 0x01);   // Put, Z when the attachment follows
+        if (attachmentSize)
+        {
+            writer.byte(0x43);              // attachment extension, last
+            writer.integer(static_cast<uint32_t>(attachmentSize));
+            writer.bytes(attachment, attachmentSize);
+        }
+        writer.integer(static_cast<uint32_t>(payloadSize));
+        writer.bytes(payload, payloadSize);
+        return writer.size();
+    }
+
+    /// @brief Refuse a request: a RESPONSE carrying an ERR body with a text
+    /// reason.  The client sees the call fail rather than time out.
+    static size_t writeReplyError(uint8_t* output, size_t capacity, uint32_t requestId, std::string_view key,
+                                  std::string_view reason)
+    {
+        if (!validKey(key) || reason.size() > MAX_ATTACHMENT_SIZE)
+            return 0;
+        Writer writer(output, capacity);
+        writer.byte(0x7b);
+        writer.integer(requestId);
+        writer.byte(0);
+        writer.string(key);
+        writer.byte(0x05);                  // ERR, no extensions
+        writer.integer(0);                  // encoding: default
+        writer.string(reason);
+        return writer.size();
+    }
+
+    /// @brief Close a request; the router forwards it as the end of the reply
+    static size_t writeResponseFinal(uint8_t* output, size_t capacity, uint32_t requestId)
+    {
+        Writer writer(output, capacity);
+        writer.byte(0x1a);                  // RESPONSE_FINAL, no extensions
+        writer.integer(requestId);
         return writer.size();
     }
 
@@ -386,6 +583,44 @@ private:
                     if ((header & 0x7f) == 0x43)
                         attachment = std::string_view(reinterpret_cast<const char*>(_input + _offset),
                                                       static_cast<size_t>(value));
+                    _offset += static_cast<size_t>(value);
+                }
+                more = (header & 0x80) != 0;
+            }
+            return true;
+        }
+
+        /// @brief Walk a request's extensions.  Buffer extensions with ids
+        /// `3` and `5` are returned (on a QUERY body those are the query body
+        /// and the attachment); the integer extension `wantInt` is returned
+        /// in `intValue`; everything else, mandatory or not, is stepped over
+        /// for the same reason as in sampleExtensions().  The extension id is
+        /// the low four bits: bit 0x10 is the mandatory flag (a Target
+        /// extension arrives as 0xb4 = Z | ZInt | mandatory | id 4).
+        bool requestExtensions(bool more, std::string_view& bufId3, std::string_view& bufId5,
+                               uint8_t wantInt, uint64_t* intValue)
+        {
+            for (size_t count = 0; more; ++count)
+            {
+                uint8_t header = 0;
+                uint64_t value = 0;
+                if (count == 16 || !byte(header) || (header & 0x60) == 0x60)
+                    return false;
+                if ((header & 0x60) && !integer(value))
+                    return false;
+                const uint8_t id = header & 0x0f;
+                if ((header & 0x60) == 0x20 && intValue && id == wantInt)
+                    *intValue = value;
+                if ((header & 0x60) == 0x40)
+                {
+                    if (value > _length - _offset || value > MAX_PAYLOAD_SIZE)
+                        return false;
+                    const std::string_view view(reinterpret_cast<const char*>(_input + _offset),
+                                                static_cast<size_t>(value));
+                    if (id == 3)
+                        bufId3 = view;
+                    else if (id == 5)
+                        bufId5 = view;
                     _offset += static_cast<size_t>(value);
                 }
                 more = (header & 0x80) != 0;

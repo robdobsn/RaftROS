@@ -174,6 +174,28 @@ inline const char* AutoPubClassMap_typeHash(AutoPubMsgKind kind)
     }
 }
 
+/// @brief ROS 2 type hash of a *service* type, by its wire type name
+/// (`<pkg>::srv::dds_::<Srv>_` - the response type name with `Response_`
+/// stripped, which is what rmw_zenoh puts in a service key).  Values are the
+/// service entries of the rosidl type descriptions shipped with ROS 2 Jazzy
+/// (`/opt/ros/jazzy/share/<pkg>/srv/<Srv>.json`).
+/// @return Static literal, or nullptr for a type not in the table.
+inline const char* AutoPubClassMap_serviceTypeHash(const char* wireType)
+{
+    struct Entry { const char* type; const char* hash; };
+    static const Entry table[] = {
+        {"std_srvs::srv::dds_::Trigger_", "RIHS01_eeff2cd6fa5ad9d27cdf4dec64818317839b62f212a91e6b5304b634b2062c5f"},
+        {"std_srvs::srv::dds_::SetBool_", "RIHS01_abe9e4bb6b41b40e6789712c00ec8871923e089af3f667a79992a428cff2da0a"},
+        {"std_srvs::srv::dds_::Empty_",   "RIHS01_5888399dedec5ccc85ea6451949fd2c9f97bfdf963f9a588821639fcd31b5d19"},
+    };
+    if (!wireType)
+        return nullptr;
+    for (const auto& entry : table)
+        if (std::strcmp(entry.type, wireType) == 0)
+            return entry.hash;
+    return nullptr;
+}
+
 /// @brief Result of a class-map lookup.  `primary*` is always populated unless
 ///        `excluded == true`.  `secondary*` is populated only for composite
 ///        two-writer rules (TEMP+RH, PRES+TEMP).

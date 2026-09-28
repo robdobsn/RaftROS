@@ -36,6 +36,7 @@ COPY components/RaftROS/Zenoh/ZenohStreamFramer.h components/RaftROS/Zenoh/Zenoh
 COPY components/RaftROS/CDR/CDREncoder.h components/RaftROS/CDR/CDREncoder.cpp include/CDR/
 COPY components/RaftROS/AutoPub/AutoPubCDRSerializer.h components/RaftROS/AutoPub/AutoPubCDRSerializer.cpp components/RaftROS/AutoPub/AutoPubClassMap.h components/RaftROS/AutoPub/AutoPubSampleRunner.h include/AutoPub/
 COPY linux_unit_tests/zenoh_session_tests.cpp linux_unit_tests/zenoh_session_probe.cpp ./
+COPY linux_unit_tests/fixtures ./fixtures
 RUN g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude zenoh_session_tests.cpp -o zenoh_session_tests \
     && ./zenoh_session_tests \
     && g++ -std=c++17 -Wall -Wextra -Werror -pedantic -Iinclude -Iinclude/CDR zenoh_session_probe.cpp include/CDR/CDREncoder.cpp include/AutoPub/AutoPubCDRSerializer.cpp -o zenoh_session_probe

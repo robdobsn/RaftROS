@@ -143,6 +143,17 @@ hash table.
 *Gate:* the S0 fixtures parse and re-encode byte-for-byte; every truncation of
 a request is rejected; `make zenoh-session-test` and `zenoh-autopub-test`
 green; mutation check on the request parser as was done for the pool.
+**Met 2026-09-28:** `declareKeyExpr`/`undeclareKeyExpr`,
+`declareQueryable`/`undeclareQueryable` (byte for byte `c4 <id> <keyexpr> 21 01`),
+`readRequest`, `writeReply`, `writeReplyError`, `writeResponseFinal`; the
+session's `RequestCallback`; `EndpointKind::Service`/`Client`;
+`AutoPubClassMap_serviceTypeHash`. Both captured requests parse completely
+(request id, key id 30/32, 600 s timeout, CDR payload, 33-byte attachment),
+every truncation is rejected, a request with no handler is skipped not fatal.
+Session suite 1294 passed. Mutations caught: attachment read from the wrong
+extension id (1 failure), encoding prefix left on the payload (3), queryable
+declared without `complete` (1). Our reply omits the optional QoS and
+ResponderId extensions a real server adds; S3 confirms the client accepts it.
 
 **S2 - Shared service core (host only).** `AutoPub/AutoPubServiceRegistry.h`:
 slots of (ROS service name, wire type, hash, handler, state), the deferred
