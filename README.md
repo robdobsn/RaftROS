@@ -303,7 +303,9 @@ sudo chown $USER ~/raft_rtps.pcap
 - `devdocs/` — design overview, development status, and implementation plan.
   Start with `RaftROS-zenoh-milestone-results.md` (measured results: loop
   budget, memory, the 12 h soak, defects fixed) and
-  `RaftROS-services-assessment.md` (what services would need, per transport).
+  `RaftROS-services-assessment.md` (what services would need, per transport)
+  and `RaftROS-services-implementation-plan.md` (the plan: Zenoh server-side
+  services in seven slices with gates).
 
 ## Dependencies
 
