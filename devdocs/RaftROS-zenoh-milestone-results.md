@@ -1,0 +1,125 @@
+# RaftROS Zenoh Milestone: Measured Results
+
+This is the findings record for the initial Zenoh milestone (completed
+2026-09-28): what was measured, on what, with what result. The dated sections
+of [RaftROS-development-status.md](RaftROS-development-status.md) hold the
+evidence and the fixes behind each number; this document is the summary.
+
+**Hardware and setup for every figure below:** Adafruit ESP32-S3 TFT Feather,
+VL6180 range sensor on the STEMMA QT connector (I2C 0x29), WiFi at RSSI -82 to
+-66, ESP-IDF 6.0.2. ROS 2 Jazzy on an Ubuntu host on the same network; Zenoh
+runs through `rmw_zenohd` (`ros-jazzy-rmw-zenoh-cpp` 0.2.10), RTPS is checked
+against both CycloneDDS and FastDDS. "Under load" means a ROS 2 subscriber
+actually consuming the device's topic, not the idle figures the project
+carried before 2026-09-26.
+
+## What works, on both transports
+
+| Capability | RTPS | Zenoh | Verified with |
+| --- | --- | --- | --- |
+| Node in the ROS graph | yes | yes | `ros2 node list`, `ros2 node info` |
+| Auto-published bus devices | yes | yes | `ros2 topic echo /raft/range_1_29` |
+| `/chatter` publisher | yes | yes | `ros2 topic echo /chatter` |
+| String subscriptions, per-topic routing | yes | yes | `ros2 topic pub /chatter_in`, `/chatter_in2` |
+| QoS profiles, including subscriptions, from `qosProfiles` | yes | yes | `ros2 topic info -v` shows the profile |
+| Device hot-plug (withdraw, fresh endpoint on return) | not re-tested | yes | graph watcher + `rosstat` |
+| Reconnect after router/session loss | n/a | yes | tokens re-declared, sequence continues |
+
+The application code is identical for both: the transport is a build-time
+choice (`CONFIG_RAFTROS_BACKEND_ZENOH`, the default, or `..._RTPS`), and the
+example's `MainSysMod` has no transport conditionals.
+
+## Loop budget
+
+The Raft contract for a SysMod is 10 ms average / 50 ms worst case per pass.
+
+| Under an active subscriber | RTPS before fix | RTPS after | Zenoh |
+| --- | --- | --- | --- |
+| Worst RaftROS pass | 82 ms (breach) | 14 ms | 2.4 ms |
+| Worst whole-loop pass | 54 ms | 17 ms | 3.0 ms |
+| Whole-loop average | 3.0-5.3 ms | 2.8-4.3 ms | **0.60 ms** |
+| Samples delivered | 4.8 Hz | 4.8 Hz | 4.2 Hz range + 1 Hz chatter, none lost |
+
+Two numbers underneath these matter more than the table:
+
+- **A UDP datagram costs ~0.8 ms of main-loop time on this board (up to
+  1.8 ms).** Measured across 1175 sends via lwIP `sendto` at RSSI -82; the
+  spread is narrow, so it is inherent per-packet cost through lwIP and the WiFi
+  driver, not blocking on a full queue - a non-blocking socket would not help.
+  Budget *datagrams per pass*, not packets parsed.
+- RTPS breached the contract because `recvMetatraffic` bounded itself by packet
+  count (32), and a received ACKNACK can trigger a send. It now carries a time
+  budget (6 ms; SPDP 3 ms); deferred work waits in the socket buffer, which RTPS
+  tolerates through HEARTBEAT/ACKNACK.
+
+Zenoh is an order of magnitude cheaper on the loop for a structural reason: it
+sends at most one datagram per pass by construction, where RTPS fans out to
+every peer within a pass.
+
+## Memory
+
+| | RTPS | Zenoh |
+| --- | --- | --- |
+| App image | 1268 kB (28% of the OTA slot free) | 1258 kB (29% free) |
+| Free heap, fresh boot, under load | 178.5 kB | 168.7 kB |
+| Main-task stack headroom | 6280 B | 5480 B |
+
+Zenoh pays about 10 kB of RAM for its loop cost, close to the 11 kB its 16
+endpoint slots reserve for key expressions and liveliness tokens.
+
+## Twelve-hour soak (Zenoh, 2026-09-27/28)
+
+`GET /api/rosstat` sampled once a minute from the ROS host; 675 samples
+(11.2 h) after the last reflash.
+
+| | Result |
+| --- | --- |
+| Session | one, for the whole run; 0 connect failures, 0 re-declares |
+| Free heap | 177.8 kB -> 176.9 kB; trend **-2 bytes/hour**; first-hour and last-hour means 105 B apart |
+| Minimum free heap | 143.5 kB, reached within 12 minutes of boot and never lower again |
+| Stack headroom | never below 5540 B |
+| Published | 238,425 samples at 5.9/s, continuous; 0 inbound dropped |
+
+**Reading:** there is no leak. The earlier figure that prompted the soak
+(145.7 kB minimum after a day of tests) was the transient low-water mark, which
+sits ~34 kB below steady state and is reached early and once. So the headroom to
+budget against on this load is **~143 kB**, not the 177 kB steady figure; and
+`heapFreeB`'s trend, not `heapMinB`, is the leak indicator.
+
+## Router reachability
+
+The router address is layered - Kconfig default < `RaftROS.routerHost` in
+SysTypes < a settings overlay posted to `/api/postsettings/reboot` - and a
+device that cannot reach it logs `ROUTER UNREACHABLE` after three attempts:
+the address, whether the host answered (no router listening) or not (wrong
+address), whether the address is the built-in default set for another network,
+and the `curl` line to change it. Both diagnoses were captured on hardware.
+
+## Defects found on the way, all fixed
+
+- The shared descriptor carried a DDS-mangled topic (`rt/...`), which Zenoh
+  rejected; host tests could not have caught it because both RTPS halves agreed.
+- A real router's `Put` carries timestamp and encoding fields before its
+  extensions, in three encodings; misreading them cost the session on every
+  sample. The captured bytes are now a test.
+- A publish with a stale clock made the session's lease check wrap; the backend
+  now takes the time every pass and the session compares rather than subtracts.
+- The liveliness writer sent sequence number 0 on the initial announce (invalid
+  RTPS); the counter starts at 1 and the builder refuses 0.
+- The long-standing "one malformed SEDP packet per participant" was the
+  initial-announce `ReusePrevious` step sending a stale shared buffer with the
+  SPDP length - only with peers that ACKNACK between announce steps, which is
+  why `ros2 topic list` never showed it and `ros2 topic info -v` always did.
+- RaftCore: `RaftJsonNVS` read NVS from a global constructor before the NVS
+  initialiser in another translation unit had run, so persisted settings never
+  loaded. Fixed upstream (`b8e1f9b`, `5494416`).
+
+## Not done in this milestone
+
+- Services and parameters - see
+  [RaftROS-services-assessment.md](RaftROS-services-assessment.md).
+- Runtime transport switching (deferred by design; one backend per image).
+- Hot-plug was re-verified on Zenoh only; RTPS hot-plug was verified in an
+  earlier phase and not repeated after the shared pipeline extraction.
+- The 17.7 kB transient heap dip 12 minutes into the soak was not attributed;
+  it coincided with REST and graph-tool queries and never recurred.
