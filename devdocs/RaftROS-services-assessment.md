@@ -2,7 +2,8 @@
 
 Written 2026-09-28, after the initial Zenoh milestone. This records what exists
 and what a services implementation would need, so a plan can be written against
-facts. It is deliberately not the plan.
+facts. It is deliberately not the plan; the plan is
+[RaftROS-services-implementation-plan.md](RaftROS-services-implementation-plan.md).
 
 ## What exists today
 
