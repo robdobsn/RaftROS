@@ -161,13 +161,28 @@ pRaftROS->addService("/raft_esp32/chatter_enable", "std_srvs::srv::dds_::SetBool
     });
 ```
 
-A handler that needs a bus transaction returns `Deferred` and calls
-`completeService(token, reply)` from a later loop pass; the request is
-answered with an error at the client's timeout if that never happens. The
-types this build can serve are `std_srvs` `Trigger`, `SetBool` and `Empty`;
-up to four services, four requests in flight. `GET /api/rosstat` counts
-`svcAccepted`, `svcCompleted`, `svcDeferred`, `svcTimedOut`, `svcRefused` and
-`svcUnknownKey`.
+A handler that needs the bus cannot wait for it - bus transactions happen on
+the bus task, and a handler runs on the main loop. It returns `Deferred` and
+the request is completed from a later loop pass with
+`completeService(token, reply)`. The third service shows this:
+
+```bash
+ros2 service call /raft_esp32/range std_srvs/srv/Trigger
+#   success=True, message='range 255.0 mm valid=1, read 82 ms after the call'
+```
+
+The handler parks the request; `MainSysMod::loop()` completes it from the
+first VL6180 poll result that lands after the call (a data callback on the
+bus task bumps a counter; the loop decodes the latest result with
+`getLatestDecodedPollResponse`). The reading is taken after the call, not
+served from a cache. A second call while one is parked is refused; with the
+sensor unplugged no poll result comes and RaftROS answers the client with an
+error at the timeout (5 s) rather than leaving it hanging.
+
+The types this build can serve are `std_srvs` `Trigger`, `SetBool` and
+`Empty`; up to four services, four requests in flight. `GET /api/rosstat`
+counts `svcAccepted`, `svcCompleted`, `svcDeferred`, `svcTimedOut`,
+`svcRefused` and `svcUnknownKey`.
 
 With no router to hand, `tools/` has two stand-ins that need no ROS install:
 

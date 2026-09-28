@@ -220,6 +220,17 @@ deferred path, proving a handler never blocks the loop.
 *Gate:* the loop's worst pass during calls is unchanged from S3; the reply
 carries a fresh reading; a deferred call with the sensor unplugged is answered
 `ERR` at the timeout, not hung.
+**Met 2026-09-28**, except the sensor-unplugged case, which needs hands on
+the board and is still to be run (the timeout path itself is host-tested).
+`/raft_esp32/range` (Trigger) in the example: the handler parks the request
+and returns `Deferred`; a DeviceManager data callback on the bus task bumps a
+counter per VL6180 poll result; `MainSysMod::loop()` completes the request
+from the first result after the call, decoded with
+`getLatestDecodedPollResponse`. 41 calls answered with readings taken 39-100
+ms after the call (the sensor polls at ~4 Hz); a second call while one is
+parked is refused and the CLI reports the `ERR` reply. Worst pass during the
+calls: receive 0.6 ms socket read + 0.4 ms parse for a 64-byte request; the
+loop maxima stayed at the one-console-line figures (11-13 ms).
 
 **S6 (decision gate, not scheduled) - RTPS services.** DDS-RPC: `rq/<name>Request`
 reliable reader and `rr/<name>Reply` writer per service, SEDP announce of both,

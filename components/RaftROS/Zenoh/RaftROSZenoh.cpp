@@ -418,10 +418,23 @@ void RaftROS::serviceSession(uint32_t nowMs)
 /// @brief Read whatever has arrived, once.  @return false if the connection died
 bool RaftROS::receiveFromRouter(uint32_t nowMs)
 {
+    const int64_t recvStartUs = esp_timer_get_time();
     const int count = recv(_sock, _rxBuf, sizeof(_rxBuf), 0);
+    const int64_t parseStartUs = esp_timer_get_time();
     if (count > 0)
     {
-        if (!_session.receive(_rxBuf, (size_t)count, nowMs, onDiscoveryThunk, this, onSampleThunk, onRequestThunk))
+        const bool ok = _session.receive(_rxBuf, (size_t)count, nowMs, onDiscoveryThunk, this, onSampleThunk, onRequestThunk);
+        // Place a new worst receive pass: the socket read / the parse and
+        // callbacks, and how many bytes it was
+        const uint32_t totalUs = (uint32_t)(esp_timer_get_time() - recvStartUs);
+        if (totalUs > _loopRxPartsMaxUs)
+        {
+            _loopRxPartsMaxUs = totalUs;
+            _loopRxMaxRecvUs = (uint32_t)(parseStartUs - recvStartUs);
+            _loopRxMaxParseUs = (uint32_t)(esp_timer_get_time() - parseStartUs);
+            _loopRxMaxBytes = (uint32_t)count;
+        }
+        if (!ok)
         {
             LOG_W(MODULE_PREFIX, "session rejected router data error=%d", (int)_session.error());
             closeConnection("bad router data");
@@ -1168,7 +1181,7 @@ String RaftROS::getStatusJSON() const
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
              R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u,)"
              R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d,)"
-             R"("heapFreeB":%u,"heapMinB":%u,"loopMaxUs":%u,"loopMaxDrainUs":%u,"loopMaxConnUs":%u,"loopMaxRxUs":%u,"loopMaxTxUs":%u,"loopMaxTxParts":"%u/%u/%u",)"
+             R"("heapFreeB":%u,"heapMinB":%u,"loopMaxUs":%u,"loopMaxDrainUs":%u,"loopMaxConnUs":%u,"loopMaxRxUs":%u,"loopMaxTxUs":%u,"loopMaxTxParts":"%u/%u/%u","loopMaxRxParts":"%u/%u/%uB",)"
              R"("services":%u,"svcAccepted":%u,"svcCompleted":%u,"svcDeferred":%u,"svcTimedOut":%u,)"
              R"("svcRefused":%u,"svcUnknownKey":%u})",
              _isEnabled ? "true" : "false",
@@ -1200,6 +1213,7 @@ String RaftROS::getStatusJSON() const
              (unsigned)_loopPassMaxUs, (unsigned)_loopDrainMaxUs, (unsigned)_loopConnMaxUs,
              (unsigned)_loopRxMaxUs, (unsigned)_loopTxMaxUs,
              (unsigned)_loopTxMaxSessionUs, (unsigned)_loopTxMaxStepUs, (unsigned)_loopTxMaxFlushUs,
+             (unsigned)_loopRxMaxRecvUs, (unsigned)_loopRxMaxParseUs, (unsigned)_loopRxMaxBytes,
              (unsigned)_services.inUseCount(),
              (unsigned)svcStats.accepted, (unsigned)svcStats.completed,
              (unsigned)svcStats.deferred, (unsigned)svcStats.timedOut,
