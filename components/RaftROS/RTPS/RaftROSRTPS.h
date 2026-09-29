@@ -35,6 +35,7 @@
 #include "AutoPub/AutoPubPublisherPool.h"
 #include "AutoPub/AutoPubDeviceSource.h"
 #include "AutoPub/AutoPubServiceRegistry.h"
+#include "AutoPub/AutoPubParamCodec.h"
 #include "RaftThreading.h"
 #include "RaftDeviceConsts.h"
 #include "DeviceTypeRecord.h"
@@ -106,6 +107,23 @@ public:
         return -1;
     }
     bool completeService(uint32_t /*token*/, const ServiceReply& /*reply*/) { return false; }
+
+    // ---- Parameters ----
+    // Not served on the RTPS backend (parameters are services, and services
+    // are Zenoh-only by decision, 2026-09-29).  The calls exist so one
+    // application compiles against either transport: declarations are
+    // refused and parameter() finds nothing, so callers fall back to defaults.
+    using ParamValue = RaftRuntime::AutoPub::AutoPubParamValue;
+    using ParamType = RaftRuntime::AutoPub::AutoPubParamType;
+    using ParamSetCallback = std::function<bool(const ParamValue&, const char*&)>;
+    template <typename T>
+    bool declareParameter(const char* name, T /*value*/, const char* /*description*/ = "",
+                          bool /*readOnly*/ = false, ParamSetCallback /*onSet*/ = {})
+    {
+        LOG_W(MODULE_PREFIX, "declareParameter '%s': parameters are not served by the RTPS backend", name ? name : "");
+        return false;
+    }
+    const ParamValue* parameter(const char* /*name*/) const { return nullptr; }
     void setChatterEnabled(bool enabled) { _chatterEnabled = enabled; }
     bool isChatterEnabled() const { return _chatterEnabled; }
     uint8_t attachedDeviceCount() const { return _autoPubSource.attachedCount(); }

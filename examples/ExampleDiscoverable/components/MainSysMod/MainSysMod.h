@@ -10,7 +10,6 @@
 #include "RaftSysMod.h"
 #include "RaftDeviceConsts.h"
 #include "RaftBusDevicesIF.h"
-#include <atomic>
 
 class MainSysMod : public RaftSysMod
 {
@@ -52,15 +51,17 @@ private:
 
     // /raft_esp32/range: a deferred service.  The handler cannot read the
     // sensor itself (that is a bus transaction on the bus task), so it parks
-    // the request and the loop completes it from the first poll result that
-    // arrives afterwards - a reading taken after the call, not a cached one.
+    // the request and the loop completes it from the first poll result newer
+    // than the call - a reading taken after the call, not a cached one.
+    // No data callback: the bus holds one per device and the auto-publisher
+    // owns it; the loop peeks the latest decoded result instead.
     RaftDeviceID _rangeDeviceID;                  ///< The VL6180, once identified
     bool _rangeAttached = false;
-    std::atomic<uint32_t> _rangeSampleSeq{0};     ///< Bumped by the bus task per poll result
     bool _rangeRequestPending = false;
     uint32_t _rangeToken = 0;
-    uint32_t _rangeSeqAtRequest = 0;
+    uint32_t _rangePollTimeAtRequest = 0;         ///< timeMs of the latest poll when the call arrived
     uint32_t _rangeRequestMs = 0;
+    bool peekRange(struct poll_VL6180& poll);
     RaftBusDeviceDecodeState _rangeDecodeState;
     char _rangeMsg[96] = {};
     void serviceRangeRequest();

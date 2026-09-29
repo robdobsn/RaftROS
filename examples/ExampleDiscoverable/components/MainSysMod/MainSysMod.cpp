@@ -105,7 +105,8 @@ void MainSysMod::setup()
                         return RaftROS::ServiceOutcome::Refused;
                     }
                     _rangeToken = request.token;
-                    _rangeSeqAtRequest = _rangeSampleSeq.load();
+                    poll_VL6180 latest = {};
+                    _rangePollTimeAtRequest = peekRange(latest) ? latest.timeMs : 0;
                     _rangeRequestMs = millis();
                     _rangeRequestPending = true;
                     return RaftROS::ServiceOutcome::Deferred;
@@ -136,7 +137,7 @@ void MainSysMod::setup()
         }
 
         // The range service's view of the sensor: which device it is (status
-        // callbacks) and when a poll result has landed (data callbacks, bus task)
+        // callbacks - a list, so this does not displace anyone else's)
         DeviceManager* pDevMan = getSysManager()->getDeviceManager();
         if (pDevMan)
         {
@@ -155,11 +156,17 @@ void MainSysMod::setup()
                     else if (addrStatus.isChange)
                         _rangeAttached = false;
                 });
-            pDevMan->registerForDeviceData(RANGE_DEVICE_TYPE,
-                [this](uint16_t, std::vector<uint8_t>, const void*) { _rangeSampleSeq.fetch_add(1); },
-                /*minTimeBetweenReportsMs=*/0);
         }
     }
+}
+
+/// @brief The latest decoded VL6180 poll, without consuming it
+bool MainSysMod::peekRange(poll_VL6180& poll)
+{
+    RaftBus* pBus = _rangeAttached ? raftBusSystem.getBusByNumber(_rangeDeviceID.getBusNum()) : nullptr;
+    RaftBusDevicesIF* pDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
+    return pDevicesIF && pDevicesIF->getLatestDecodedPollResponse(_rangeDeviceID.getAddress(),
+                                                                  &poll, sizeof(poll), _rangeDecodeState);
 }
 
 /// @brief Complete a parked /raft_esp32/range request once a poll result has
@@ -175,20 +182,16 @@ void MainSysMod::serviceRangeRequest()
         _rangeRequestPending = false;
         return;
     }
-    if (_rangeSampleSeq.load() == _rangeSeqAtRequest)
+    poll_VL6180 poll = {};
+    if (!peekRange(poll) || poll.timeMs == _rangePollTimeAtRequest)
     {
-        // Nothing new from the bus yet.  RaftROS answers the client with an
+        // Nothing newer from the bus yet.  RaftROS answers the client with an
         // error at the timeout; drop our side once that has passed.
         if (Raft::isTimeout(millis(), _rangeRequestMs, 10000))
             _rangeRequestPending = false;
         return;
     }
     RaftROS::ServiceReply reply;
-    poll_VL6180 poll = {};
-    RaftBus* pBus = _rangeAttached ? raftBusSystem.getBusByNumber(_rangeDeviceID.getBusNum()) : nullptr;
-    RaftBusDevicesIF* pDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
-    if (pDevicesIF && pDevicesIF->getLatestDecodedPollResponse(_rangeDeviceID.getAddress(),
-                                                               &poll, sizeof(poll), _rangeDecodeState))
     {
         // The rangeOffsetMm parameter (ros2 param set /raft_esp32 rangeOffsetMm 4.5)
         const RaftROS::ParamValue* pOffset = pRaftROS->parameter("rangeOffsetMm");
@@ -196,11 +199,6 @@ void MainSysMod::serviceRangeRequest()
         snprintf(_rangeMsg, sizeof(_rangeMsg), "range %.1f mm (offset %.1f) valid=%d, read %u ms after the call",
                  (double)poll.dist + offsetMm, offsetMm, (int)poll.valid, (unsigned)(millis() - _rangeRequestMs));
         reply.fields.success = true;
-    }
-    else
-    {
-        snprintf(_rangeMsg, sizeof(_rangeMsg), "poll result arrived but could not be decoded");
-        reply.fields.success = false;
     }
     reply.fields.message = _rangeMsg;
     pRaftROS->completeService(_rangeToken, reply);   // false if it already timed out

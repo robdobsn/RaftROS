@@ -52,6 +52,28 @@
 #define WARN_SDSP_SEND_FAILURE
 #define WARN_INVALID_RTPS_HEADER
 
+// One console line per loop pass.  With no host reading the USB-Serial-JTAG
+// console each line stalls the writer ~10 ms whatever its length (measured
+// 2026-09-28 on the ProS3: 1 line 11 ms, 3 lines 32 ms, 5 lines 53 ms), so two
+// lines in one pass already spend twice the average budget.  Runtime lines
+// ask for the pass's slot; one that does not get it is counted instead
+// (`logSuppressed` in rosstat).  Reset at the top of every loop pass.
+namespace
+{
+bool sLogSlotUsed = false;
+uint32_t sLogSuppressed = 0;
+bool logSlot()
+{
+    if (sLogSlotUsed)
+    {
+        ++sLogSuppressed;
+        return false;
+    }
+    sLogSlotUsed = true;
+    return true;
+}
+}
+
 namespace
 {
 
@@ -141,6 +163,7 @@ static_assert(
 // the 200ms sensor sample interval often enough to lose ~5% of auto-published samples.
 // #define RAFTROS_VERBOSE_LOGGING
 #ifdef RAFTROS_VERBOSE_LOGGING
+    #define DEBUG_SEDP_RDI              // per-peer reader-port / partial-discovery detail
     #define DEBUG_SDSP_SEND
     #define DEBUG_SDSP_RECEIVE
     #define DEBUG_SOCKET_CREATION
@@ -265,6 +288,7 @@ void RaftROS::loop()
     // Validate
     if (!_isEnabled)
         return;
+    sLogSlotUsed = false;
 
     // Loop-budget diagnostics.  The Raft contract gives a SysMod 10 ms on
     // average and 50 ms at worst, and the phases below are not all bounded -
@@ -427,7 +451,7 @@ void RaftROS::loop()
     if (passUs > _loopPassMaxUs)
         _loopPassMaxUs = passUs;
     if (passUs >= LOOP_PASS_WARN_US &&
-        Raft::isTimeout(millis(), _lastLoopBudgetLogMs, LOOP_BUDGET_LOG_INTERVAL_MS))
+        Raft::isTimeout(millis(), _lastLoopBudgetLogMs, LOOP_BUDGET_LOG_INTERVAL_MS) && logSlot())
     {
         _lastLoopBudgetLogMs = millis();
         LOG_W(MODULE_PREFIX,
@@ -574,7 +598,8 @@ void RaftROS::sendSPDP()
     if (sent < 0)
     {
 #ifdef WARN_SDSP_SEND_FAILURE
-        LOG_W(MODULE_PREFIX, "sendSPDP sendto failed errno %d", errno);
+        if (logSlot())
+            LOG_W(MODULE_PREFIX, "sendSPDP sendto failed errno %d", errno);
 #endif
     }
     else
@@ -662,7 +687,8 @@ void RaftROS::recvSPDP()
         if (!_spdpHandler.parseAnnouncementMessage(_recvBuf, (uint32_t)n, remote))
         {
 #ifdef WARN_SDSP_PARSE_FAILURE
-            LOG_W(MODULE_PREFIX, "recvSPDP parse FAILED (%d bytes)", n);
+            if (logSlot())
+                LOG_W(MODULE_PREFIX, "recvSPDP parse FAILED (%d bytes)", n);
 #endif
             // FastDDS may send SEDP builtin endpoint DATA on the metatraffic
             // multicast port (7400), which shares this socket with SPDP. If this
@@ -711,9 +737,11 @@ void RaftROS::processDiscoveredParticipant(DiscoveredParticipant& remote, const 
             static uint32_t sLastSender = 0;
             if (parsed != sLastParsed || fromAddr.sin_addr.s_addr != sLastSender)
             {
+                #ifdef DEBUG_SEDP_RDI
                 LOG_I(MODULE_PREFIX,
                       "overriding unreachable SPDP locator %08x with senderIp %s",
                       (unsigned)parsed, inet_ntoa(fromAddr.sin_addr));
+#endif
                 sLastParsed = parsed;
                 sLastSender = fromAddr.sin_addr.s_addr;
             }
@@ -853,7 +881,8 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
     callbacks.onInvalidHeader = [](void*, RTPSRxChannel)
     {
 #ifdef WARN_INVALID_RTPS_HEADER
-        LOG_W(MODULE_PREFIX, "recvMetatraffic invalid RTPS header");
+        if (logSlot())
+            LOG_W(MODULE_PREFIX, "recvMetatraffic invalid RTPS header");
 #endif
     };
     callbacks.onHeartbeat = [](void*, RTPSRxChannel, const uint8_t* writerEID, uint32_t lastSNLow, bool responded, int sentBytes)
@@ -1089,12 +1118,14 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                             if (inlineSub.unicastLocatorPort != 0 &&
                                 dp.rdiReaderUnicastPort != inlineSub.unicastLocatorPort)
                             {
+#ifdef DEBUG_SEDP_RDI
                                 LOG_I(MODULE_PREFIX,
                                       "SEDP inline rdi reader port for participant %02x%02x%02x%02x: %u (was %u)",
                                       dp.guidPrefix[0], dp.guidPrefix[1],
                                       dp.guidPrefix[2], dp.guidPrefix[3],
                                       (unsigned)inlineSub.unicastLocatorPort,
                                       (unsigned)dp.rdiReaderUnicastPort);
+#endif
                                 dp.rdiReaderUnicastPort = inlineSub.unicastLocatorPort;
                             }
                             if (inlineSub.hasReaderGuid)
@@ -1110,11 +1141,13 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                         partial.rdiReaderUnicastPort = inlineSub.unicastLocatorPort;
                         if (inlineSub.hasReaderGuid)
                             (void)addRdiReaderEntityIdCandidate(partial, inlineSub.readerGuid + 12);
+#ifdef DEBUG_SEDP_RDI
                         LOG_I(MODULE_PREFIX,
                               "SEDP inline rdi partial-disc guidPfx=%02x%02x%02x%02x rdiPort=%u",
                               partial.guidPrefix[0], partial.guidPrefix[1],
                               partial.guidPrefix[2], partial.guidPrefix[3],
                               (unsigned)inlineSub.unicastLocatorPort);
+#endif
                         self->processDiscoveredParticipant(partial, from);
                     }
                     return;
@@ -1150,6 +1183,7 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                 return;
             if (parsedSub.hasReaderGuid)
             {
+#ifdef DEBUG_SEDP_RDI
                 LOG_I(MODULE_PREFIX,
                       "SEDP rdi reader guidPfx=%02x%02x%02x%02x readerEID=%02x%02x%02x%02x port=%u",
                       parsedSub.readerGuid[0], parsedSub.readerGuid[1],
@@ -1157,6 +1191,7 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                       parsedSub.readerGuid[12], parsedSub.readerGuid[13],
                       parsedSub.readerGuid[14], parsedSub.readerGuid[15],
                       (unsigned)parsedSub.unicastLocatorPort);
+#endif
             }
             // Locate the matching DiscoveredParticipant by readerGuid prefix
             // (first 12 bytes of the reader GUID == participant guidPrefix).
@@ -1188,11 +1223,13 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                     if (parsedSub.unicastLocatorPort != 0 &&
                         dp.rdiReaderUnicastPort != parsedSub.unicastLocatorPort)
                     {
+#ifdef DEBUG_SEDP_RDI
                         LOG_I(MODULE_PREFIX,
                               "SEDP rdi reader port for participant %02x%02x%02x%02x: %u (was %u)",
                               dp.guidPrefix[0], dp.guidPrefix[1], dp.guidPrefix[2], dp.guidPrefix[3],
                               (unsigned)parsedSub.unicastLocatorPort,
                               (unsigned)dp.rdiReaderUnicastPort);
+#endif
                         dp.rdiReaderUnicastPort = parsedSub.unicastLocatorPort;
                     }
                     if (parsedSub.hasReaderGuid)
@@ -1211,11 +1248,13 @@ void RaftROS::processMetatrafficPacket(const uint8_t* packet, uint32_t packetLen
                 if (parsedSub.hasReaderGuid)
                     (void)addRdiReaderEntityIdCandidate(partial, parsedSub.readerGuid + 12);
                 // leaseDurationSec = 0 → uses DEFAULT_LEASE_TIMEOUT_MS (240 s)
+#ifdef DEBUG_SEDP_RDI
                 LOG_I(MODULE_PREFIX,
                       "SEDP rdi partial-disc guidPfx=%02x%02x%02x%02x rdiPort=%u",
                       partial.guidPrefix[0], partial.guidPrefix[1],
                       partial.guidPrefix[2], partial.guidPrefix[3],
                       (unsigned)parsedSub.unicastLocatorPort);
+#endif
                 self->processDiscoveredParticipant(partial, from);
             }
         }
@@ -1481,7 +1520,8 @@ void RaftROS::handleAcknack(const uint8_t* srcGuidPrefix, const uint8_t* pConten
     };
     callbackInit.unknownRemote = [](void*)
     {
-        LOG_W(MODULE_PREFIX, "  ACKNACK from unknown participant");
+        if (logSlot())
+            LOG_W(MODULE_PREFIX, "ACKNACK from unknown participant");
     };
     callbackInit.getChatterSeq = &RTPSRunnerAdapter_standardGetChatterSeq;
     callbackInit.executeAction = &RTPSRunnerAdapter_standardExecuteAction;
@@ -1860,7 +1900,8 @@ void RaftROS::handleNewParticipant(const DiscoveredParticipant& remote, const st
     {
         char senderIpStr[16] = {0};
         strncpy(senderIpStr, inet_ntoa(senderAddr.sin_addr), sizeof(senderIpStr) - 1);
-        LOG_I(MODULE_PREFIX,
+        if (logSlot())
+            LOG_I(MODULE_PREFIX,
               "handleNewParticipant NEW peer guidPfx=%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x%02x metaPort=%u userPort=%u senderIp=%s autoPubSlotsInUse=%u",
               remote.guidPrefix[0], remote.guidPrefix[1], remote.guidPrefix[2], remote.guidPrefix[3],
               remote.guidPrefix[4], remote.guidPrefix[5], remote.guidPrefix[6], remote.guidPrefix[7],
@@ -2376,11 +2417,11 @@ String RaftROS::getStatusJSON() const
         case ConnState::ANNOUNCING:   stStr = "announcing"; break;
         case ConnState::ACTIVE:       stStr = "active"; break;
     }
-    char buf[400];
+    char buf[460];
     snprintf(buf, sizeof(buf),
              R"({"rslt":"ok","backend":"%s","en":%s,"domId":%d,"node":"%s","ns":"%s","conn":"%s",)"
              R"("disc":%d,"spdpSeq":%llu,"devices":%u,"stackFreeB":%u,"loopMaxUs":%u,"rxDeferrals":%u,)"
-             R"("sends":%u,"sendTotalMs":%u,"sendMaxUs":%u,"heapFreeB":%u,"heapMinB":%u})",
+             R"("sends":%u,"sendTotalMs":%u,"sendMaxUs":%u,"heapFreeB":%u,"heapMinB":%u,"logSuppressed":%u})",
              RAFTROS_BACKEND_NAME,
              _isEnabled ? "true" : "false",
              (int)_domainId,
@@ -2402,7 +2443,8 @@ String RaftROS::getStatusJSON() const
              (unsigned)_sendMaxUs,
              // System heap, not this module's: the figures a long soak reads
              (unsigned)esp_get_free_heap_size(),
-             (unsigned)esp_get_minimum_free_heap_size());
+             (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)sLogSuppressed);
     return buf;
 }
 
