@@ -41,6 +41,9 @@
 #include "runtime/autopub/RTPSAutoPubCDRSerializer.h"
 #include "runtime/autopub/RTPSAutoPubBackend.h"
 #include "AutoPub/AutoPubServiceRegistry.h"
+#include "AutoPub/AutoPubParamCodec.h"
+#include "AutoPub/AutoPubParameterStore.h"
+#include <fstream>
 #include "AutoPub/AutoPubSampleRunner.h"
 #include "runtime/autopub/RTPSAutoPubSampleEmitter.h"
 #include "AutoPub/AutoPubPublisherPool.h"
@@ -558,6 +561,287 @@ int main()
     // request from acceptance to the final without ever blocking the loop.
     //=================================================================
     {
+        printf("Test: parameter codec against the ros2 param capture\n");
+        {
+            using namespace RaftRuntime::AutoPub;
+            auto fixture = [](const char* name) {
+                std::ifstream in(std::string("fixtures/") + name);
+                std::string line, hex;
+                while (std::getline(in, line)) if (!line.empty() && line[0] != '#') hex = line;
+                std::vector<uint8_t> bytes;
+                for (size_t i = 0; i + 1 < hex.size(); i += 2)
+                    bytes.push_back((uint8_t)std::stoul(hex.substr(i, 2), nullptr, 16));
+                return bytes;
+            };
+            uint8_t out[1024];
+            char names[8][AUTOPUB_PARAM_NAME_MAX];
+            uint32_t count = 0;
+            uint64_t depth = 9;
+            // FastCDR (what rclpy serialises with) leaves alignment padding
+            // uninitialised, so a multi-string capture differs from ours only
+            // where we wrote a padding zero.  Equal means: same length, and
+            // every differing byte is one of our zeros - few of them.
+            auto sameButPadding = [](const uint8_t* ours, const std::vector<uint8_t>& captured, uint32_t n) {
+                if (n != captured.size()) return false;
+                uint32_t differing = 0;
+                for (uint32_t i = 0; i < n; ++i)
+                    if (ours[i] != captured[i]) { if (ours[i] != 0) return false; ++differing; }
+                return differing <= n / 16;
+            };
+
+            // ros2 param list: ListParameters {prefixes: [], depth: 0}
+            auto req = fixture("zenoh_param_list_parameters_req_0.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readListRequest(req.data(), req.size(), names, 8, count, depth) &&
+                        count == 0 && depth == 0, "list request: no prefixes, depth 0");
+            TEST_ASSERT(!AutoPubParamCodec_readListRequest(req.data(), req.size() - 1, names, 8, count, depth),
+                        "list request: truncated depth is rejected");
+            const char* listNames[] = {"use_sim_time", "start_type_description_service", "chatterEnable",
+                                       "chatterPeriodMs", "rangeScale", "routerHost"};
+            auto resp = fixture("zenoh_param_list_parameters_resp_0.cdr.hex");
+            uint32_t n = AutoPubParamCodec_writeListResult(out, sizeof(out), listNames, 6, nullptr, 0);
+            TEST_ASSERT(sameButPadding(out, resp, n) && n == 140,
+                        "list response: six names, no prefixes, byte for byte but padding");
+
+            // ros2 param get: GetParameters {names: [x]} -> ParameterValue[]
+            req = fixture("zenoh_param_get_parameters_req_0.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readNames(req.data(), req.size(), names, 8, count) && count == 1 &&
+                        std::strcmp(names[0], "chatterEnable") == 0, "get request: one name");
+            AutoPubParamValue v;
+            v.type = AutoPubParamType::Bool; v.boolValue = true;
+            resp = fixture("zenoh_param_get_parameters_resp_0.cdr.hex");
+            n = AutoPubParamCodec_writeValues(out, sizeof(out), &v, 1);
+            TEST_ASSERT(n == resp.size() && n == 56 && std::memcmp(out, resp.data(), n) == 0,
+                        "get response: bool true is 52 body bytes, byte for byte");
+            v = AutoPubParamValue(); v.type = AutoPubParamType::Integer; v.integerValue = 1000;
+            resp = fixture("zenoh_param_get_parameters_resp_1.cdr.hex");
+            n = AutoPubParamCodec_writeValues(out, sizeof(out), &v, 1);
+            TEST_ASSERT(n == resp.size() && std::memcmp(out, resp.data(), n) == 0, "get response: int64 1000");
+            v = AutoPubParamValue(); v.type = AutoPubParamType::Double; v.doubleValue = 1.5;
+            resp = fixture("zenoh_param_get_parameters_resp_2.cdr.hex");
+            n = AutoPubParamCodec_writeValues(out, sizeof(out), &v, 1);
+            TEST_ASSERT(n == resp.size() && std::memcmp(out, resp.data(), n) == 0, "get response: double 1.5");
+            v = AutoPubParamValue(); v.type = AutoPubParamType::String; std::strcpy(v.stringValue, "192.168.86.192");
+            resp = fixture("zenoh_param_get_parameters_resp_3.cdr.hex");
+            n = AutoPubParamCodec_writeValues(out, sizeof(out), &v, 1);
+            TEST_ASSERT(n == resp.size() && std::memcmp(out, resp.data(), n) == 0, "get response: string");
+
+            // ros2 param dump: one GetParameters with every name, sorted
+            req = fixture("zenoh_param_get_parameters_req_4.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readNames(req.data(), req.size(), names, 8, count) && count == 6 &&
+                        std::strcmp(names[0], "chatterEnable") == 0 && std::strcmp(names[5], "use_sim_time") == 0,
+                        "dump request: six sorted names");
+            TEST_ASSERT(AutoPubParamCodec_readNames(req.data(), req.size(), names, 2, count) && count == 6 &&
+                        std::strcmp(names[1], "chatterPeriodMs") == 0, "names past the caller's slots are counted, not stored");
+            AutoPubParamValue six[6];
+            six[0].type = AutoPubParamType::Bool;
+            six[1].type = AutoPubParamType::Integer; six[1].integerValue = 500;
+            six[2].type = AutoPubParamType::Double; six[2].doubleValue = 2.25;
+            six[3].type = AutoPubParamType::String; std::strcpy(six[3].stringValue, "192.168.86.192");
+            six[4].type = AutoPubParamType::Bool; six[4].boolValue = true;
+            six[5].type = AutoPubParamType::Bool;
+            resp = fixture("zenoh_param_get_parameters_resp_4.cdr.hex");
+            n = AutoPubParamCodec_writeValues(out, sizeof(out), six, 6);
+            TEST_ASSERT(sameButPadding(out, resp, n) && n == 312,
+                        "dump response: six values, 312 bytes, byte for byte but padding");
+
+            // ros2 param set: SetParameters {parameters: [{name, value}]}
+            AutoPubParamEntry entries[4];
+            req = fixture("zenoh_param_set_parameters_req_0.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readSetRequest(req.data(), req.size(), entries, 4, count) && count == 1 &&
+                        std::strcmp(entries[0].name, "chatterEnable") == 0 && entries[0].value.type == AutoPubParamType::Bool &&
+                        !entries[0].value.boolValue && !entries[0].value.hasArrayData, "set request: bool false");
+            req = fixture("zenoh_param_set_parameters_req_1.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readSetRequest(req.data(), req.size(), entries, 4, count) && count == 1 &&
+                        entries[0].value.type == AutoPubParamType::Integer && entries[0].value.integerValue == 500,
+                        "set request: int64 500");
+            req = fixture("zenoh_param_set_parameters_req_2.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readSetRequest(req.data(), req.size(), entries, 4, count) && count == 1 &&
+                        entries[0].value.type == AutoPubParamType::Double && entries[0].value.doubleValue == 2.25,
+                        "set request: double 2.25");
+            req = fixture("zenoh_param_set_parameters_req_3.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readSetRequest(req.data(), req.size(), entries, 4, count) && count == 1 &&
+                        std::strcmp(entries[0].name, "chatterPeriodMs") == 0 && entries[0].value.type == AutoPubParamType::String &&
+                        std::strcmp(entries[0].value.stringValue, "abc") == 0, "set request: a string where an int is held");
+            for (size_t cut = 5; cut < req.size(); cut += 7)
+                TEST_ASSERT(!AutoPubParamCodec_readSetRequest(req.data(), cut, entries, 4, count),
+                            "set request: every truncation is rejected");
+            // A set carrying array data is noted, its contents stepped over
+            {
+                uint8_t arr[128]; CDREncoder e; e.reset(arr, sizeof(arr));
+                e.writeEncapsulationHeader(); e.writeSequenceLength(1); e.writeString("xs");
+                e.writeUint8(7); e.writeBool(false); e.writeInt64(0); e.writeFloat64(0); e.writeString("");
+                e.writeSequenceLength(0); e.writeSequenceLength(0);
+                e.writeSequenceLength(2); e.writeInt64(1); e.writeInt64(2);
+                e.writeSequenceLength(0); e.writeSequenceLength(1); e.writeString("s");
+                TEST_ASSERT(AutoPubParamCodec_readSetRequest(arr, e.getPos(), entries, 4, count) && count == 1 &&
+                            entries[0].value.type == AutoPubParamType::IntegerArray && entries[0].value.hasArrayData,
+                            "set request: array values are recognised and skipped");
+            }
+            // Results
+            AutoPubParamResult ok{true, ""};
+            resp = fixture("zenoh_param_set_parameters_resp_0.cdr.hex");
+            n = AutoPubParamCodec_writeResults(out, sizeof(out), &ok, 1);
+            TEST_ASSERT(n == resp.size() && n == 17 && std::memcmp(out, resp.data(), n) == 0, "set response: success");
+            AutoPubParamResult bad{false, "Wrong parameter type, expected 'Type.INTEGER' got 'Type.STRING'"};
+            resp = fixture("zenoh_param_set_parameters_resp_1.cdr.hex");
+            n = AutoPubParamCodec_writeResults(out, sizeof(out), &bad, 1);
+            TEST_ASSERT(n == resp.size() && std::memcmp(out, resp.data(), n) == 0, "set response: failure with reason");
+            n = AutoPubParamCodec_writeSingleResult(out, sizeof(out), bad);
+            TEST_ASSERT(n == resp.size() - 4 && std::memcmp(out + 4, resp.data() + 8, n - 4) == 0,
+                        "atomic set response: the same result without the sequence length");
+            TEST_ASSERT(AutoPubParamCodec_writeResults(out, 12, &bad, 1) == 0, "a result that does not fit is refused");
+
+            // ros2 param describe
+            req = fixture("zenoh_param_describe_parameters_req_0.cdr.hex");
+            TEST_ASSERT(AutoPubParamCodec_readNames(req.data(), req.size(), names, 8, count) && count == 1 &&
+                        std::strcmp(names[0], "chatterPeriodMs") == 0, "describe request: one name");
+            AutoPubParamDescriptor d{"chatterPeriodMs", AutoPubParamType::Integer, "Period of /chatter in ms", false};
+            resp = fixture("zenoh_param_describe_parameters_resp_0.cdr.hex");
+            n = AutoPubParamCodec_writeDescriptors(out, sizeof(out), &d, 1);
+            TEST_ASSERT(n == resp.size() && std::memcmp(out, resp.data(), n) == 0, "describe response: byte for byte");
+
+            // GetParameterTypes has no capture; its shape is uint8[]
+            const AutoPubParamType types[] = {AutoPubParamType::Bool, AutoPubParamType::String};
+            n = AutoPubParamCodec_writeTypes(out, sizeof(out), types, 2);
+            TEST_ASSERT(n == 10 && out[4] == 2 && out[8] == 1 && out[9] == 4, "types response: sequence of uint8");
+        }
+
+        printf("Test: parameter store serves list/get/types/describe/set/set_atomically\n");
+        {
+            using namespace RaftRuntime::AutoPub;
+            AutoPubParameterStore<8> store;
+            auto boolV = [](bool b) { AutoPubParamValue v; v.type = AutoPubParamType::Bool; v.boolValue = b; return v; };
+            auto intV = [](int64_t i) { AutoPubParamValue v; v.type = AutoPubParamType::Integer; v.integerValue = i; return v; };
+            auto strV = [](const char* s) { AutoPubParamValue v; v.type = AutoPubParamType::String; std::strncpy(v.stringValue, s, sizeof(v.stringValue) - 1); return v; };
+            int applied = 0;
+            TEST_ASSERT(store.declare("use_sim_time", boolV(false), "", true) == 0, "declare read-only");
+            TEST_ASSERT(store.declare("chatterEnable", boolV(true), "Publish /chatter", false,
+                            [&](const AutoPubParamValue& v, const char*&) { applied += v.boolValue ? 1 : 10; return true; }) == 1,
+                        "declare with a callback");
+            TEST_ASSERT(store.declare("chatterPeriodMs", intV(1000), "Period of /chatter in ms") == 2, "declare int");
+            TEST_ASSERT(store.declare("routerHost", strV("192.168.86.192"), "", false,
+                            [](const AutoPubParamValue& v, const char*& reason) {
+                                if (std::strchr(v.stringValue, '.') == nullptr) { reason = "not an IPv4 address"; return false; }
+                                return true; }) == 3, "declare string with a validating callback");
+            TEST_ASSERT(store.declare("a.b", intV(1)) == 4 && store.declare("a.c", intV(2)) == 5, "declare nested names");
+            TEST_ASSERT(store.declare("chatterEnable", boolV(true)) == store.INVALID_SLOT, "no duplicate names");
+            AutoPubParamValue arr; arr.type = AutoPubParamType::IntegerArray;
+            TEST_ASSERT(store.declare("arr", arr) == store.INVALID_SLOT, "arrays cannot be declared");
+            TEST_ASSERT(store.count() == 6 && store.value("chatterPeriodMs")->integerValue == 1000, "count and value");
+
+            // Build requests with the codec's own writers' inverse: small hand encoders
+            uint8_t req[512], out[1024];
+            auto namesReq = [&](std::initializer_list<const char*> names) {
+                CDREncoder e; e.reset(req, sizeof(req)); e.writeEncapsulationHeader(); e.writeSequenceLength((uint32_t)names.size());
+                for (const char* n : names) e.writeString(n);
+                return e.getPos(); };
+            auto listReq = [&](std::initializer_list<const char*> prefixes, uint64_t depth) {
+                CDREncoder e; e.reset(req, sizeof(req)); e.writeEncapsulationHeader(); e.writeSequenceLength((uint32_t)prefixes.size());
+                for (const char* p : prefixes) e.writeString(p);
+                e.writeUint64(depth); return e.getPos(); };
+            auto setReq = [&](std::initializer_list<AutoPubParamEntry> entries) {
+                CDREncoder e; e.reset(req, sizeof(req)); e.writeEncapsulationHeader(); e.writeSequenceLength((uint32_t)entries.size());
+                for (const auto& en : entries) { e.writeString(en.name); AutoPubParamCodec_writeValue(e, en.value); }
+                return e.getPos(); };
+            auto entry = [](const char* name, AutoPubParamValue v) { AutoPubParamEntry en; std::strcpy(en.name, name); en.value = v; return en; };
+            // Decode helpers for the responses
+            auto readValues = [&](uint32_t n, std::vector<AutoPubParamValue>& values) {
+                CDRDecoder d; d.init(out, n); uint32_t c = 0; values.clear();
+                if (!d.readEncapsulationHeader() || !d.readSequenceLength(c)) return false;
+                for (uint32_t i = 0; i < c; ++i) { AutoPubParamValue v; if (!AutoPubParamCodec_readValue(d, v)) return false; values.push_back(v); }
+                return true; };
+            auto readResults = [&](uint32_t n, bool single, std::vector<std::pair<bool, std::string>>& results) {
+                CDRDecoder d; d.init(out, n); uint32_t c = 1; results.clear();
+                if (!d.readEncapsulationHeader() || (!single && !d.readSequenceLength(c))) return false;
+                for (uint32_t i = 0; i < c; ++i) { bool ok; char r[128]; uint32_t l; if (!d.readBool(ok) || !d.readString(r, sizeof(r), l)) return false; results.push_back({ok, r}); }
+                return true; };
+            auto readNamesResp = [&](uint32_t n, std::vector<std::string>& names, std::vector<std::string>& prefixes) {
+                CDRDecoder d; d.init(out, n); uint32_t c = 0; names.clear(); prefixes.clear(); char s[64]; uint32_t l;
+                if (!d.readEncapsulationHeader() || !d.readSequenceLength(c)) return false;
+                for (uint32_t i = 0; i < c; ++i) { if (!d.readString(s, sizeof(s), l)) return false; names.push_back(s); }
+                if (!d.readSequenceLength(c)) return false;
+                for (uint32_t i = 0; i < c; ++i) { if (!d.readString(s, sizeof(s), l)) return false; prefixes.push_back(s); }
+                return true; };
+
+            std::vector<std::string> names, prefixes;
+            uint32_t n = store.list(req, listReq({}, 0), out, sizeof(out));
+            TEST_ASSERT(n && readNamesResp(n, names, prefixes) && names.size() == 6 && names[1] == "chatterEnable" &&
+                        prefixes.size() == 1 && prefixes[0] == "a", "list: everything, with the one nested prefix");
+            n = store.list(req, listReq({"a"}, 0), out, sizeof(out));
+            TEST_ASSERT(n && readNamesResp(n, names, prefixes) && names.size() == 2 && names[0] == "a.b", "list: by prefix");
+            n = store.list(req, listReq({}, 1), out, sizeof(out));
+            TEST_ASSERT(n && readNamesResp(n, names, prefixes) && names.size() == 4 && prefixes.empty(), "list: depth 1 hides nested names");
+            n = store.list(req, listReq({"nosuch"}, 0), out, sizeof(out));
+            TEST_ASSERT(n && readNamesResp(n, names, prefixes) && names.empty(), "list: unknown prefix matches nothing");
+
+            std::vector<AutoPubParamValue> values;
+            n = store.get(req, namesReq({"chatterPeriodMs", "nosuch", "routerHost"}), out, sizeof(out));
+            TEST_ASSERT(n && readValues(n, values) && values.size() == 3 && values[0].integerValue == 1000 &&
+                        values[1].type == AutoPubParamType::NotSet && std::strcmp(values[2].stringValue, "192.168.86.192") == 0,
+                        "get: values in request order, unknown as NotSet");
+            n = store.getTypes(req, namesReq({"use_sim_time", "nosuch"}), out, sizeof(out));
+            TEST_ASSERT(n == 10 && out[8] == 1 && out[9] == 0, "types: bool and NotSet");
+            n = store.describe(req, namesReq({"chatterPeriodMs"}), out, sizeof(out));
+            TEST_ASSERT(n > 0 && std::memcmp(out + 12, "chatterPeriodMs", 15) == 0, "describe: named descriptor");
+            TEST_ASSERT(store.get(req, 3, out, sizeof(out)) == 0 && store.set(req, 3, out, sizeof(out)) == 0, "a truncated request builds nothing");
+
+            std::vector<std::pair<bool, std::string>> results;
+            n = store.set(req, setReq({entry("chatterEnable", boolV(false)), entry("chatterPeriodMs", strV("abc")),
+                                       entry("use_sim_time", boolV(true)), entry("nosuch", intV(1)),
+                                       entry("routerHost", strV("nodots"))}), out, sizeof(out));
+            TEST_ASSERT(n && readResults(n, false, results) && results.size() == 5 &&
+                        results[0].first && applied == 10 && !store.value("chatterEnable")->boolValue &&
+                        !results[1].first && results[1].second == "Wrong parameter type, expected 'Type.INTEGER' got 'Type.STRING'" &&
+                        !results[2].first && results[2].second == "Trying to set a read-only parameter: use_sim_time." &&
+                        !results[3].first && results[3].second.rfind("Invalid access to undeclared", 0) == 0 &&
+                        !results[4].first && results[4].second == "not an IPv4 address" &&
+                        std::strcmp(store.value("routerHost")->stringValue, "192.168.86.192") == 0,
+                        "set: each parameter judged on its own, with the node's reasons");
+            AutoPubParamValue arrSet; arrSet.type = AutoPubParamType::Integer; arrSet.hasArrayData = true;
+            {
+                // A set carrying array data on the wire
+                CDREncoder e; e.reset(req, sizeof(req)); e.writeEncapsulationHeader(); e.writeSequenceLength(1); e.writeString("chatterPeriodMs");
+                e.writeUint8(2); e.writeBool(false); e.writeInt64(5); e.writeFloat64(0); e.writeString("");
+                e.writeSequenceLength(0); e.writeSequenceLength(0); e.writeSequenceLength(1); e.writeInt64(9); e.writeSequenceLength(0); e.writeSequenceLength(0);
+                n = store.set(req, e.getPos(), out, sizeof(out));
+                TEST_ASSERT(n && readResults(n, false, results) && !results[0].first && results[0].second.rfind("Array", 0) == 0 &&
+                            store.value("chatterPeriodMs")->integerValue == 1000, "set: array data refused, value untouched");
+            }
+            n = store.setAtomically(req, setReq({entry("chatterPeriodMs", intV(250)), entry("use_sim_time", boolV(true))}), out, sizeof(out));
+            TEST_ASSERT(n && readResults(n, true, results) && !results[0].first && store.value("chatterPeriodMs")->integerValue == 1000,
+                        "atomic set: one refusal and nothing changes");
+            n = store.setAtomically(req, setReq({entry("chatterPeriodMs", intV(250)), entry("chatterEnable", boolV(true))}), out, sizeof(out));
+            TEST_ASSERT(n && readResults(n, true, results) && results[0].first && store.value("chatterPeriodMs")->integerValue == 250 &&
+                        store.value("chatterEnable")->boolValue && applied == 11, "atomic set: all applied, callbacks ran");
+            TEST_ASSERT(store.setLocal("chatterPeriodMs", intV(400)) && store.value("chatterPeriodMs")->integerValue == 400 &&
+                        !store.setLocal("chatterPeriodMs", boolV(true)), "setLocal keeps the type");
+        }
+
+        printf("Test: a Raw service hands the CDR to its handler and copies its reply\n");
+        {
+            using namespace RaftRuntime::AutoPub;
+            AutoPubServiceRegistry<2, 2, 64, 32> registry;
+            static uint8_t seen[32]; static uint32_t seenLen = 0;
+            static const uint8_t answer[] = {0, 1, 0, 0, 9, 8, 7};
+            const uint8_t slot = registry.add("/raft/raw", AutoPubServiceKind::Raw,
+                [](const AutoPubServiceRequest& req, AutoPubServiceReply& reply) {
+                    seenLen = req.fields.rawLen; std::memcpy(seen, req.fields.raw, seenLen);
+                    reply.fields.raw = answer; reply.fields.rawLen = sizeof(answer);
+                    return AutoPubServiceOutcome::Replied;
+                });
+            const uint8_t request[] = {0, 1, 0, 0, 5, 6};
+            TEST_ASSERT(registry.accept(slot, 1, request, sizeof(request), nullptr, 0, 0, 100), "a raw request is accepted");
+            registry.service(100, 2);
+            TEST_ASSERT(seenLen == sizeof(request) && std::memcmp(seen, request, seenLen) == 0, "the handler sees the request bytes");
+            auto send = registry.next();
+            TEST_ASSERT(send.kind == AutoPubServiceSend::Kind::Response && send.payloadLen == sizeof(answer) &&
+                        std::memcmp(send.payload, answer, sizeof(answer)) == 0, "the reply is the handler's bytes");
+            uint8_t big[40] = {};
+            registry.sent(); registry.sent();
+            TEST_ASSERT(!registry.accept(slot, 2, big, sizeof(big), nullptr, 0, 0, 100) &&
+                        registry.next().kind == AutoPubServiceSend::Kind::Error, "a raw request over REQUEST_MAX is refused");
+        }
+
         printf("Test: service codec encodes and decodes the std_srvs types\n");
         using namespace RaftRuntime::AutoPub;
         // The exact request payloads a real client sent (S0 fixtures)
