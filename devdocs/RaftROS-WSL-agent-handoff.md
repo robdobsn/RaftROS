@@ -1,5 +1,33 @@
 # RaftROS WSL Agent Handoff
 
+> **Current state (2026-09-29) - read this first; the 2026-09-17 record below
+> is history and several of its constraints are superseded.**
+>
+> - **Backends:** Zenoh is the default (`CONFIG_RAFTROS_BACKEND_ZENOH`); RTPS is
+>   the opt-in (`CONFIG_RAFTROS_BACKEND_RTPS=y` in
+>   `systypes/SysTypeMain/sdkconfig.defaults`, then delete
+>   `build/SysTypeMain/sdkconfig`). Both are firmware backends now.
+> - **Services and parameters exist** on Zenoh (server side) - the "no services,
+>   parameters" constraint below no longer applies. Actions and parameter
+>   events do not exist. Services/parameters on RTPS were ruled out.
+> - **Board:** Unexpected Maker ProS3 on Windows **COM18**, VL6180 at I2C 0x29,
+>   IP 192.168.86.230. Build: `cd examples/ExampleDiscoverable && raft build
+>   --no-docker -e /home/rob/esp/esp-idf-v6.0.2 .`; flash: `raft flash -p COM18
+>   --no-fs .`. Loop figures must be read from `GET /api/rosstat` with no
+>   monitor attached (a log line costs ~10 ms when nothing reads the console).
+> - **ROS host:** `rob@192.168.86.192`, ROS 2 Jazzy, `rmw_zenohd` 0.2.10 (start
+>   detached: `ssh -n -f host "nohup ... &"`), `RMW_IMPLEMENTATION=rmw_zenoh_cpp`.
+>   Service/parameter gate scripts and the soak live in `~/` and `~/soak2`.
+> - **RaftCore** is fetched `@main` into `examples/ExampleDiscoverable/raftdevlibs`;
+>   the user commits RaftCore changes. Upstream since this record: NVS init
+>   order, `RaftJson` escaped quotes, device-data fan-out (`78781c0`).
+> - **Where things are:** [status](RaftROS-development-status.md) (log, newest
+>   state at the top), [results](RaftROS-zenoh-milestone-results.md) (measured
+>   summary), [services plan](RaftROS-services-implementation-plan.md),
+>   [parameters plan](RaftROS-parameters-implementation-plan.md), and the
+>   example's [README](../examples/ExampleDiscoverable/README.md) for every
+>   demo command.
+
 **Recorded:** 2026-09-17, after the 20:05 UTC resource build.
 **Reason:** The user paused implementation to move this agent session from a
 Windows mapped-folder workspace into a native WSL workspace.

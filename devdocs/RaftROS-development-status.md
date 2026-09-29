@@ -1,14 +1,25 @@
 # RaftROS Development Status
 
-**Last Updated:** 2026-09-21 (bus→loop mailbox handoff; first hardware and
-native ROS 2 Jazzy end-to-end validation of auto-publishing). Resume commands
-are in the [agent handoff](RaftROS-WSL-agent-handoff.md).
+**Last Updated:** 2026-09-29 (Zenoh services and parameters complete; RaftCore
+device-data fan-out; second soak in progress). Resume commands are in the
+[agent handoff](RaftROS-WSL-agent-handoff.md). The measured summary is
+[RaftROS-zenoh-milestone-results.md](RaftROS-zenoh-milestone-results.md);
+dated sections below hold the evidence, newest first after this table.
 
-## Next Milestone: Zenoh Alternative (Started)
+## Current State (2026-09-29)
 
-RTPS is still the only implemented/buildable backend. The
-[Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) defines the
-new forward work. ROS metadata/identity code and host-only native ROS graph/data
+Zenoh is the default backend and the focus; RTPS remains a supported opt-in.
+On Zenoh the node publishes, subscribes, auto-publishes bus devices, serves
+ROS 2 services ([plan](RaftROS-services-implementation-plan.md), S0-S5 met)
+and ROS 2 parameters ([plan](RaftROS-parameters-implementation-plan.md),
+P0-P4 met). Services and parameters on RTPS were ruled out (2026-09-29). A
+second 12 h soak with service and parameter traffic is running; at 4.4 h it
+was clean (see the results document).
+
+## Zenoh Alternative (history)
+
+The [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md) defined
+this work; the paragraph below is as written when it began. ROS metadata/identity code and host-only native ROS graph/data
 control tests pass. The connected Linux probe now sends ROS node/publisher
 declarations, Raft-CDR String or Range samples and token withdrawals over its own TCP
 session. A late independent ROS process also discovers and receives samples.
@@ -25,10 +36,11 @@ subscriptions.
 | Z1: native ROS proof | Complete. String/Range, late ROS process, withdrawal, scripted interests and peer restarts pass; firmware integration, automatic reconnect and resource budgets are done and measured; and the ROS 2 tools themselves resolve the node, its publishers and its subscriptions over `rmw_zenohd` (2026-09-27). |
 | Z2: common pipeline and RTPS adapter | Started: mapping/CDR have neutral ownership with legacy RTPS aliases/forwarders; a synchronous common sample runner and RTPS emission adapter drive the production callback. Both backends now sit behind the same create/destroy/publish contract, the Zenoh one host-tested against a real session. DeviceManager lifecycle work is done; firmware linking of the Zenoh backend is Z3. |
 | Z3: isolated firmware builds | Complete. Kconfig selects the backend - Zenoh by default since 2026-09-27, RTPS as the opt-in - and each image links only its own backend. The router address is layered (Kconfig < SysTypes < posted settings) and an unreachable router is reported with its cause and the fix. |
-| Z4-Z6: parity and release | **Complete** for the initial Zenoh milestone: parity verified with the ROS 2 tools on both transports, `qosProfiles` reach subscriptions, hot-plug verified, bring-up logging behind per-file switches, and a 12 h soak shows one session throughout and free heap flat to -2 bytes/hour. Next milestone: services (no plan written yet - see 2026-09-28 discussion). |
+| Z4-Z6: parity and release | **Complete** for the initial Zenoh milestone: parity verified with the ROS 2 tools on both transports, `qosProfiles` reach subscriptions, hot-plug verified, bring-up logging behind per-file switches, and a 12 h soak shows one session throughout and free heap flat to -2 bytes/hour. |
+| Services (Zenoh) | **Complete** 2026-09-28/29: server-side `std_srvs` Trigger/SetBool/Empty, deferred replies, every acceptance-matrix row shown on hardware. |
+| Parameters (Zenoh) | **Complete** 2026-09-29: the six `rcl_interfaces` services; `ros2 param list/get/set/describe/dump` against the board. |
 
-Runtime transport switching is deferred. Services/parameters remain future
-work after this milestone. Do not treat pending RTPS cleanup or Task D as a
+Runtime transport switching is deferred. Do not treat pending RTPS cleanup or Task D as a
 prerequisite for the initial Zenoh feasibility experiment.
 
 ### Metadata and Identity Implementation (2026-09-17)
@@ -2479,11 +2491,21 @@ Feather (2026-09-18/21). These are changes to RaftCore/RaftSysMods, not RaftROS.
 - **Invalid BLE status JSON** — `advName` was emitted without its closing
   quote while advertising.
 
-**Still open:**
+**Fixed upstream (2026-09-29):**
 
-- **DeviceManager data-callback unregister** now reaches the bus
-  (`unregisterForDeviceData`), but RaftROS does not depend on it: stale
-  callbacks are rejected by generation-checked pool handles.
+- **`RaftJson` lost every key after an object holding an escaped quote**
+  (`1907d54`) - a posted setting could hide a whole SysMod section.
+- **One data callback per device address** (`78781c0`) - a second
+  `registerForDeviceData` silently replaced the first (it stopped the example's
+  range topic for a day). `DeviceManager` now owns each device's single bus
+  slot and fans samples out through `DeviceDataSubscribers`; `BusAddrRecord`
+  warns when a direct registration displaces another; a status change no
+  longer registers only the first matching subscription; late subscriptions
+  take effect; `RaftDevice::registerForDeviceData` checks for a missing bus.
+  The host tests for both (`linux_unit_tests/DeviceDataSubscribersTest.h`,
+  `main.cpp`, `Makefile` header dependencies) were left for the user to commit.
+
+**Still open:**
 - **`configWifiSTA` can block the loop task for up to 2 s** (`vTaskDelay`
   retry loop around `esp_wifi_set_config`), exceeding the 50 ms SysMod
   budget when a connect attempt is in progress.
@@ -2493,11 +2515,13 @@ Feather (2026-09-18/21). These are changes to RaftCore/RaftSysMods, not RaftROS.
   attached; the same logs replay as a multi-hour backlog when a monitor
   reattaches. RaftROS's chatty discovery logs are now debug-gated, but a
   Raft-level fix (drop, don't block, when nothing is reading) would protect
-  every app.
+  every app. Measured 2026-09-28 on the ProS3: ~10.5 ms per line whatever its
+  length when nothing reads the USB-Serial-JTAG console. RaftROS now writes at
+  most one line per loop pass on both backends.
 
 ## Phase 5: Integration with Raft — TODO
 
-- ROS 2 actions / service servers.
+- ROS 2 actions. (Service servers are done on Zenoh - see the services plan.)
 - Command-side subscriptions auto-wired from DeviceManager actuator classes
   (SRVO, PUMP, PIX) — the symmetric write path. Phase 4 excludes these
   from publishing; Phase 5 will route incoming topic data into

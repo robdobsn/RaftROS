@@ -6,31 +6,43 @@ RaftROS enables ESP32 firmware built on the Raft framework to function as a nati
 
 ## Status
 
-**Phases 1–4 are complete.** Verified end-to-end against ROS 2 Humble /
-Jazzy + FastDDS with an ESP32-S3 on WiFi:
+A Raft SysMod that makes an ESP32 a native ROS 2 node over **either**
+transport, chosen at build time:
 
-- **Phase 1 (Discovery)** — the ESP32 participates in SPDP/SEDP discovery
-  and standard ROS 2/rclpy subscribers discover its publishers.
-- **Phase 2 (Topic Publishing)** — `ros2 topic echo /chatter` prints a
-  sample per second; RELIABLE + VOLATILE QoS.
-- **Phase 3 (Topic Subscribing)** — `ros2 topic pub --once /chatter_in2 ...`
-  dispatches on-device to the correct per-slot handler.
-- **Phase 4 (DeviceManager auto-publishing)** — every bus device detected
-  by `DeviceManager` automatically becomes a typed ROS 2 topic
-  (`rt/raft/<slug>_<bus>_<addrHex>`) with per-class message type, REP-103
-  unit scaling, per-writer QoS, and clean dispose on detach. No per-device
-  code. Composite devices (AHT20, BMP280, IMUs) publish multiple topics
-  from a single bus sample.
+- **Zenoh (the default since 2026-09-27)** - talks to an `rmw_zenoh` router
+  (`ros2 run rmw_zenoh_cpp rmw_zenohd`); every ROS 2 tool works with
+  `RMW_IMPLEMENTATION=rmw_zenoh_cpp`.
+- **RTPS/DDS** - a clean-room RTPS 2.2 participant that joins DDS discovery
+  directly (FastDDS, CycloneDDS); opt in with `CONFIG_RAFTROS_BACKEND_RTPS=y`.
 
-**912 linux unit tests pass.** ESP32-S3 firmware fits in 25% of a
-`0x1b0000` app partition.
+What works, verified on an ESP32-S3 against ROS 2 Jazzy
+([measured results](devdocs/RaftROS-zenoh-milestone-results.md)):
 
-See `devdocs/RaftROS-development-status.md` for the full fix list and
-`devdocs/RaftROS-auto-publishing-design.md` for the Phase 4 design.
+| | Zenoh | RTPS |
+| --- | --- | --- |
+| Node in the graph, `/chatter`, string subscriptions | yes | yes |
+| Every `DeviceManager` bus device auto-published as a typed topic | yes | yes |
+| QoS profiles (`qosProfiles`) for publishers and subscriptions | yes | yes |
+| Device hot-plug (topic withdrawn and re-announced) | yes | earlier phase |
+| ROS 2 **services** (`std_srvs` Trigger / SetBool / Empty, deferred replies) | yes | no (by decision) |
+| ROS 2 **parameters** (`ros2 param list/get/set/describe/dump`) | yes | no (by decision) |
+| 12 h soak: one session, free heap flat | yes | - |
 
-### Current CLI Caveat
+Worst main-loop pass, unattended: ~13 ms (Zenoh), ~15 ms (RTPS) against the
+Raft 50 ms contract. Image ~1.27 MB (28% of the app partition free); free heap
+~147 kB on the Zenoh build with services and parameters.
 
-On the current Windows 11 + WSL2 + ROS 2 Jazzy test setup, `ros2 topic info -v`
+Host tests: the unit suite, the Zenoh session (1298), codec (2223) and
+firmware-piece (141) suites all pass. The example -
+[`examples/ExampleDiscoverable`](examples/ExampleDiscoverable/README.md) - is
+the demo, with the exact `ros2` commands for every feature.
+
+The project log is
+[`devdocs/RaftROS-development-status.md`](devdocs/RaftROS-development-status.md).
+
+### RTPS CLI Caveat (historical)
+
+Applies to the RTPS build only. On the Windows 11 + WSL2 + ROS 2 Jazzy test setup of 2026-04, `ros2 topic info -v`
 may show the ESP32 publisher with `Node name: _NODE_NAME_UNKNOWN_`, and
 `ros2 node info /raft_esp32` may fail even while typed subscriptions receive
 valid samples. This is currently treated as a host/CLI graph-attribution issue,
@@ -60,10 +72,24 @@ wire-level investigation and mitigations.
 - **Automatic ROS 2 publishing of every `DeviceManager`-detected bus device**
   — `clas[]`-driven type mapping, REP-103 SI unit scaling, composite
   multi-topic devices, per-class QoS profiles with SysTypes override.
+- **Zenoh transport** (default): `rmw_zenoh`-compatible session, liveliness
+  tokens, interests, reconnect with a configurable router address
+  (Kconfig < SysTypes < `/api/postsettings`) and an actionable warning when
+  the router is unreachable.
+- **ROS 2 services** (Zenoh): `std_srvs` Trigger / SetBool / Empty servers from
+  application code; handlers never block the loop, and can defer a reply
+  until a bus reading arrives.
+- **ROS 2 parameters** (Zenoh): the six `rcl_interfaces` services; the node's
+  own settings (`chatterEnable`, `chatterPeriodMs`, `routerHost` - persisted)
+  and any the application declares.
+- `GET /api/rosstat`: session, counters, heap, stack and per-phase loop maxima.
 - Planned: automatic subscription of actuator classes (SRVO/PUMP/PIX) for
-  command-side wiring, and ROS 2 services from device actions.
+  command-side wiring; ROS 2 actions.
 
-## Quick Start
+## Quick Start (RTPS build)
+
+For the default Zenoh build, follow
+[`examples/ExampleDiscoverable/README.md`](examples/ExampleDiscoverable/README.md#demonstrating-the-zenoh-build).
 
 Build and flash the ExampleDiscoverable project (see `examples/ExampleDiscoverable/README.md`) and then, from a Linux host on the same network with ROS 2 Humble installed:
 
@@ -303,9 +329,9 @@ sudo chown $USER ~/raft_rtps.pcap
 - `devdocs/` — design overview, development status, and implementation plan.
   Start with `RaftROS-zenoh-milestone-results.md` (measured results: loop
   budget, memory, the 12 h soak, defects fixed) and
-  `RaftROS-services-assessment.md` (what services would need, per transport)
-  and `RaftROS-services-implementation-plan.md` (the plan: Zenoh server-side
-  services in seven slices with gates).
+  `RaftROS-services-assessment.md` (what services would need, per transport),
+  `RaftROS-services-implementation-plan.md` (Zenoh server-side services, done)
+  and `RaftROS-parameters-implementation-plan.md` (ROS 2 parameters, done).
 
 ## Dependencies
 

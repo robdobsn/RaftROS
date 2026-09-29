@@ -1,5 +1,9 @@
 # RaftROS Services: Implementation Plan
 
+> **Status 2026-09-29: complete.** S0-S5 met on hardware and every acceptance-matrix
+> row shown (section 5). S6 (RTPS services) was ruled out; S7 became the
+> [parameters plan](RaftROS-parameters-implementation-plan.md), also complete.
+
 Written 2026-09-28 against the initial Zenoh milestone
 ([results](RaftROS-zenoh-milestone-results.md)) and the
 [services assessment](RaftROS-services-assessment.md). This is the plan the

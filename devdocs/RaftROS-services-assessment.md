@@ -1,4 +1,9 @@
-# RaftROS Services: Assessment (not yet a plan)
+# RaftROS Services: Assessment
+
+> **Status 2026-09-29:** historical. The plan it called for was written and
+> carried out - services (Zenoh, server side) are complete; see
+> [RaftROS-services-implementation-plan.md](RaftROS-services-implementation-plan.md)
+> and, for parameters, [RaftROS-parameters-implementation-plan.md](RaftROS-parameters-implementation-plan.md).
 
 Written 2026-09-28, after the initial Zenoh milestone. This records what exists
 and what a services implementation would need, so a plan can be written against
