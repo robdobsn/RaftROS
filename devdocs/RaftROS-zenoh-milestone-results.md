@@ -41,6 +41,7 @@ The Raft contract for a SysMod is 10 ms average / 50 ms worst case per pass.
 | Worst RaftROS pass | 82 ms (breach) | 14 ms | 2.4 ms |
 | Worst whole-loop pass | 54 ms | 17 ms | 3.0 ms |
 | Whole-loop average | 3.0-5.3 ms | 2.8-4.3 ms | **0.60 ms** |
+| Worst RaftROS pass under a CycloneDDS subscriber, unattended (2026-09-29) | 20.4 ms before the one-line rule | 15.4 ms after | - |
 | Worst pass, no terminal attached (2026-09-28) | not measured | not measured | 12.4 ms at session open, 11.8 ms with the router down - one console line each (~10.5 ms per line on an unread USB-Serial-JTAG port; 53 ms before the one-line-per-pass rule) |
 | Samples delivered | 4.8 Hz | 4.8 Hz | 4.2 Hz range + 1 Hz chatter, none lost |
 
@@ -131,7 +132,16 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
   one frame. Persisting `routerHost` first copied the whole base `RaftROS`
   section into NVS (read through the chained config), freezing it; it now
   merges the overlay alone.
-- (RaftCore, found 2026-09-29, **not fixed here**) `RaftJson` counts an escaped
+- (Example, introduced 2026-09-28 in S5, found and fixed 2026-09-29) The
+  deferred `/raft_esp32/range` service registered its own VL6180 data
+  callback. RaftCore keeps one data callback per bus address, so it silently
+  replaced the auto-publisher's and `/raft/range_1_29` published nothing on
+  either backend for a day; the checks exercised the service, not the topic.
+  Found because an RTPS capture showed no range writer on the wire. The
+  example now peeks the latest decoded poll instead; RTPS delivers 460
+  samples in 90 s again, Zenoh 94 in 20 s.
+- (RaftCore, found 2026-09-29, patch applied to the working tree for the user
+  to commit) `RaftJson` counts an escaped
   quote inside a nested object as the end of a string, so every key after
   that object disappears - a posted setting like `{"A":{"s":"a\"b"},
   "RaftROS":{...}}` would hide the whole `RaftROS` section from `configGet*`.

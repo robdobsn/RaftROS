@@ -226,6 +226,27 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### One Log Line per Pass on RTPS; a Range Topic That Had Gone Quiet (2026-09-29)
+
+The console finding of 2026-09-28 (a log line costs ~10 ms unattended)
+applied to the RTPS build: runtime lines now take the pass's single log
+slot (`logSlot()`; `logSuppressed` in rosstat counts the rest), and the
+per-peer SEDP reader-port lines moved behind `DEBUG_SEDP_RDI` in the
+verbose block. Unattended A/B on the ProS3 with a CycloneDDS subscriber on
+the range topic and `ros2 topic info -v` every 15 s: worst pass 20.4 ms
+before, 15.4 ms after (two earlier runs 18.3/21.0 against 13.8/14.6);
+`logSuppressed` stayed 0 - the gain is the per-peer lines. The RTPS build
+also gained `declareParameter`/`parameter()` stubs: since the parameters
+commit the example had not compiled on RTPS.
+
+The A/B first showed no range samples at all. The capture had no range
+writer on the wire: the S5 range service had registered its own VL6180
+data callback, which replaced the auto-publisher's (RaftCore keeps one per
+address). Fixed in the example by peeking the latest decoded poll; both
+backends deliver range samples again. The RaftCore `RaftJson` escaped-quote
+fix is applied to the RaftCore working tree with a regression test, for
+the user to commit.
+
 ### Parameters on the Board (2026-09-29)
 
 P1-P4 of the parameters plan: `AutoPubParamCodec.h` (pinned to the P0

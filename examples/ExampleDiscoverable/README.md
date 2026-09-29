@@ -172,10 +172,14 @@ ros2 service call /raft_esp32/range std_srvs/srv/Trigger
 ```
 
 The handler parks the request; `MainSysMod::loop()` completes it from the
-first VL6180 poll result that lands after the call (a data callback on the
-bus task bumps a counter; the loop decodes the latest result with
-`getLatestDecodedPollResponse`). The reading is taken after the call, not
-served from a cache. A second call while one is parked is refused; with the
+first VL6180 poll result newer than the call, peeking the latest decoded
+result with `getLatestDecodedPollResponse` and comparing its `timeMs`. The
+reading is taken after the call, not served from a cache.
+
+Do not register a device-data callback for a device RaftROS publishes:
+the bus holds one data callback per device and the auto-publisher owns it,
+so a second `registerForDeviceData` silently replaces it and the device's
+topic stops (this example did exactly that for a day). A second call while one is parked is refused; with the
 sensor unplugged no poll result comes and RaftROS answers the client with an
 error at the timeout (5 s) rather than leaving it hanging.
 
