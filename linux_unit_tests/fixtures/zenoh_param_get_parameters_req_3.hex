@@ -1,0 +1,4 @@
+# Captured 2026-09-28 from ros2 param (Jazzy) via rmw_zenohd 0.2.10 / zenoh 1.x: get_parameters REQ.
+# Network-message bytes as carried in one FRAME (frame header and sequence stripped).
+# ['routerHost']
+dc011fa10db40226c0cf24a301c3180000010000010000000b000000726f75746572486f7374004521010000000000000087f0e575938cd91810c1abe7e0479937b10e0dbb5aaf331ab3

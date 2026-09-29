@@ -250,9 +250,10 @@ private:
         char key[RaftRuntime::Zenoh::ZENOH_AUTOPUB_KEY_MAX] = {};
         char token[RaftRuntime::Zenoh::ZENOH_AUTOPUB_TOKEN_MAX] = {};
         const char* typeHash = nullptr;
+        char wireType[64] = {};         ///< e.g. rcl_interfaces::srv::dds_::GetParameters_
         uint64_t entityId = 0;
     };
-    static const uint8_t MAX_SERVICES = 4;
+    static const uint8_t MAX_SERVICES = 12;     ///< Six parameter services and up to six of the application's
     /// @brief Id spaces kept clear of the publisher (2..), subscriber (100..)
     /// and subscription-token (200..) ids
     static const uint32_t SERVICE_KEYEXPR_ID_BASE = 300;
@@ -260,7 +261,7 @@ private:
     static const uint32_t SERVICE_TOKEN_ID_BASE = 500;
     static const uint8_t SERVICE_DISPATCH_BUDGET = 2;    ///< Handlers run per loop pass
     ServiceSlot _serviceSlots[MAX_SERVICES];
-    RaftRuntime::AutoPub::AutoPubServiceRegistry<MAX_SERVICES, 4, 256> _services;
+    RaftRuntime::AutoPub::AutoPubServiceRegistry<MAX_SERVICES, 4, 1024, 512> _services;
     uint64_t _nextServiceEntityId = 2000;
     uint32_t _requestsUnknownKey = 0;    ///< Requests for a key no service holds
 

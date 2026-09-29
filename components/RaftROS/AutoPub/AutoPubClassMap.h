@@ -187,6 +187,13 @@ inline const char* AutoPubClassMap_serviceTypeHash(const char* wireType)
         {"std_srvs::srv::dds_::Trigger_", "RIHS01_eeff2cd6fa5ad9d27cdf4dec64818317839b62f212a91e6b5304b634b2062c5f"},
         {"std_srvs::srv::dds_::SetBool_", "RIHS01_abe9e4bb6b41b40e6789712c00ec8871923e089af3f667a79992a428cff2da0a"},
         {"std_srvs::srv::dds_::Empty_",   "RIHS01_5888399dedec5ccc85ea6451949fd2c9f97bfdf963f9a588821639fcd31b5d19"},
+        // The ROS 2 parameter services (rcl_interfaces, Jazzy)
+        {"rcl_interfaces::srv::dds_::ListParameters_",         "RIHS01_3e6062bfbb27bfb8730d4cef2558221f51a11646d78e7bb30a1e83afac3aad9d"},
+        {"rcl_interfaces::srv::dds_::GetParameters_",          "RIHS01_bf9803d5c74cf989a5de3e0c2e99444599a627c7ff75f97b8c05b01003675cbc"},
+        {"rcl_interfaces::srv::dds_::GetParameterTypes_",      "RIHS01_da199c878688b3e530bdfe3ca8f74cb9fa0c303101e980a9e8f260e25e1c80ca"},
+        {"rcl_interfaces::srv::dds_::SetParameters_",          "RIHS01_56eed9a67e169f9cb6c1f987bc88f868c14a8fc9f743a263bc734c154015d7e0"},
+        {"rcl_interfaces::srv::dds_::SetParametersAtomically_", "RIHS01_0e192ef259c07fc3c07a13191d27002222e65e00ccec653ca05e856f79285fcd"},
+        {"rcl_interfaces::srv::dds_::DescribeParameters_",     "RIHS01_845b484d71eb0673dae682f2e3ba3c4851a65a3dcfb97bddd82c5b57e91e4cff"},
     };
     if (!wireType)
         return nullptr;

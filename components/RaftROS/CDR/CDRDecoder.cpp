@@ -21,6 +21,7 @@ void CDRDecoder::init(const uint8_t* pBuf, uint32_t bufLen)
     _pBuf = pBuf;
     _bufLen = bufLen;
     _pos = 0;
+    _origin = 0;
     _littleEndian = true;
 }
 
@@ -32,12 +33,13 @@ bool CDRDecoder::readEncapsulationHeader()
     // Byte 0: 0x00, Byte 1: 0x01 = LE, 0x00 = BE
     _littleEndian = (_pBuf[_pos + 1] == 0x01);
     _pos += 4;
+    _origin = _pos;
     return true;
 }
 
 bool CDRDecoder::align(uint32_t alignment)
 {
-    uint32_t remainder = _pos % alignment;
+    uint32_t remainder = (_pos - _origin) % alignment;
     if (remainder != 0)
         _pos += alignment - remainder;
     return _pos <= _bufLen;

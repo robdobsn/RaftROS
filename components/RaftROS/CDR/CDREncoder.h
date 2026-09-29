@@ -55,6 +55,12 @@ private:
     uint8_t* _pBuf = nullptr;
     uint32_t _bufLen = 0;
     uint32_t _pos = 0;
+    // Alignment is relative to the start of the serialized body, which is
+    // after the 4-byte encapsulation header when one was written (XCDR1):
+    // an int64 following a uint8 at body offset 1 lands at body offset 8, so
+    // absolute offset 12, as a real ROS 2 node serialises it (captured
+    // 2026-09-28: a scalar rcl_interfaces/ParameterValue is 52 body bytes).
+    uint32_t _origin = 0;
     bool _littleEndian = true;
 
     // Align write position to N-byte boundary

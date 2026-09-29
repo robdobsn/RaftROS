@@ -87,7 +87,8 @@ struct AutoPubServiceSend
 /// @tparam CAPACITY services this device can hold
 /// @tparam INFLIGHT requests held at once, across all services
 /// @tparam REPLY_MAX bytes of encoded response kept per in-flight request
-template <uint8_t CAPACITY = 4, uint8_t INFLIGHT = 4, uint32_t REPLY_MAX = 256>
+/// @tparam REQUEST_MAX bytes of a Raw request kept until its handler runs
+template <uint8_t CAPACITY = 4, uint8_t INFLIGHT = 4, uint32_t REPLY_MAX = 256, uint32_t REQUEST_MAX = 64>
 class AutoPubServiceRegistry
 {
 public:
@@ -158,12 +159,22 @@ public:
             return false;
         }
         begin(*entry, slot, requestId, attachment, attachmentLen, nowMs, clientTimeoutMs);
-        if (!AutoPubServiceCodec_decodeRequest(_services[slot].kind, payload, payloadLen, entry->fields))
+        // A Raw request is kept whole for its handler; one that does not fit
+        // is refused here, not truncated
+        const bool rawFits = _services[slot].kind != AutoPubServiceKind::Raw ||
+                             (payload && payloadLen > 0 && payloadLen <= REQUEST_MAX);
+        if (!rawFits || !AutoPubServiceCodec_decodeRequest(_services[slot].kind, payload, payloadLen, entry->fields))
         {
             ++_refusedBad;
             entry->reason = "bad request";
             entry->state = Entry::State::SendError;
             return false;
+        }
+        entry->requestLen = 0;
+        if (_services[slot].kind == AutoPubServiceKind::Raw)
+        {
+            std::memcpy(entry->request, payload, payloadLen);
+            entry->requestLen = payloadLen;
         }
         entry->state = Entry::State::Queued;
         ++_accepted;
@@ -195,6 +206,8 @@ public:
             request.slot = entry.slot;
             request.token = entry.token;
             request.fields = entry.fields;
+            request.fields.raw = entry.request;
+            request.fields.rawLen = entry.requestLen;
             AutoPubServiceReply reply;
             const AutoPubServiceOutcome outcome = _services[entry.slot].handler(request, reply);
             switch (outcome)
@@ -320,6 +333,8 @@ private:
         uint64_t deadlineMs = 0;
         AutoPubServiceRequestFields fields;
         uint8_t attachment[AUTOPUB_SERVICE_ATTACHMENT_SIZE] = {};
+        uint8_t request[REQUEST_MAX] = {};      ///< Raw kind: the request CDR until dispatch
+        uint32_t requestLen = 0;
         uint8_t reply[REPLY_MAX] = {};
         uint32_t replyLen = 0;
         const char* reason = "";

@@ -1,0 +1,3 @@
+# CDR payload only (with its 4-byte encapsulation header) of the set_parameters RESP exchange.
+# [(False, 'Trying to set a read-only parameter: r
+00010000010000000000000031000000547279696e6720746f20736574206120726561642d6f6e6c7920706172616d657465723a20726f75746572486f73742e00

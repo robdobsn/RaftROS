@@ -226,6 +226,25 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### Parameters P0: the Capture Also Caught a CDR Alignment Bug (2026-09-28)
+
+The parameters plan ([RaftROS-parameters-implementation-plan.md](RaftROS-parameters-implementation-plan.md))
+started with a capture of every `ros2 param` command against an `rclpy`
+node through `rmw_zenohd`, decoded by a Python script that reads only
+request/response batches and prints decoded fields. It settled what the CLI
+actually sends (one service call per command; `dump` is `list` then one
+`get` of every name; `get_parameter_types` and `set_parameters_atomically`
+are never used) and produced 24 fixtures. Decoding the values needed
+body-relative alignment after the 4-byte encapsulation header - and our
+`CDREncoder`/`CDRDecoder` aligned on the absolute offset. A scalar
+`ParameterValue` is 52 body bytes on the wire; absolute alignment gives 48.
+Every float64 message kind in the auto-publisher (Temperature, Imu, Wrench,
+...) was affected and had only ever been tested against our own encoder.
+Fixed in the helpers; 14 host assertions re-derived. Also in this slice: a
+*Raw* service kind whose handler works on the request and response CDR
+directly (the six parameter services will use it), the six
+`rcl_interfaces` type hashes, and the service table widened to 12.
+
 ### Services on the Board; the Console Is the Loop's Worst Case (2026-09-28)
 
 Services S3 and S4 of the [implementation plan](RaftROS-services-implementation-plan.md)

@@ -1,0 +1,3 @@
+# CDR payload only (with its 4-byte encapsulation header) of the get_parameters REQ exchange.
+# ['rangeScale']
+00010000010000000b00000072616e67655363616c6500

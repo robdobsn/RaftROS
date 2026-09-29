@@ -1,0 +1,3 @@
+# CDR payload only (with its 4-byte encapsulation header) of the get_parameters REQ exchange.
+# ['chatterEnable']
+00010000010000000e00000063686174746572456e61626c6500

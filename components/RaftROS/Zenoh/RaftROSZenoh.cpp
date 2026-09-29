@@ -1012,8 +1012,12 @@ int RaftROS::addService(const char* name, const char* type, ServiceHandler handl
     using namespace RaftRuntime::AutoPub;
     if (!name || !*name || !type)
         return -1;
-    const AutoPubServiceKind kind = AutoPubServiceCodec_kindForWireType(type);
+    // A type the codec decodes gets its kind; any other type with a known
+    // hash is served Raw - the handler works on the CDR itself
+    AutoPubServiceKind kind = AutoPubServiceCodec_kindForWireType(type);
     const char* typeHash = AutoPubClassMap_serviceTypeHash(type);
+    if (kind == AutoPubServiceKind::Unknown && typeHash)
+        kind = AutoPubServiceKind::Raw;
     if (kind == AutoPubServiceKind::Unknown || !typeHash)
     {
         LOG_W(MODULE_PREFIX, "addService '%s': type '%s' is not one this build can serve", name, type);
@@ -1033,6 +1037,12 @@ int RaftROS::addService(const char* name, const char* type, ServiceHandler handl
     ServiceSlot& svc = _serviceSlots[slot];
     svc.typeHash = typeHash;
     svc.entityId = _nextServiceEntityId++;
+    if (strlen(type) >= sizeof(svc.wireType))
+    {
+        _services.remove(slot);
+        return -1;
+    }
+    strcpy(svc.wireType, type);
     if (!ZenohROSCodec::formatTopicKey(svc.key, sizeof(svc.key), _domainId, rosName, type, typeHash))
     {
         LOG_W(MODULE_PREFIX, "addService '%s' cannot be expressed as a Zenoh key", rosName);
@@ -1069,7 +1079,7 @@ bool RaftROS::stepServiceDeclarations(uint32_t nowMs)
             case ServiceSlot::State::PENDING_TOKEN:
             {
                 const ZenohROSCodec::Endpoint endpoint{svc.entityId, ZenohROSCodec::EndpointKind::Service,
-                    _services.rosName(index), RaftRuntime::AutoPub::AutoPubServiceCodec_wireType(_services.kind(index)),
+                    _services.rosName(index), svc.wireType,
                     svc.typeHash, {ZenohROSCodec::Reliability::Reliable, ZenohROSCodec::Durability::Volatile, 10}};
                 if (ZenohROSCodec::formatEndpointToken(svc.token, sizeof(svc.token), nodeIdentity(), endpoint))
                     msgLen = ZenohNetworkMessage::declareToken(_msgBuf, sizeof(_msgBuf),
