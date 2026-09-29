@@ -176,10 +176,15 @@ first VL6180 poll result newer than the call, peeking the latest decoded
 result with `getLatestDecodedPollResponse` and comparing its `timeMs`. The
 reading is taken after the call, not served from a cache.
 
-Do not register a device-data callback for a device RaftROS publishes:
-the bus holds one data callback per device and the auto-publisher owns it,
-so a second `registerForDeviceData` silently replaces it and the device's
-topic stops (this example did exactly that for a day). A second call while one is parked is refused; with the
+Peeking is the better pattern for "the latest reading when I need it": it
+costs nothing when nobody asks. Several subscribers can also share a device
+through `DeviceManager::registerForDeviceData`, which fans each sample out to
+all of them - this needs RaftCore with the device-data fan-out
+(`devdocs/patches/raftcore-device-data-fanout.patch`). Without it the bus
+holds one data callback per device and a second registration silently
+replaced the auto-publisher's, stopping the device's topic; this example did
+exactly that for a day. A registration made directly on a bus now logs a
+`BusAddrRecord` warning when it displaces another. A second call while one is parked is refused; with the
 sensor unplugged no poll result comes and RaftROS answers the client with an
 error at the timeout (5 s) rather than leaving it hanging.
 

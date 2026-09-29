@@ -139,7 +139,13 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
   either backend for a day; the checks exercised the service, not the topic.
   Found because an RTPS capture showed no range writer on the wire. The
   example now peeks the latest decoded poll instead; RTPS delivers 460
-  samples in 90 s again, Zenoh 94 in 20 s.
+  samples in 90 s again, Zenoh 94 in 20 s. The root cause is fixed in
+  RaftCore (2026-09-29, working tree, for the user to commit):
+  `DeviceManager` owns each device's single bus slot and fans samples out to
+  every subscriber (`DeviceDataSubscribers`), and `BusAddrRecord` warns when
+  a direct registration displaces another. Shown on the board: a second
+  VL6180 subscriber and the auto-publisher both received every sample (94
+  topic samples and +100 app samples over the same 20 s).
 - (RaftCore, found 2026-09-29, patch applied to the working tree for the user
   to commit) `RaftJson` counts an escaped
   quote inside a nested object as the end of a string, so every key after
