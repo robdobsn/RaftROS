@@ -116,6 +116,15 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
   was enough. The parser now steps over an oversized payload and flags the
   message; the SysMod drops the sample (counted in `rxDropped`) or answers
   the request `ERR bad request`, and the session goes on.
+- (Parameters P0, 2026-09-28) The CDR helpers aligned 8-byte fields on their
+  absolute buffer offset; ROS 2 aligns relative to the body after the 4-byte
+  encapsulation header (a scalar `rcl_interfaces/ParameterValue` is 52 body
+  bytes in the capture, not 48). Every float64-bearing message the
+  auto-publisher can emit - Temperature, RelativeHumidity, FluidPressure,
+  Illuminance, Imu, Wrench - was therefore mis-padded and would have decoded
+  as garbage on a ROS host; only Range (float32) had ever been checked
+  against one. Fixed at the origin in both helpers; the host tests' offsets
+  were re-derived (they had been written from the encoder's own output).
 - A publish with a stale clock made the session's lease check wrap; the backend
   now takes the time every pass and the session compares rather than subtracts.
 - The liveliness writer sent sequence number 0 on the initial announce (invalid

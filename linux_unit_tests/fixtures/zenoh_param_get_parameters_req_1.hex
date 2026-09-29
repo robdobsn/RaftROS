@@ -1,0 +1,4 @@
+# Captured 2026-09-28 from ros2 param (Jazzy) via rmw_zenohd 0.2.10 / zenoh 1.x: get_parameters REQ.
+# Network-message bytes as carried in one FRAME (frame header and sequence stripped).
+# ['chatterPeriodMs']
+dc011fa10db40226c0cf24a301c31d0000010000010000001000000063686174746572506572696f644d730045210100000000000000418321a0928cd9181045490e337b575da709d63aa13db8d181

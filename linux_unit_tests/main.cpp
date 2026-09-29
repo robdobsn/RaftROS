@@ -3375,12 +3375,14 @@ int main()
             TEST_ASSERT(frameLen == 5, "Temperature: frame_id length = 5 (raft + null)");
             TEST_ASSERT(std::strncmp((char*)buf + 16, "raft", 4) == 0,
                         "Temperature: frame_id content = raft");
-            // temp aligned to 8 from encap start → position 24.
-            TEST_ASSERT(nearly(lef64(buf + 24), 24.75, 1e-6),
+            // Alignment is relative to the body after the 4-byte encapsulation
+            // header (as ROS 2 serialises: captured 2026-09-28): frame_id ends at
+            // body 17, temp aligns to body 24 = absolute 28, variance at 36.
+            TEST_ASSERT(nearly(lef64(buf + 28), 24.75, 1e-6),
                         "Temperature: temperature = 24.75");
-            TEST_ASSERT(nearly(lef64(buf + 32), 0.0, 1e-12),
+            TEST_ASSERT(nearly(lef64(buf + 36), 0.0, 1e-12),
                         "Temperature: variance = 0");
-            TEST_ASSERT(written == 40, "Temperature: payload size = 40");
+            TEST_ASSERT(written == 44, "Temperature: payload size = 44");
         }
 
         // ---- sensor_msgs/RelativeHumidity: % → 0..1 -----------------------
@@ -3399,7 +3401,7 @@ int main()
             TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::RelativeHumidity, ctx, buf, sizeof(buf), written),
                         "RelativeHumidity: serialize ok");
             // Same layout offsets as Temperature.
-            TEST_ASSERT(nearly(lef64(buf + 24), 0.55, 1e-6),
+            TEST_ASSERT(nearly(lef64(buf + 28), 0.55, 1e-6),
                         "RelativeHumidity: 55% → 0.55");
         }
 
@@ -3418,7 +3420,7 @@ int main()
             ctx.timestampMs = 0; ctx.frameId = "raft";
             TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::FluidPressure, ctx, buf, sizeof(buf), written),
                         "FluidPressure: serialize ok");
-            TEST_ASSERT(nearly(lef64(buf + 24), 101325.0, 1.0),
+            TEST_ASSERT(nearly(lef64(buf + 28), 101325.0, 1.0),
                         "FluidPressure: 1013.25 hPa → 101325 Pa");
         }
 
@@ -3437,7 +3439,7 @@ int main()
             ctx.timestampMs = 0; ctx.frameId = "raft";
             TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Illuminance, ctx, buf, sizeof(buf), written),
                         "Illuminance: serialize ok");
-            TEST_ASSERT(nearly(lef64(buf + 24), 350.5, 1e-3),
+            TEST_ASSERT(nearly(lef64(buf + 28), 350.5, 1e-3),
                         "Illuminance: als = 350.5 lux");
         }
 
@@ -3487,24 +3489,25 @@ int main()
             //          + linear_acceleration(3×f64) + lin_cov(9×f64).
             // header size: sec(4) + ns(4) + string(len4 + "raft\0" = 5) + pad
             //              = 4 + 4 + 4 + 5 = 17 → align 8 → 24.  Pos at header end = 4(encap) + 24 = 28? 
-            // Actually encap=4, sec@4, ns@8, strlen@12, bytes@16..20, pad@20..24, orient.x@24 (aligned 8).
+            // encap=4, sec@4, ns@8, strlen@12, bytes@16..21; body-relative align 8
+            // → orient.x at body 24 = absolute 28 (ROS 2 aligns after the header).
             // orientation: x=0 y=0 z=0 w=1.
-            TEST_ASSERT(nearly(lef64(buf + 24),  0.0, 1e-12), "Accel: orient.x = 0");
-            TEST_ASSERT(nearly(lef64(buf + 24 + 8*3), 1.0, 1e-12), "Accel: orient.w = 1");
-            // orient_covariance[0] = -1 (unknown) at offset 24 + 32 = 56.
-            TEST_ASSERT(nearly(lef64(buf + 56), -1.0, 1e-12), "Accel: orient_cov[0] = -1");
-            // After orient_cov (9×8=72 bytes) → 56+72 = 128. angular_velocity.x at 128.
-            TEST_ASSERT(nearly(lef64(buf + 128), 0.0, 1e-12), "Accel: gx = 0");
-            // ang_cov starts at 128 + 24 = 152. ang_cov[0] = -1 (unknown for accel-only).
-            TEST_ASSERT(nearly(lef64(buf + 152), -1.0, 1e-12),
+            TEST_ASSERT(nearly(lef64(buf + 28),  0.0, 1e-12), "Accel: orient.x = 0");
+            TEST_ASSERT(nearly(lef64(buf + 28 + 8*3), 1.0, 1e-12), "Accel: orient.w = 1");
+            // orient_covariance[0] = -1 (unknown) at offset 28 + 32 = 60.
+            TEST_ASSERT(nearly(lef64(buf + 60), -1.0, 1e-12), "Accel: orient_cov[0] = -1");
+            // After orient_cov (9×8=72 bytes) → 60+72 = 132. angular_velocity.x at 132.
+            TEST_ASSERT(nearly(lef64(buf + 132), 0.0, 1e-12), "Accel: gx = 0");
+            // ang_cov starts at 132 + 24 = 156. ang_cov[0] = -1 (unknown for accel-only).
+            TEST_ASSERT(nearly(lef64(buf + 156), -1.0, 1e-12),
                         "Accel: angular_velocity_cov[0] = -1 (unknown)");
-            // lin_accel.x at 152 + 72 = 224. Value: 1.0 g × 9.80665.
-            TEST_ASSERT(nearly(lef64(buf + 224), 9.80665, 1e-6),
+            // lin_accel.x at 156 + 72 = 228. Value: 1.0 g × 9.80665.
+            TEST_ASSERT(nearly(lef64(buf + 228), 9.80665, 1e-6),
                         "Accel: ax = 1g → 9.80665 m/s²");
-            // lin_cov at 224 + 24 = 248. lin_cov[0] = 0 (valid).
-            TEST_ASSERT(nearly(lef64(buf + 248), 0.0, 1e-12),
+            // lin_cov at 228 + 24 = 252. lin_cov[0] = 0 (valid).
+            TEST_ASSERT(nearly(lef64(buf + 252), 0.0, 1e-12),
                         "Accel: linear_accel_cov[0] = 0 (valid)");
-            TEST_ASSERT(written == 248 + 72, "Accel: payload size");
+            TEST_ASSERT(written == 252 + 72, "Accel: payload size");
         }
 
         // ---- sensor_msgs/Imu composite (LSM6DS) --------------------------
@@ -3527,13 +3530,13 @@ int main()
             TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Imu, ctx, buf, sizeof(buf), written),
                         "Imu: serialize ok");
             // ang_cov[0] = 0 (valid) for composite Imu.
-            TEST_ASSERT(nearly(lef64(buf + 152), 0.0, 1e-12),
+            TEST_ASSERT(nearly(lef64(buf + 156), 0.0, 1e-12),
                         "Imu: angular_velocity_cov[0] = 0 (valid for composite)");
             // gx: 10 °/s → 10 × π/180 ≈ 0.1745329
-            TEST_ASSERT(nearly(lef64(buf + 128), 10.0 * 0.017453292519943295, 1e-9),
+            TEST_ASSERT(nearly(lef64(buf + 132), 10.0 * 0.017453292519943295, 1e-9),
                         "Imu: gx = 10°/s → 0.1745 rad/s");
             // ax: 0.5 g → 0.5 × 9.80665
-            TEST_ASSERT(nearly(lef64(buf + 224), 0.5 * 9.80665, 1e-6),
+            TEST_ASSERT(nearly(lef64(buf + 228), 0.5 * 9.80665, 1e-6),
                         "Imu: ax = 0.5g → 4.903 m/s²");
         }
 
@@ -3550,11 +3553,12 @@ int main()
             ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
             TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(RTPSAutoPubMsgKind::Wrench, ctx, buf, sizeof(buf), written),
                         "Wrench: serialize ok");
-            // encap(4) + 6×float64 (aligned 8 → starts pad to 8) = 4+4 pad + 48 = 56.
-            TEST_ASSERT(written == 56, "Wrench: 4 encap + 4 pad + 48 = 56 bytes");
-            // force.z is the 3rd double → offset 8 + 16 = 24.
-            TEST_ASSERT(nearly(lef64(buf + 24), 5.25, 1e-6), "Wrench: force.z = 5.25 N");
-            TEST_ASSERT(nearly(lef64(buf + 8), 0.0, 1e-12), "Wrench: force.x = 0");
+            // encap(4) + 6×float64: the first double is at body 0 = absolute 4,
+            // no padding (alignment is body-relative) → 52 bytes.
+            TEST_ASSERT(written == 52, "Wrench: 4 encap + 48 = 52 bytes");
+            // force.z is the 3rd double → offset 4 + 16 = 20.
+            TEST_ASSERT(nearly(lef64(buf + 20), 5.25, 1e-6), "Wrench: force.z = 5.25 N");
+            TEST_ASSERT(nearly(lef64(buf + 4), 0.0, 1e-12), "Wrench: force.x = 0");
             TEST_ASSERT(nearly(lef64(buf + 16), 0.0, 1e-12), "Wrench: force.y = 0");
         }
 

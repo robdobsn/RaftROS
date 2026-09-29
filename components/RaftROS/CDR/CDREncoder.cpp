@@ -21,6 +21,7 @@ void CDREncoder::reset(uint8_t* pBuf, uint32_t bufLen)
     _pBuf = pBuf;
     _bufLen = bufLen;
     _pos = 0;
+    _origin = 0;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -41,6 +42,7 @@ bool CDREncoder::writeEncapsulationHeader(bool littleEndian)
     // Bytes 2-3: options (zero)
     _pBuf[_pos++] = 0x00;
     _pBuf[_pos++] = 0x00;
+    _origin = _pos;
     return true;
 }
 
@@ -50,7 +52,7 @@ bool CDREncoder::writeEncapsulationHeader(bool littleEndian)
 
 bool CDREncoder::align(uint32_t alignment)
 {
-    uint32_t remainder = _pos % alignment;
+    uint32_t remainder = (_pos - _origin) % alignment;
     if (remainder == 0)
         return true;
     uint32_t padding = alignment - remainder;

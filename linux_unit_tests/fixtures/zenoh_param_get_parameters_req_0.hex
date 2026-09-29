@@ -1,0 +1,4 @@
+# Captured 2026-09-28 from ros2 param (Jazzy) via rmw_zenohd 0.2.10 / zenoh 1.x: get_parameters REQ.
+# Network-message bytes as carried in one FRAME (frame header and sequence stripped).
+# ['chatterEnable']
+dc011ba10db40226c0cf24a301c31b0000010000010000000e00000063686174746572456e61626c65004521010000000000000060b15e35928cd91810bbad319d2048193147c3d6ba4e30925c

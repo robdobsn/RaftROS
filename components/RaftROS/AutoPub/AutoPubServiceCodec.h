@@ -33,6 +33,7 @@ enum class AutoPubServiceKind : uint8_t
     Trigger,        ///< std_srvs/srv/Trigger: () -> (bool success, string message)
     SetBool,        ///< std_srvs/srv/SetBool: (bool data) -> (bool success, string message)
     Empty,          ///< std_srvs/srv/Empty:   () -> ()
+    Raw,            ///< Any type: the handler decodes the request CDR and encodes the response CDR itself
 };
 
 /// @brief Wire type name for a kind, in the form a Zenoh service key carries
@@ -66,6 +67,8 @@ struct AutoPubServiceRequestFields
 {
     AutoPubServiceKind kind = AutoPubServiceKind::Unknown;
     bool data = false;
+    const uint8_t* raw = nullptr;   ///< Raw: the request CDR, valid during the handler call only
+    uint32_t rawLen = 0;
 };
 
 /// @brief A response to encode.  `success`/`message` are used by Trigger and
@@ -74,6 +77,8 @@ struct AutoPubServiceResponseFields
 {
     bool success = false;
     const char* message = "";
+    const uint8_t* raw = nullptr;   ///< Raw: the encoded response CDR (copied by the registry)
+    uint32_t rawLen = 0;
 };
 
 /// @brief Decode a request of the given kind
@@ -98,6 +103,8 @@ inline bool AutoPubServiceCodec_decodeRequest(AutoPubServiceKind kind, const uin
             return decoder.readUint8(byte);
         case AutoPubServiceKind::SetBool:
             return decoder.readBool(out.data);
+        case AutoPubServiceKind::Raw:
+            return true;                // the handler decodes it
         default:
             return false;
     }
@@ -110,6 +117,13 @@ inline uint32_t AutoPubServiceCodec_encodeResponse(AutoPubServiceKind kind, cons
 {
     if (!out || kind == AutoPubServiceKind::Unknown)
         return 0;
+    if (kind == AutoPubServiceKind::Raw)
+    {
+        if (!in.raw || in.rawLen == 0 || in.rawLen > capacity)
+            return 0;
+        std::memcpy(out, in.raw, in.rawLen);
+        return in.rawLen;
+    }
     CDREncoder encoder;
     encoder.reset(out, capacity);
     if (!encoder.writeEncapsulationHeader())

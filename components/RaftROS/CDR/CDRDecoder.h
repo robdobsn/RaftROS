@@ -57,6 +57,7 @@ private:
     const uint8_t* _pBuf = nullptr;
     uint32_t _bufLen = 0;
     uint32_t _pos = 0;
+    uint32_t _origin = 0;           ///< Alignment origin: the body start after the encapsulation header
     bool _littleEndian = true;
 
     bool align(uint32_t alignment);
