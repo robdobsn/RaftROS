@@ -220,8 +220,14 @@ deferred path, proving a handler never blocks the loop.
 *Gate:* the loop's worst pass during calls is unchanged from S3; the reply
 carries a fresh reading; a deferred call with the sensor unplugged is answered
 `ERR` at the timeout, not hung.
-**Met 2026-09-28**, except the sensor-unplugged case, which needs hands on
-the board and is still to be run (the timeout path itself is host-tested).
+**Met 2026-09-28**; the sensor-unplugged case **met 2026-09-29**: with the
+VL6180 out, the device withdrew `/raft/range_1_29`, `/raft_esp32/devices`
+reported 0 devices, and a `/raft_esp32/range` call was answered `ERR`
+reason `timeout` 5.3 s after the CLI started (the 5 s deadline); session up,
+loop maximum unchanged. Plugged back in, it re-attached as a fresh endpoint
+and range calls answered 148-186 ms after the call. Note: `ros2 service
+call` logs an `ERR` reply and then keeps waiting - scripts need their own
+timeout.
 `/raft_esp32/range` (Trigger) in the example: the handler parks the request
 and returns `Deferred`; a DeviceManager data callback on the bus task bumps a
 counter per VL6180 poll result; `MainSysMod::loop()` completes the request
@@ -283,7 +289,7 @@ Trigger key - empty payload `ERR 'bad request'`, 900 B answered, 3000 B
 (dropped, `rxDropped` 1) all with the session still up. The two defects the
 last row found (the `ERR` encoding flag, oversized payloads failing the
 batch) are in the results document. Image 1268 kB (28% of the slot free).
-Still to run: a deferred call with the sensor unplugged (needs hands).
+The unplugged-sensor case ran 2026-09-29 (S5 above): every row is now shown.
 
 ## 6. Risks and What Retires Them
 
