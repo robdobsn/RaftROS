@@ -1,0 +1,1049 @@
+diff --git a/components/core/Bus/BusAddrRecord.h b/components/core/Bus/BusAddrRecord.h
+index 720ef0b..4c7a03d 100644
+--- a/components/core/Bus/BusAddrRecord.h
++++ b/components/core/Bus/BusAddrRecord.h
+@@ -12,6 +12,7 @@
+ #include "DeviceStatus.h"
+ #include "RaftBusConsts.h"
+ #include "BusAddrStatus.h"
++#include "Logger.h"
+ 
+ /// @brief Full address record for internal bus status management
+ /// This is used to track the status of a bus address and to determine when to report changes in status
+@@ -66,11 +67,20 @@ public:
+             uint32_t failMax = BusAddrStatus::ADDR_RESP_COUNT_FAIL_MAX_DEFAULT);
+     
+     // Register for data change
+-    void registerForDataChange(RaftDeviceDataChangeCB dataChangeCB, uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo)
++    /// @return false if this replaced a different subscriber's callback (identified by pCallbackInfo).
++    /// A bus address holds ONE data callback: register through DeviceManager::registerForDeviceData,
++    /// which owns this slot and fans data out to any number of subscribers.
++    bool registerForDataChange(RaftDeviceDataChangeCB dataChangeCB, uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo)
+     {
++        const bool displaced = dataChangeCB && this->dataChangeCB && (this->pCallbackInfo != pCallbackInfo);
++        if (displaced)
++            LOG_W("BusAddrRecord", "address 0x%x: data callback (info %p) replaced by another subscriber (info %p) - "
++                  "register through DeviceManager::registerForDeviceData to share a device",
++                  (unsigned)address, this->pCallbackInfo, pCallbackInfo);
+         this->dataChangeCB = dataChangeCB;
+         this->pCallbackInfo = pCallbackInfo;
+         this->minTimeBetweenReportsMs = minTimeBetweenReportsMs;
++        return !displaced;
+     }
+ 
+     // Get device data change callback
+diff --git a/components/core/DeviceManager/DeviceDataSubscribers.h b/components/core/DeviceManager/DeviceDataSubscribers.h
+new file mode 100644
+index 0000000..257d919
+--- /dev/null
++++ b/components/core/DeviceManager/DeviceDataSubscribers.h
+@@ -0,0 +1,352 @@
++/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++//
++// DeviceDataSubscribers.h
++//
++// Fan-out of device data to any number of subscribers.
++//
++// A bus keeps ONE data callback per device address (BusAddrRecord), so two
++// subscribers to the same device used to overwrite each other silently.  The
++// DeviceManager now owns that single slot on every device and this class
++// dispatches each sample to every matching subscriber - by device ID or by
++// device type index - with a per-subscriber, per-device rate limit.
++//
++// Threading: dispatch() runs on a bus (or device) task; add() and remove()
++// run on any task.  The subscriber list is guarded by a mutex that is never
++// held while a subscriber is called.  remove() does not return while that
++// subscriber is being called on another task (so the subscriber may be
++// destroyed afterwards), matching the guarantee the bus gives.  A subscriber
++// that removes itself (or another) from inside its own callback does not
++// wait - it would wait on itself - and the entry is erased when the dispatch
++// finishes.
++//
++// Dispatch uses no heap: matching subscribers are collected into a fixed
++// array (MAX_PER_DISPATCH; more are counted in dispatchOverflows()).
++//
++/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++
++#pragma once
++
++#include <stdint.h>
++#include <list>
++#include <vector>
++#include <utility>
++#include "RaftThreading.h"
++#include "RaftDeviceConsts.h"
++
++class DeviceDataSubscribers
++{
++public:
++    static const uint32_t MAX_PER_DISPATCH = 8;
++    static const uint32_t MAX_DISPATCH_TASKS = 8;
++    static const uint32_t QUIESCE_MAX_MS = 500;
++
++    DeviceDataSubscribers()
++    {
++        RaftMutex_init(_mutex);
++    }
++    ~DeviceDataSubscribers()
++    {
++        RaftMutex_destroy(_mutex);
++    }
++    DeviceDataSubscribers(const DeviceDataSubscribers&) = delete;
++    DeviceDataSubscribers& operator=(const DeviceDataSubscribers&) = delete;
++
++    /// @brief Subscribe to one device
++    void addForDevice(RaftDeviceID deviceID, RaftDeviceDataChangeCB cb, uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo)
++    {
++        add(Sub::Kind::DEVICE_ID, deviceID, DEVICE_TYPE_INDEX_INVALID, cb, minTimeBetweenReportsMs, pCallbackInfo);
++    }
++
++    /// @brief Subscribe to every device of a type
++    void addForType(DeviceTypeIndexType deviceTypeIndex, RaftDeviceDataChangeCB cb, uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo)
++    {
++        add(Sub::Kind::DEVICE_TYPE, RaftDeviceID(), deviceTypeIndex, cb, minTimeBetweenReportsMs, pCallbackInfo);
++    }
++
++    /// @brief Unsubscribe from one device (matched by device ID and callback info)
++    /// @return number of subscriptions removed
++    uint32_t removeForDevice(RaftDeviceID deviceID, const void* pCallbackInfo)
++    {
++        return remove([&](const Sub& s) {
++            return s.kind == Sub::Kind::DEVICE_ID && s.deviceID == deviceID && s.pCallbackInfo == pCallbackInfo;
++        });
++    }
++
++    /// @brief Unsubscribe from a type (matched by type index and callback info)
++    /// @return number of subscriptions removed
++    uint32_t removeForType(DeviceTypeIndexType deviceTypeIndex, const void* pCallbackInfo)
++    {
++        return remove([&](const Sub& s) {
++            return s.kind == Sub::Kind::DEVICE_TYPE && s.deviceTypeIndex == deviceTypeIndex && s.pCallbackInfo == pCallbackInfo;
++        });
++    }
++
++    /// @brief Deliver one sample to every matching subscriber
++    /// @param deviceID the device the sample came from
++    /// @param deviceTypeIndex its type (DEVICE_TYPE_INDEX_INVALID if not yet identified)
++    /// @param data the sample; moved to the last subscriber, copied for the others
++    /// @param timeNowMs for rate limiting
++    /// @return number of subscribers called
++    uint32_t dispatch(RaftDeviceID deviceID, DeviceTypeIndexType deviceTypeIndex, std::vector<uint8_t>&& data, uint32_t timeNowMs)
++    {
++        Sub* toCall[MAX_PER_DISPATCH];
++        uint32_t numToCall = 0;
++        const void* thisTask = currentTask();
++        if (!RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER))
++            return 0;
++        for (Sub& s : _subs)
++        {
++            if (s.removed || !s.matches(deviceID, deviceTypeIndex))
++                continue;
++            if (!s.rateAllows(deviceID, timeNowMs))
++                continue;
++            if (numToCall >= MAX_PER_DISPATCH)
++            {
++                _dispatchOverflows++;
++                continue;
++            }
++            s.inProgress++;
++            toCall[numToCall++] = &s;
++        }
++        if (numToCall)
++            noteDispatchTask(thisTask, +1);
++        RaftMutex_unlock(_mutex);
++
++        // Entries are not erased while inProgress > 0, so these pointers stay valid
++        for (uint32_t i = 0; i < numToCall; i++)
++        {
++            if (i + 1 < numToCall)
++                toCall[i]->cb(deviceTypeIndex, data, toCall[i]->pCallbackInfo);
++            else
++                toCall[i]->cb(deviceTypeIndex, std::move(data), toCall[i]->pCallbackInfo);
++        }
++
++        if (numToCall)
++        {
++            RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER);
++            for (uint32_t i = 0; i < numToCall; i++)
++                toCall[i]->inProgress--;
++            noteDispatchTask(thisTask, -1);
++            eraseFinishedRemovals();
++            RaftMutex_unlock(_mutex);
++        }
++        return numToCall;
++    }
++
++    /// @brief True if any live subscription matches the device
++    bool hasSubscriber(RaftDeviceID deviceID, DeviceTypeIndexType deviceTypeIndex)
++    {
++        bool found = false;
++        if (!RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER))
++            return false;
++        for (const Sub& s : _subs)
++            if (!s.removed && s.matches(deviceID, deviceTypeIndex))
++                found = true;
++        RaftMutex_unlock(_mutex);
++        return found;
++    }
++
++    uint32_t count()
++    {
++        uint32_t n = 0;
++        if (!RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER))
++            return 0;
++        for (const Sub& s : _subs)
++            n += s.removed ? 0 : 1;
++        RaftMutex_unlock(_mutex);
++        return n;
++    }
++    uint32_t dispatchOverflows() const { return _dispatchOverflows; }
++
++private:
++    struct LastReport
++    {
++        RaftDeviceID deviceID;
++        uint32_t timeMs = 0;
++    };
++    struct Sub
++    {
++        enum class Kind { DEVICE_ID, DEVICE_TYPE };
++        Kind kind = Kind::DEVICE_ID;
++        RaftDeviceID deviceID;
++        DeviceTypeIndexType deviceTypeIndex = DEVICE_TYPE_INDEX_INVALID;
++        RaftDeviceDataChangeCB cb = nullptr;
++        uint32_t minTimeBetweenReportsMs = 0;
++        const void* pCallbackInfo = nullptr;
++        uint32_t inProgress = 0;
++        bool removed = false;
++        // One entry per device this subscription has reported (a type
++        // subscription covers several); allocated the first time a device
++        // reports, not per sample
++        std::vector<LastReport> lastReports;
++
++        bool matches(RaftDeviceID id, DeviceTypeIndexType typeIdx) const
++        {
++            if (kind == Kind::DEVICE_ID)
++                return deviceID == id;
++            return (typeIdx != DEVICE_TYPE_INDEX_INVALID) && (deviceTypeIndex == typeIdx);
++        }
++        bool rateAllows(RaftDeviceID id, uint32_t timeNowMs)
++        {
++            if (minTimeBetweenReportsMs == 0)
++                return true;
++            for (LastReport& r : lastReports)
++            {
++                if (!(r.deviceID == id))
++                    continue;
++                if (timeNowMs - r.timeMs < minTimeBetweenReportsMs)
++                    return false;
++                r.timeMs = timeNowMs;
++                return true;
++            }
++            lastReports.push_back({id, timeNowMs});
++            return true;
++        }
++    };
++    struct DispatchTask
++    {
++        const void* task = nullptr;
++        uint32_t depth = 0;
++    };
++
++    std::list<Sub> _subs;
++    RaftMutex _mutex;
++    DispatchTask _dispatchTasks[MAX_DISPATCH_TASKS];
++    uint32_t _dispatchOverflows = 0;
++
++    void add(Sub::Kind kind, RaftDeviceID deviceID, DeviceTypeIndexType typeIdx,
++             RaftDeviceDataChangeCB cb, uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo)
++    {
++        if (!cb)
++            return;
++        Sub s;
++        s.kind = kind;
++        s.deviceID = deviceID;
++        s.deviceTypeIndex = typeIdx;
++        s.cb = cb;
++        s.minTimeBetweenReportsMs = minTimeBetweenReportsMs;
++        s.pCallbackInfo = pCallbackInfo;
++        if (!RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER))
++            return;
++        _subs.push_back(std::move(s));
++        RaftMutex_unlock(_mutex);
++    }
++
++    template <typename Match>
++    uint32_t remove(Match match)
++    {
++        uint32_t numRemoved = 0;
++        bool mustWait = false;
++        if (!RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER))
++            return 0;
++        for (auto it = _subs.begin(); it != _subs.end();)
++        {
++            if (it->removed || !match(*it))
++            {
++                ++it;
++                continue;
++            }
++            numRemoved++;
++            if (it->inProgress == 0)
++            {
++                it = _subs.erase(it);
++                continue;
++            }
++            // Being called right now: no new call can start (removed), and the
++            // dispatch that holds it erases it when it finishes
++            it->removed = true;
++            mustWait = true;
++            ++it;
++        }
++        // Waiting from inside a dispatch on this task would wait on ourselves
++        const bool calledFromDispatch = isDispatchTask(currentTask());
++        RaftMutex_unlock(_mutex);
++
++        if (mustWait && !calledFromDispatch)
++        {
++            const uint32_t startMs = nowMs();
++            while (true)
++            {
++                bool stillThere = false;
++                RaftMutex_lock(_mutex, RAFT_MUTEX_WAIT_FOREVER);
++                for (const Sub& s : _subs)
++                    if (s.removed && match(s))
++                        stillThere = true;
++                RaftMutex_unlock(_mutex);
++                if (!stillThere)
++                    break;
++                if (nowMs() - startMs > QUIESCE_MAX_MS)
++                    break;
++                RaftThread_sleep(1);
++            }
++        }
++        return numRemoved;
++    }
++
++    void eraseFinishedRemovals()
++    {
++        for (auto it = _subs.begin(); it != _subs.end();)
++        {
++            if (it->removed && it->inProgress == 0)
++                it = _subs.erase(it);
++            else
++                ++it;
++        }
++    }
++
++    void noteDispatchTask(const void* task, int delta)
++    {
++        for (DispatchTask& d : _dispatchTasks)
++        {
++            if (d.task == task && d.depth > 0)
++            {
++                d.depth += delta;
++                if (d.depth == 0)
++                    d.task = nullptr;
++                return;
++            }
++        }
++        if (delta > 0)
++        {
++            for (DispatchTask& d : _dispatchTasks)
++            {
++                if (d.depth == 0)
++                {
++                    d.task = task;
++                    d.depth = 1;
++                    return;
++                }
++            }
++        }
++    }
++    bool isDispatchTask(const void* task) const
++    {
++        for (const DispatchTask& d : _dispatchTasks)
++            if (d.depth > 0 && d.task == task)
++                return true;
++        return false;
++    }
++
++    static const void* currentTask()
++    {
++#if defined(FREERTOS_CONFIG_H) || defined(FREERTOS_H) || defined(ESP_PLATFORM)
++        return (const void*)xTaskGetCurrentTaskHandle();
++#elif defined(__linux__)
++        return (const void*)(uintptr_t)pthread_self();
++#else
++        return nullptr;
++#endif
++    }
++    static uint32_t nowMs()
++    {
++#if defined(FREERTOS_CONFIG_H) || defined(FREERTOS_H) || defined(ESP_PLATFORM)
++        return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
++#elif defined(__linux__)
++        struct timespec ts;
++        clock_gettime(CLOCK_MONOTONIC, &ts);
++        return (uint32_t)(ts.tv_sec * 1000 + ts.tv_nsec / 1000000);
++#else
++        return 0;
++#endif
++    }
++};
+diff --git a/components/core/DeviceManager/DeviceManager.cpp b/components/core/DeviceManager/DeviceManager.cpp
+index 5686e2c..c2624a6 100644
+--- a/components/core/DeviceManager/DeviceManager.cpp
++++ b/components/core/DeviceManager/DeviceManager.cpp
+@@ -236,77 +236,23 @@ void DeviceManager::busElemStatusCB(RaftBus& bus, const std::vector<BusAddrStatu
+         if (addrStatus.onlineState != DeviceOnlineState::ONLINE)
+             continue;
+ 
+-        // Take a copy of the requested device data change callbacks under the lock (the list may be changed
+-        // by registerForDeviceData on another task). This must be taken after the status change callbacks
+-        // above as a listener may register for device data from its status change callback (e.g. when a
+-        // device is newly identified) and that registration must be passed to the bus below
+-        std::vector<DeviceDataChangeRec> requestedDeviceDataChangeCBs;
+-        if (RaftMutex_lock(_accessMutex, ACCESS_MUTEX_MAX_WAIT_MS))
+-        {
+-            requestedDeviceDataChangeCBs.assign(_requestedDeviceDataChangeCBList.begin(), _requestedDeviceDataChangeCBList.end());
+-            RaftMutex_unlock(_accessMutex);
+-        }
+-
+-        // Get the devices interface for the bus and if it exists register for device data updates for the deviceID of the bus element with the status change
++        // Own the device's single bus data callback and fan it out to every
++        // subscriber (registerForDeviceData), whenever they register - so a
++        // subscription made after the device came online also takes effect,
++        // and two subscribers to one device both receive its data.  Installed
++        // after the status listeners above, as they may subscribe from there.
+         RaftBusDevicesIF* pBusDevicesIF = bus.getBusDevicesIF();
+         if (!pBusDevicesIF)
+             continue;
++        installBusDataDispatcher(*pBusDevicesIF, bus.getBusNum(), addrStatus.address);
+ 
+-        // Iterate the registered device data change callbacks to see if any match the deviceID or deviceTypeIndex of the bus element with the status change
+-#ifdef DEBUG_BUS_ELEMENT_STATUS_CHANGES
+-        bool recordFound = false;
+-#endif
+-        for (const DeviceDataChangeRec& rec : requestedDeviceDataChangeCBs)
+-        {
+-            // Check if the record matches the deviceID
+-            bool registerForData = (rec.recType == DeviceDataChangeRec::DataChangeRecType::DEVICE_ID) && 
+-                        (rec.deviceID.getBusNum() == bus.getBusNum()) && 
+-                        (rec.deviceID.getAddress() == addrStatus.address);
+-            if (registerForData)
+-            {
+-                // Debug
+-#ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+-                LOG_I(MODULE_PREFIX, "busElemStatusCB MATCH reg deviceID %s against busElem deviceID %s deviceTypeIndex %u", 
+-                    rec.deviceID.toString().c_str(),
+-                    RaftDeviceID(bus.getBusNum(), addrStatus.address).toString().c_str(), addrStatus.deviceTypeIndex);
+-                recordFound = true;
+-#endif
+-                pBusDevicesIF->registerForDeviceData(rec.deviceID.getAddress(), rec.dataChangeCB, rec.minTimeBetweenReportsMs, rec.pCallbackInfo);
+-                break;
+-            }
+-
+-            // Check if the device is newly identified and if the record matches the deviceTypeIndex
+-            bool registerForDataByType = (rec.recType == DeviceDataChangeRec::DataChangeRecType::DEVICE_TYPE_INDEX) && 
+-                        (rec.deviceTypeIndex == addrStatus.deviceTypeIndex) && 
+-                        (addrStatus.deviceTypeIndex != DEVICE_TYPE_INDEX_INVALID);
+-
+-            if (registerForDataByType)
+-            {
+-#ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+-                LOG_I(MODULE_PREFIX, "busElemStatusCB MATCH reg deviceTypeIndex %u against busElem deviceTypeIndex %u", 
+-                        rec.deviceTypeIndex, addrStatus.deviceTypeIndex);
+-                recordFound = true;
+-#endif
+-                pBusDevicesIF->registerForDeviceData(addrStatus.address, rec.dataChangeCB, rec.minTimeBetweenReportsMs, rec.pCallbackInfo);
+-                break;
+-            }
+-
+-#ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+-            String regTypeInfoStr = (rec.recType == DeviceDataChangeRec::DataChangeRecType::DEVICE_ID ? String("DEVICE_ID") + " " + rec.deviceID.toString() : String("DEVICE_TYPE_INDEX") + " " + String(rec.deviceTypeIndex));
+-            String busElemTypeInfoStr = String("DEVICE_ID") + " " + RaftDeviceID(bus.getBusNum(), addrStatus.address).toString() + " DEVICE_TYPE_INDEX " + String(addrStatus.deviceTypeIndex);
+-            LOG_I(MODULE_PREFIX, "busElemStatusCB NO MATCH reg %s busElem %s", regTypeInfoStr.c_str(), busElemTypeInfoStr.c_str());
+-#endif
+-        }
+-
+-        // Debug
+ #ifdef DEBUG_BUS_ELEMENT_STATUS_CHANGES
+-        LOG_I(MODULE_PREFIX, "busElemStatusCB bus %s address %x onlineState %s isNewlyIdentified %s deviceTypeIndex %u numDataChangeCBReqs %d dataChangeCBRequested %s", 
++        LOG_I(MODULE_PREFIX, "busElemStatusCB bus %s address %x onlineState %s isNewlyIdentified %s deviceTypeIndex %u subscribers %d",
+                     bus.getBusName().c_str(), addrStatus.address,
+-                    BusAddrStatus::getOnlineStateStr(addrStatus.onlineState), 
+-                    addrStatus.isNewlyIdentified ? "Y" : "N", 
++                    BusAddrStatus::getOnlineStateStr(addrStatus.onlineState),
++                    addrStatus.isNewlyIdentified ? "Y" : "N",
+                     addrStatus.deviceTypeIndex,
+-                    requestedDeviceDataChangeCBs.size(),
+-                    recordFound ? "Y" : "N");
++                    (int)_deviceDataSubscribers.count());
+ #endif
+ 
+         // Dispatch of status-change listeners now happens at the top of
+@@ -1690,43 +1636,22 @@ RaftRetCode DeviceManager::apiDevManBusName(const String &reqStr, String &respSt
+ void DeviceManager::registerForDeviceData(RaftDeviceID deviceID, RaftDeviceDataChangeCB dataChangeCB, 
+         uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo, bool unregister)
+ {
+-    // Add to requests for device data changes
+     if (unregister)
+     {
+-        // Remove matching record from the list
+-        if (RaftMutex_lock(_accessMutex, ACCESS_MUTEX_MAX_WAIT_MS))
+-        {
+-            _requestedDeviceDataChangeCBList.remove_if([&](const DeviceDataChangeRec& rec) {
+-                return rec.matches(deviceID, dataChangeCB, pCallbackInfo);
+-            });
+-            RaftMutex_unlock(_accessMutex);
+-        }
+-
+-        // Also unregister from the bus (if the device is on a bus) as the callback and callback info may
+-        // already have been installed on the bus (which makes data change callbacks on its own task)
+-        // Note that this must not be done while holding _accessMutex as it may wait for a callback to complete
+-        RaftBus* pBus = raftBusSystem.getBusByNumber(deviceID.getBusNum());
+-        RaftBusDevicesIF* pBusDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
+-        if (pBusDevicesIF)
+-            pBusDevicesIF->unregisterForDeviceData(deviceID.getAddress(), pCallbackInfo);
+-        
++        // Returns only once no call to this subscriber is in progress on another task
++        _deviceDataSubscribers.removeForDevice(deviceID, pCallbackInfo);
+ #ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+-        LOG_I(MODULE_PREFIX, "registerForDeviceData unregister deviceID %s cb callbackInfo %p", 
++        LOG_I(MODULE_PREFIX, "registerForDeviceData unregister deviceID %s callbackInfo %p", 
+                 deviceID.toString().c_str(), pCallbackInfo);
+ #endif
+         return;
+     }
+-
+ #ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+     LOG_I(MODULE_PREFIX, "registerForDeviceData register deviceID %s callbackInfo %p minTimeBetweenReportsMs %u", 
+             deviceID.toString().c_str(), pCallbackInfo, minTimeBetweenReportsMs);
+ #endif
+-
+-    if (RaftMutex_lock(_accessMutex, ACCESS_MUTEX_MAX_WAIT_MS))
+-    {
+-        _requestedDeviceDataChangeCBList.push_back(DeviceDataChangeRec(deviceID, dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo));
+-        RaftMutex_unlock(_accessMutex);
+-    }
++    _deviceDataSubscribers.addForDevice(deviceID, dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo);
++    installStaticDataDispatchers();
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -1741,52 +1666,20 @@ void DeviceManager::registerForDeviceData(DeviceTypeIndexType deviceTypeIndex, R
+ {
+     if (unregister)
+     {
+-        // Remove matching record from the list
+-        if (RaftMutex_lock(_accessMutex, ACCESS_MUTEX_MAX_WAIT_MS))
+-        {
+-            _requestedDeviceDataChangeCBList.remove_if([&](const DeviceDataChangeRec& rec) {
+-                return rec.matches(deviceTypeIndex, dataChangeCB, pCallbackInfo);
+-            });
+-            RaftMutex_unlock(_accessMutex);
+-        }
+-
+-        // Also unregister from all buses as the callback and callback info may already have been installed
+-        // (per address) on a bus (which makes data change callbacks on its own task)
+-        // Registrations on a bus are identified only by the callback info so this is only possible if callback
+-        // info was provided - and note that ALL registrations with this callback info are removed from the buses
+-        // Note that this must not be done while holding _accessMutex as it may wait for a callback to complete
+-        if (pCallbackInfo)
+-        {
+-            for (RaftBus* pBus : raftBusSystem.getBusList())
+-            {
+-                RaftBusDevicesIF* pBusDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
+-                if (pBusDevicesIF)
+-                    pBusDevicesIF->unregisterForDeviceDataAll(pCallbackInfo);
+-            }
+-        }
+-        else
+-        {
+-            LOG_W(MODULE_PREFIX, "registerForDeviceData unregister deviceTypeIndex %u - no callbackInfo so can't unregister from buses",
+-                        deviceTypeIndex);
+-        }
++        // Returns only once no call to this subscriber is in progress on another task
++        _deviceDataSubscribers.removeForType(deviceTypeIndex, pCallbackInfo);
+ #ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+         LOG_I(MODULE_PREFIX, "registerForDeviceData unregister deviceTypeIndex %u callbackInfo %p", 
+                 deviceTypeIndex, pCallbackInfo);
+ #endif
+         return;
+     }
+-
+ #ifdef DEBUG_REGISTER_FOR_DEVICE_DATA
+     LOG_I(MODULE_PREFIX, "registerForDeviceData register deviceTypeIndex %u callbackInfo %p minTimeBetweenReportsMs %u", 
+             deviceTypeIndex, pCallbackInfo, minTimeBetweenReportsMs);
+-#endif    
+-    
+-    // Add to requests for device data changes
+-    if (RaftMutex_lock(_accessMutex, ACCESS_MUTEX_MAX_WAIT_MS))
+-    {
+-        _requestedDeviceDataChangeCBList.push_back(DeviceDataChangeRec(deviceTypeIndex, dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo));
+-        RaftMutex_unlock(_accessMutex);
+-    }
++#endif
++    _deviceDataSubscribers.addForType(deviceTypeIndex, dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo);
++    installStaticDataDispatchers();
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+@@ -1983,48 +1876,59 @@ void DeviceManager::callDeviceStatusChangeCBs(RaftDevice* pDevice, const BusAddr
+ /// @return number of devices registered for data change callbacks
+ uint32_t DeviceManager::postSetupRegisterDataCBs()
+ {
+-    // Get mutex
++    return installStaticDataDispatchers();
++}
++
++/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++/// @brief Install the fan-out as a bus device's single data callback.  Idempotent: the bus replaces its
++/// callback with an identical one (same callback info), so it is safe on every status change.
++/// @param busDevicesIF bus devices interface
++/// @param busNum bus number
++/// @param address device address on the bus
++void DeviceManager::installBusDataDispatcher(RaftBusDevicesIF& busDevicesIF, BusNumType busNum, BusElemAddrType address)
++{
++    const RaftDeviceID deviceID(busNum, address);
++    busDevicesIF.registerForDeviceData(address,
++        [this, deviceID](uint16_t deviceTypeIdx, std::vector<uint8_t> data, const void*) {
++            _deviceDataSubscribers.dispatch(deviceID, deviceTypeIdx, std::move(data), millis());
++        },
++        /*minTimeBetweenReportsMs=*/0, /*pCallbackInfo=*/&_deviceDataSubscribers);
++}
++
++/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
++/// @brief Install the fan-out on static devices that have a subscriber and do not have it yet.  Only
++/// devices with a subscriber: a static device's registerForDeviceData may reach a bus that does not exist.
++/// @return number of static devices newly installed
++uint32_t DeviceManager::installStaticDataDispatchers()
++{
++    std::vector<RaftDevice*> toInstall;
+     if (!RaftMutex_lock(_accessMutex, RAFT_MUTEX_WAIT_FOREVER))
+         return 0;
+-
+-    // Create a vector of devices for the device data change callbacks
+-    std::vector<DeviceDataChangeRecTmp> deviceListForDataChangeCB;
+-    for (auto& rec : _requestedDeviceDataChangeCBList)
++    for (auto& devRec : _staticDeviceList)
+     {
+-        // Check if the record matches a deviceID or deviceTypeIndex in the static device list
+-        RaftDevice* pDevice = nullptr;
+-        for (auto& devRec : _staticDeviceList)
+-        {
+-            if (!devRec.pDevice)
+-                continue;
+-            if ((rec.recType == DeviceDataChangeRec::DataChangeRecType::DEVICE_ID) && (rec.deviceID == devRec.pDevice->getDeviceID()))
+-            {
+-                pDevice = devRec.pDevice;
+-                break;
+-            }
+-            else if ((rec.recType == DeviceDataChangeRec::DataChangeRecType::DEVICE_TYPE_INDEX) && (rec.deviceTypeIndex == devRec.pDevice->getDeviceTypeIndex()))
+-            {
+-                pDevice = devRec.pDevice;
+-                break;
+-            }
+-        }
+-        if (!pDevice)
++        if (!devRec.pDevice)
++            continue;
++        const RaftDeviceID deviceID = devRec.pDevice->getDeviceID();
++        if (std::find(_staticDispatchInstalled.begin(), _staticDispatchInstalled.end(), deviceID) != _staticDispatchInstalled.end())
+             continue;
+-        deviceListForDataChangeCB.push_back({pDevice, rec.dataChangeCB, rec.minTimeBetweenReportsMs, rec.pCallbackInfo});
++        if (!_deviceDataSubscribers.hasSubscriber(deviceID, devRec.pDevice->getDeviceTypeIndex()))
++            continue;
++        _staticDispatchInstalled.push_back(deviceID);
++        toInstall.push_back(devRec.pDevice);
+     }
+     RaftMutex_unlock(_accessMutex);
+ 
+-    // Handle the found devices - register for device data notifications
+-    for (auto& cbRec : deviceListForDataChangeCB)
++    // Outside the lock: a device may call back into DeviceManager
++    for (RaftDevice* pDevice : toInstall)
+     {
+-        // Register for device data notification from the device
+-        cbRec.pDevice->registerForDeviceData(
+-            cbRec.dataChangeCB,
+-            cbRec.minTimeBetweenReportsMs,
+-            cbRec.pCallbackInfo
+-        );
++        const RaftDeviceID deviceID = pDevice->getDeviceID();
++        pDevice->registerForDeviceData(
++            [this, deviceID](uint16_t deviceTypeIdx, std::vector<uint8_t> data, const void*) {
++                _deviceDataSubscribers.dispatch(deviceID, deviceTypeIdx, std::move(data), millis());
++            },
++            /*minTimeBetweenReportsMs=*/0, /*pCallbackInfo=*/&_deviceDataSubscribers);
+     }
+-    return deviceListForDataChangeCB.size();
++    return toInstall.size();
+ }
+ 
+ /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+diff --git a/components/core/DeviceManager/DeviceManager.h b/components/core/DeviceManager/DeviceManager.h
+index 3be3f82..4a87974 100644
+--- a/components/core/DeviceManager/DeviceManager.h
++++ b/components/core/DeviceManager/DeviceManager.h
+@@ -10,6 +10,9 @@
+ #include "BusRequestResult.h"
+ #include "RaftDeviceConsts.h"
+ #include "RaftThreading.h"
++#include "DeviceDataSubscribers.h"
++
++class RaftBusDevicesIF;
+ #include <unordered_map>
+ 
+ class APISourceInfo;
+@@ -157,67 +160,25 @@ private:
+     static const uint32_t DEVICE_LIST_MAX_SIZE = 100;
+ 
+     // Access mutex (mutable to allow locking in const methods)
+-    // This protects _staticDeviceList, _requestedDeviceDataChangeCBList and _requestedDeviceStatusChangeCBList
++    // This protects _staticDeviceList, _staticDispatchInstalled and _requestedDeviceStatusChangeCBList
+     // It is only ever held for short periods (never while calling a callback or another module) so waiting
+     // indefinitely is safe and avoids silently dropping work (e.g. status change callbacks) on contention
+     mutable RaftMutex _accessMutex;
+     static const uint32_t ACCESS_MUTEX_MAX_WAIT_MS = RAFT_MUTEX_WAIT_FOREVER;
+ 
+-    // Device data change record
+-    class DeviceDataChangeRec
+-    {
+-    public:
+-        enum class DataChangeRecType
+-        {
+-            DEVICE_ID,
+-            DEVICE_TYPE_INDEX
+-        };
+-        
+-        DeviceDataChangeRec(RaftDeviceID deviceID, RaftDeviceDataChangeCB dataChangeCB, 
+-                uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo) :
+-            recType(DataChangeRecType::DEVICE_ID),
+-            deviceID(deviceID),
+-            dataChangeCB(dataChangeCB),
+-            minTimeBetweenReportsMs(minTimeBetweenReportsMs),
+-            pCallbackInfo(pCallbackInfo)
+-        {
+-        }
+-
+-        DeviceDataChangeRec(DeviceTypeIndexType deviceTypeIndex, RaftDeviceDataChangeCB dataChangeCB, 
+-                uint32_t minTimeBetweenReportsMs, const void* pCallbackInfo) :
+-            recType(DataChangeRecType::DEVICE_TYPE_INDEX),
+-            deviceTypeIndex(deviceTypeIndex),
+-            dataChangeCB(dataChangeCB),
+-            minTimeBetweenReportsMs(minTimeBetweenReportsMs),
+-            pCallbackInfo(pCallbackInfo)
+-        {
+-        }
+-
+-        /// @brief Check if record matches by device ID
+-        bool matches(RaftDeviceID id, RaftDeviceDataChangeCB, const void* cbInfo) const
+-        {
+-            return recType == DataChangeRecType::DEVICE_ID &&
+-                   deviceID == id && pCallbackInfo == cbInfo;
+-        }
+-
+-        /// @brief Check if record matches by device type index
+-        bool matches(DeviceTypeIndexType typeIdx, RaftDeviceDataChangeCB, const void* cbInfo) const
+-        {
+-            return recType == DataChangeRecType::DEVICE_TYPE_INDEX &&
+-                   deviceTypeIndex == typeIdx && pCallbackInfo == cbInfo;
+-        }
+-
+-        DataChangeRecType recType;
+-        RaftDeviceID deviceID;
+-        DeviceTypeIndexType deviceTypeIndex = DEVICE_TYPE_INDEX_INVALID;
+-        RaftDeviceDataChangeCB dataChangeCB = nullptr;
+-        uint32_t minTimeBetweenReportsMs = 1000;
+-        uint32_t lastReportTime = 0;
+-        const void* pCallbackInfo = nullptr;
+-    };
++    // Device data subscribers.  A bus (and a static device) holds ONE data
++    // callback per device; DeviceManager owns it and fans each sample out to
++    // every subscriber registered through registerForDeviceData, so two
++    // subscribers to the same device no longer displace each other.
++    DeviceDataSubscribers _deviceDataSubscribers;
++
++    /// @brief Install the fan-out as a bus device's single data callback
++    void installBusDataDispatcher(RaftBusDevicesIF& busDevicesIF, BusNumType busNum, BusElemAddrType address);
+ 
+-    // Requested device data change callbacks
+-    std::list<DeviceDataChangeRec> _requestedDeviceDataChangeCBList;
++    /// @brief Install the fan-out on static devices that have a subscriber and do not have it yet
++    /// @return number installed
++    uint32_t installStaticDataDispatchers();
++    std::vector<RaftDeviceID> _staticDispatchInstalled;
+ 
+     // Requested device status change callbacks
+     std::list<RaftDeviceStatusChangeCB> _requestedDeviceStatusChangeCBList;
+@@ -319,18 +280,6 @@ private:
+     /// @param addrStatus Bus element address and status
+     void callDeviceStatusChangeCBs(RaftDevice* pDevice, const BusAddrStatus& addrStatus);
+ 
+-    // Device data change record temporary
+-    struct DeviceDataChangeRecTmp
+-    {
+-        RaftDevice* pDevice = nullptr;
+-        RaftDeviceDataChangeCB dataChangeCB = nullptr;
+-        uint32_t minTimeBetweenReportsMs = 1000;
+-        const void* pCallbackInfo = nullptr;
+-    };
+-
+-    /// @brief Get device data change temporary records
+-    /// @param recList List of temporary records
+-    void getDeviceDataChangeRecTmp(std::list<DeviceDataChangeRecTmp>& recList);
+ 
+     /// @brief Post setup helper - register for device data change callbacks
+     /// @return number of devices registered for data change callbacks
+diff --git a/components/core/RaftDevice/RaftDevice.cpp b/components/core/RaftDevice/RaftDevice.cpp
+index 2145eda..392e7dd 100644
+--- a/components/core/RaftDevice/RaftDevice.cpp
++++ b/components/core/RaftDevice/RaftDevice.cpp
+@@ -249,7 +249,7 @@ void RaftDevice::registerForDeviceData(RaftDeviceDataChangeCB dataChangeCB, uint
+ {
+     // Register with the bus system
+     RaftBus* pBus = raftBusSystem.getBusByNumber(_deviceID.getBusNum());
+-    RaftBusDevicesIF* pBusDevicesIF = pBus->getBusDevicesIF();
++    RaftBusDevicesIF* pBusDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
+     if (pBusDevicesIF)
+         pBusDevicesIF->registerForDeviceData(_deviceID.getAddress(), dataChangeCB, minTimeBetweenReportsMs, pCallbackInfo);
+ }
+diff --git a/linux_unit_tests/DeviceDataSubscribersTest.h b/linux_unit_tests/DeviceDataSubscribersTest.h
+new file mode 100644
+index 0000000..19aae5e
+--- /dev/null
++++ b/linux_unit_tests/DeviceDataSubscribersTest.h
+@@ -0,0 +1,157 @@
++#pragma once
++
++#include <stdio.h>
++#include <atomic>
++#include <thread>
++#include <chrono>
++#include <vector>
++#include "DeviceDataSubscribers.h"
++
++/// @brief Tests for DeviceDataSubscribers: several subscribers per device, by
++/// ID and by type, per-device rate limits, and unsubscribe while a callback is
++/// running on another thread (which must wait) or on this one (which must not)
++class DeviceDataSubscribersTest
++{
++public:
++    int runTests()
++    {
++        printf("Running DeviceDataSubscribersTest...\n");
++        testTwoSubscribersSameDevice();
++        testTypeAndIdSubscribers();
++        testRateLimitPerDevice();
++        testRemoveMatchesInfo();
++        testRemoveWaitsForCallbackOnOtherThread();
++        testSelfRemoveInsideCallback();
++        testDispatchOverflow();
++        if (_failCount == 0)
++            printf("DeviceDataSubscribersTest all tests passed\n");
++        else
++            printf("DeviceDataSubscribersTest FAILED %d tests\n", _failCount);
++        return _failCount;
++    }
++
++private:
++    int _failCount = 0;
++    void check(bool cond, const char* msg)
++    {
++        if (!cond)
++        {
++            printf("TEST_ASSERT failed %s\n", msg);
++            _failCount++;
++        }
++    }
++    static std::vector<uint8_t> sample(uint8_t v) { return std::vector<uint8_t>{v, (uint8_t)(v + 1), (uint8_t)(v + 2)}; }
++
++    // The bug this replaces: a second subscriber silently displaced the first
++    void testTwoSubscribersSameDevice()
++    {
++        DeviceDataSubscribers subs;
++        RaftDeviceID dev(1, 0x29);
++        int a = 0, b = 0;
++        std::vector<uint8_t> seenA, seenB;
++        subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t> d, const void*) { a++; seenA = d; }, 0, (const void*)1);
++        subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t> d, const void*) { b++; seenB = d; }, 0, (const void*)2);
++        const uint32_t n = subs.dispatch(dev, 6, sample(10), 1000);
++        check(n == 2 && a == 1 && b == 1, "testTwoSubscribersSameDevice both called");
++        check(seenA == sample(10) && seenB == sample(10), "testTwoSubscribersSameDevice both see the whole sample");
++        check(subs.dispatch(RaftDeviceID(1, 0x30), 6, sample(1), 1000) == 0 && a == 1, "testTwoSubscribersSameDevice other device not delivered");
++    }
++
++    void testTypeAndIdSubscribers()
++    {
++        DeviceDataSubscribers subs;
++        int byType = 0, byId = 0;
++        subs.addForType(6, [&](uint16_t, std::vector<uint8_t>, const void*) { byType++; }, 0, (const void*)1);
++        subs.addForDevice(RaftDeviceID(1, 0x29), [&](uint16_t, std::vector<uint8_t>, const void*) { byId++; }, 0, (const void*)2);
++        subs.dispatch(RaftDeviceID(1, 0x29), 6, sample(1), 0);
++        subs.dispatch(RaftDeviceID(2, 0x29), 6, sample(1), 0);
++        check(byType == 2 && byId == 1, "testTypeAndIdSubscribers type covers both devices, ID only its own");
++        subs.dispatch(RaftDeviceID(1, 0x29), DEVICE_TYPE_INDEX_INVALID, sample(1), 0);
++        check(byType == 2 && byId == 2, "testTypeAndIdSubscribers unidentified device reaches ID subscribers only");
++        check(subs.hasSubscriber(RaftDeviceID(3, 1), 6) && !subs.hasSubscriber(RaftDeviceID(3, 1), 7),
++              "testTypeAndIdSubscribers hasSubscriber");
++    }
++
++    void testRateLimitPerDevice()
++    {
++        DeviceDataSubscribers subs;
++        int fast = 0, slow = 0;
++        subs.addForType(6, [&](uint16_t, std::vector<uint8_t>, const void*) { fast++; }, 0, (const void*)1);
++        subs.addForType(6, [&](uint16_t, std::vector<uint8_t>, const void*) { slow++; }, 100, (const void*)2);
++        RaftDeviceID d1(1, 1), d2(1, 2);
++        subs.dispatch(d1, 6, sample(1), 1000);
++        subs.dispatch(d2, 6, sample(1), 1010);     // other device: its own limit
++        subs.dispatch(d1, 6, sample(1), 1050);     // too soon for the slow one
++        subs.dispatch(d1, 6, sample(1), 1100);     // 100 ms after the first
++        check(fast == 4, "testRateLimitPerDevice unlimited subscriber gets every sample");
++        check(slow == 3, "testRateLimitPerDevice limited subscriber limited per device");
++    }
++
++    void testRemoveMatchesInfo()
++    {
++        DeviceDataSubscribers subs;
++        RaftDeviceID dev(1, 0x29);
++        int a = 0, b = 0;
++        subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t>, const void*) { a++; }, 0, (const void*)1);
++        subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t>, const void*) { b++; }, 0, (const void*)2);
++        subs.addForType(6, [&](uint16_t, std::vector<uint8_t>, const void*) { b += 100; }, 0, (const void*)2);
++        check(subs.removeForDevice(dev, (const void*)1) == 1, "testRemoveMatchesInfo removes one");
++        check(subs.removeForDevice(dev, (const void*)1) == 0, "testRemoveMatchesInfo second remove finds nothing");
++        subs.dispatch(dev, 6, sample(1), 0);
++        check(a == 0 && b == 101, "testRemoveMatchesInfo the others still delivered");
++        check(subs.removeForType(6, (const void*)2) == 1 && subs.count() == 1, "testRemoveMatchesInfo type removal leaves the ID one");
++    }
++
++    // A subscriber must be safe to destroy once remove() returns
++    void testRemoveWaitsForCallbackOnOtherThread()
++    {
++        DeviceDataSubscribers subs;
++        RaftDeviceID dev(1, 0x29);
++        std::atomic<bool> entered{false}, finished{false};
++        subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t>, const void*) {
++            entered = true;
++            std::this_thread::sleep_for(std::chrono::milliseconds(100));
++            finished = true;
++        }, 0, (const void*)1);
++        std::thread busTask([&]() { subs.dispatch(dev, 6, sample(1), 0); });
++        while (!entered)
++            std::this_thread::sleep_for(std::chrono::milliseconds(1));
++        const auto t0 = std::chrono::steady_clock::now();
++        const uint32_t removed = subs.removeForDevice(dev, (const void*)1);
++        const bool finishedAtReturn = finished;
++        const auto waitedMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
++        busTask.join();
++        check(removed == 1 && finishedAtReturn, "testRemoveWaitsForCallbackOnOtherThread remove returns after the callback");
++        check(waitedMs >= 50, "testRemoveWaitsForCallbackOnOtherThread remove actually waited");
++        check(subs.count() == 0, "testRemoveWaitsForCallbackOnOtherThread entry erased");
++    }
++
++    // Removing from inside a callback must not wait on itself
++    void testSelfRemoveInsideCallback()
++    {
++        DeviceDataSubscribers subs;
++        RaftDeviceID dev(1, 0x29);
++        int calls = 0;
++        subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t>, const void*) {
++            calls++;
++            subs.removeForDevice(dev, (const void*)1);
++        }, 0, (const void*)1);
++        const auto t0 = std::chrono::steady_clock::now();
++        subs.dispatch(dev, 6, sample(1), 0);
++        const auto tookMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
++        subs.dispatch(dev, 6, sample(1), 0);
++        check(calls == 1 && tookMs < 100, "testSelfRemoveInsideCallback no self-wait, not called again");
++        check(subs.count() == 0, "testSelfRemoveInsideCallback entry erased after dispatch");
++    }
++
++    void testDispatchOverflow()
++    {
++        DeviceDataSubscribers subs;
++        RaftDeviceID dev(1, 0x29);
++        int calls = 0;
++        for (int i = 0; i < 9; i++)
++            subs.addForDevice(dev, [&](uint16_t, std::vector<uint8_t>, const void*) { calls++; }, 0, (const void*)(uintptr_t)(i + 1));
++        check(subs.dispatch(dev, 6, sample(1), 0) == 8 && calls == 8 && subs.dispatchOverflows() == 1,
++              "testDispatchOverflow capped at MAX_PER_DISPATCH and counted");
++    }
++};
+diff --git a/linux_unit_tests/Makefile b/linux_unit_tests/Makefile
+index 4dc5929..3ef3947 100644
+--- a/linux_unit_tests/Makefile
++++ b/linux_unit_tests/Makefile
+@@ -69,7 +69,7 @@ OUTPUT = linux_unit_tests
+ 
+ all: $(OUTPUT) test_device_names test_espnow_config
+ 
+-$(OUTPUT): $(SOURCES) ../components/core/RaftJson/RaftJson.h ../components/core/Utils/RaftUtils.h
++$(OUTPUT): $(SOURCES) ../components/core/RaftJson/RaftJson.h ../components/core/Utils/RaftUtils.h ../components/core/DeviceManager/DeviceDataSubscribers.h DeviceDataSubscribersTest.h
+ 	$(CC) $(CFLAGS) $(INCLUDES) -o $(OUTPUT) $(SOURCES)
+ 
+ # Arduino stub object for missing itoa/utoa on Linux
+diff --git a/linux_unit_tests/main.cpp b/linux_unit_tests/main.cpp
+index 0be1558..5bc7144 100644
+--- a/linux_unit_tests/main.cpp
++++ b/linux_unit_tests/main.cpp
+@@ -7,6 +7,7 @@
+ 
+ #include "MsgExchangeHookTest.h"
+ #include "DeviceNamesTest.h"
++#include "DeviceDataSubscribersTest.h"
+ 
+ #include "JSON_test_data_large.h"
+ #include "JSON_test_data_small.h"
+@@ -123,10 +124,38 @@ void testRaftJsonAppendFields()
+         printf("testRaftJsonAppendFields FAILED %d tests\n", failCount);
+ }
+ 
++void testRaftJsonEscapedQuoteInObject()
++{
++    printf("Running testRaftJsonEscapedQuoteInObject...\n");
++    int failCount = 0;
++    // An escaped quote inside a nested object must not end the string when
++    // the object's bounds are located - otherwise every key after the object
++    // disappears (a posted setting like this hid a whole SysMod section)
++    const char* doc = "{\"Other\":{\"x\":1,\"s\":\"a\\\"b\"},\"RaftROS\":{\"routerHost\":\"1.2.3.4\"}}";
++    RaftJson json(doc);
++    std::vector<String> keys;
++    json.getKeys("", keys);
++    TEST_ASSERT(keys.size() == 2 && keys[1] == "RaftROS", "testEscapedQuoteKeysAfterObject");
++    TEST_ASSERT(json.getString("RaftROS/routerHost", "") == "1.2.3.4", "testEscapedQuoteLaterValue");
++    TEST_ASSERT(json.getString("Other/s", "") == "a\"b", "testEscapedQuoteValue");
++    TEST_ASSERT(json.getString("Other", "") == "{\"x\":1,\"s\":\"a\\\"b\"}", "testEscapedQuoteObjectText");
++    // An escaped backslash just before the closing quote ends the string normally
++    const char* doc2 = "{\"A\":{\"p\":\"c:\\\\\"},\"B\":2}";
++    RaftJson json2(doc2);
++    TEST_ASSERT(json2.getLong("B", -1) == 2, "testEscapedBackslashBeforeQuote");
++    // The same inside an array
++    const char* doc3 = "{\"A\":[\"q\\\"]\",1],\"B\":3}";
++    RaftJson json3(doc3);
++    TEST_ASSERT(json3.getLong("B", -1) == 3, "testEscapedQuoteInArray");
++    if (failCount == 0)
++        printf("testRaftJsonEscapedQuoteInObject all tests passed\n");
++}
++
+ int main()
+ {
+     testParseIntList();
+     testRaftJsonAppendFields();
++    testRaftJsonEscapedQuoteInObject();
+ 
+     int constsAxis = RaftJson::getLongIm(JSON_test_data_small, JSON_test_data_small+strlen(JSON_test_data_small), "consts/axis", 0);
+     int minotaur = RaftJson::getLongIm(JSON_test_data_small, JSON_test_data_small+strlen(JSON_test_data_small), "consts/oxis/coo[3]/minotaur[2]", 0);
+@@ -385,6 +414,10 @@ int main()
+     DeviceNamesTest deviceNamesTest;
+     deviceNamesTest.runTests();
+ 
++    // Test device data fan-out (several subscribers per device)
++    DeviceDataSubscribersTest deviceDataSubscribersTest;
++    failCount += deviceDataSubscribersTest.runTests();
++
+     // Check failCount
+     if (failCount > 0)
+         printf("testPrimitives FAILED %d tests\n", failCount);

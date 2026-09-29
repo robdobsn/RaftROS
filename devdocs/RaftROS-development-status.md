@@ -226,6 +226,35 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### RaftCore: Several Subscribers per Device (2026-09-29)
+
+The range-topic regression's root cause, fixed in RaftCore (working tree
+at `/home/rob/rdev/raft/RaftCore`, uncommitted; record patch in
+`devdocs/patches/raftcore-device-data-fanout.patch`):
+
+- `DeviceDataSubscribers` (new, header-only): subscriptions by device ID or
+  type; per-subscriber, per-device rate limits; no heap per sample; the list
+  mutex is never held across a callback; `remove()` returns only once no
+  call to that subscriber is in progress on another task (the guarantee the
+  bus gave), and does not wait when called from inside a callback.
+- `DeviceManager` installs it as the single data callback on every online
+  bus device (and on static devices with a subscriber). The public
+  `registerForDeviceData` API is unchanged. Two old limits went with it: a
+  status change registered only the *first* matching subscription (`break`),
+  and a subscription made after its device came online never took effect.
+- `BusAddrRecord::registerForDataChange` warns (and returns false) when it
+  replaces a different subscriber; `RaftDevice::registerForDeviceData` no
+  longer dereferences a missing bus.
+
+Tests in RaftCore's host suite (seven, including a real second thread for
+the unregister wait); mutations - first-match-only dispatch, and no wait on
+unregister - each caught (7 and 2 failures). The RaftCore test Makefile did
+not rebuild on header changes (the first mutation run "passed"); the new
+headers are now dependencies. On the board: a temporary second VL6180 data
+subscriber and the auto-publisher both received every sample; a temporary
+direct bus registration produced the warning; both removed again. RaftROS
+itself needed no change - it already registers through DeviceManager.
+
 ### One Log Line per Pass on RTPS; a Range Topic That Had Gone Quiet (2026-09-29)
 
 The console finding of 2026-09-28 (a log line costs ~10 ms unattended)
