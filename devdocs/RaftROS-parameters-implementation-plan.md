@@ -91,12 +91,27 @@ handler receives the request CDR and writes the response CDR itself, so
 the six services do not each need a `AutoPubServiceKind`.
 *Gate:* fixtures re-encode byte for byte; truncations of every request
 rejected; mutation checks on the writers.
+**Met 2026-09-29.** `AutoPub/AutoPubParamCodec.h`; every captured response
+re-encodes byte for byte (the two multi-string ones equal but for padding
+bytes, which FastCDR leaves uninitialised - the test masks exactly those);
+every captured request decodes; each truncation of a set request is
+rejected; array values are recognised and stepped over. The registry's Raw
+kind hands the request CDR to the handler and copies the response CDR.
 
 **P2 - Parameter store.** `AutoPub/AutoPubParameterStore.h`: declare
 (name, type, value, description, read-only, on-set callback), get, set
 with type and read-only checks, list with prefixes and depth, describe.
 *Gate:* host tests for each service's semantics including the recursive
 and prefixed list cases and the atomic set (all or nothing).
+**Met 2026-09-29.** `AutoPub/AutoPubParameterStore.h`: declare (with
+description, read-only flag, owner callback), list with prefixes and depth
+and the derived prefixes, get/types/describe with `NotSet` for unknown
+names, set with per-parameter results in the Jazzy node's own words, atomic
+set (the store's checks all pass before any callback runs; a refusing
+callback stops the rest - what earlier callbacks applied stays, which the
+header says). The tests caught one bug on the way: formatted refusal
+reasons shared one buffer, so a request refusing two parameters reported
+the last reason twice. Unit suite 1123 passed (+59 over P0).
 
 **P3 - SysMod integration (first flash).** RaftROS declares the six
 services for its node at setup, maps `chatterEnable` and `routerHost`

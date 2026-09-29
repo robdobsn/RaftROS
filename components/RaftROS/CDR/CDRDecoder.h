@@ -47,6 +47,9 @@ public:
     // Skip bytes
     bool skip(uint32_t count);
 
+    /// @brief Align to the next multiple of `alignment` relative to the body start
+    bool align(uint32_t alignment);
+
     // Get current position
     uint32_t getPos() const { return _pos; }
 
@@ -60,5 +63,4 @@ private:
     uint32_t _origin = 0;           ///< Alignment origin: the body start after the encapsulation header
     bool _littleEndian = true;
 
-    bool align(uint32_t alignment);
 };
