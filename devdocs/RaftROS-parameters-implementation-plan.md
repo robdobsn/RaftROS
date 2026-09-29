@@ -122,10 +122,36 @@ services for its node at setup, maps `chatterEnable` and `routerHost`
 read-only set report their reasons; `ros2 param set /raft_esp32
 chatterEnable false` silences `/chatter`; `routerHost` set survives a
 reboot; loop maxima unchanged; image and heap deltas recorded.
+**Met 2026-09-29** on the ProS3 against `rmw_zenohd` 0.2.10: `ros2 param
+list/get/describe/dump` for every parameter; sets of each type; refusals
+for wrong type, read-only, undeclared name, an invalid `routerHost` and an
+out-of-range `chatterPeriodMs`, each with its reason; `chatterEnable false`
+silences `/chatter`, `chatterPeriodMs 250` gives 4.02 Hz on `ros2 topic
+hz`; a `routerHost` set persists to the overlay (`routerSource` becomes
+`config`), keeps an unrelated posted section intact, and the node
+reconnects once the reply is out. Five defects found and fixed on the way:
+(1) the reply and its `RESPONSE_FINAL` went on separate passes and the
+client logged "ResponseFinal for unknown Request" - they now share one
+frame, as a real server sends them; (2) the store's per-request arrays sat
+on the loop task's stack (headroom 5540 -> 4516 B) - now members, headroom
+5544 B; (3) reusing those arrays leaked a previous refusal's reason into a
+later success; (4) the overlay merge read the chained config and froze the
+whole base `RaftROS` section into NVS - it now merges the overlay document
+alone; (5) RaftCore's `RaftJson` loses every key after an object holding an
+escaped quote, so the merge rebuilds from leaves, and a RaftCore patch is
+in `devdocs/patches/raftcore-json-escaped-quote.patch` (not applied).
+Worst pass 14.5 ms unattended (a `routerHost` set: the NVS write); image
+1272 kB (28% of the slot free); free heap 145.8 kB against 172 kB before
+services (12 service slots with 1 kB replies, the parameter table and its
+working space).
 
 **P4 - Example and documentation.** The example declares one or two
 parameters of its own with an `onSet` (e.g. the chatter period), the README
 gets a *Parameters* section, the results document a row.
+**Met 2026-09-29.** The SysMod adds `chatterPeriodMs` (validated
+100-60000); the example declares `rangeOffsetMm` and reads it where it is
+used - `/raft_esp32/range` answered "range 259.5 mm (offset 4.5)" after a
+set. README *Parameters* section; results row added.
 
 ## 4. Validation Workflow
 

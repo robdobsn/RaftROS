@@ -226,6 +226,22 @@ prerequisite for the initial Zenoh feasibility experiment.
   clears stale generated stack records when sources move. No ESP32 build or
   hardware validation has been repeated.
 
+### Parameters on the Board (2026-09-29)
+
+P1-P4 of the parameters plan: `AutoPubParamCodec.h` (pinned to the P0
+capture), `AutoPubParameterStore.h` (declare, list with prefixes/depth,
+get, types, describe, set, atomic set; the Jazzy node's refusal texts), and
+the SysMod serving the six services as Raw services on the same registry.
+The node declares `use_sim_time` (read-only), `chatterEnable`,
+`chatterPeriodMs` and `routerHost`; the example adds `rangeOffsetMm`. Every
+`ros2 param` command works against the board; see the plan's P3 gate for
+the list and the five defects found on the way - the reply/final split
+(visible as a client-side warning), stack use, a stale reason, and two in
+persisting `routerHost`, one of which is a RaftCore `RaftJson` bug with the
+escaped quote (patch saved, not applied - the user's call). Free heap
+145.8 kB, stack headroom 5544 B, worst pass 14.5 ms (the NVS write of a
+`routerHost` set), image 1272 kB.
+
 ### Parameters P0: the Capture Also Caught a CDR Alignment Bug (2026-09-28)
 
 The parameters plan ([RaftROS-parameters-implementation-plan.md](RaftROS-parameters-implementation-plan.md))

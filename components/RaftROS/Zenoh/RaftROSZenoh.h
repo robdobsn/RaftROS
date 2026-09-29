@@ -34,6 +34,7 @@
 #include "AutoPub/AutoPubDeviceSource.h"
 #include "AutoPub/AutoPubStringMessage.h"
 #include "AutoPub/AutoPubServiceRegistry.h"
+#include "AutoPub/AutoPubParameterStore.h"
 #include "esp_timer.h"
 #include "ZenohAutoPubBackend.h"
 #include "ZenohInterestMatch.h"
@@ -107,9 +108,55 @@ public:
         return _services.complete(token, reply);
     }
 
+    // ---- Parameters ----
+    // The node serves the six ROS 2 parameter services.  A parameter is a
+    // scalar (bool, int64, double, string) held here; its owner's `onSet` is
+    // called when a set passes the checks and decides what the change means.
+    using ParamValue = RaftRuntime::AutoPub::AutoPubParamValue;
+    using ParamType = RaftRuntime::AutoPub::AutoPubParamType;
+    using ParamSetCallback = RaftRuntime::AutoPub::AutoPubParamSetCallback;
+
+    /// @brief Declare a parameter.  @return false if the table is full, the
+    /// name is taken or does not fit, or the value is not a scalar.
+    bool declareParameter(const char* name, const ParamValue& value, const char* description = "",
+                          bool readOnly = false, ParamSetCallback onSet = {})
+    {
+        return _params.declare(name, value, description, readOnly, std::move(onSet)) != decltype(_params)::INVALID_SLOT;
+    }
+    bool declareParameter(const char* name, bool value, const char* description = "", bool readOnly = false, ParamSetCallback onSet = {})
+    {
+        ParamValue v; v.type = ParamType::Bool; v.boolValue = value;
+        return declareParameter(name, v, description, readOnly, std::move(onSet));
+    }
+    bool declareParameter(const char* name, int64_t value, const char* description = "", bool readOnly = false, ParamSetCallback onSet = {})
+    {
+        ParamValue v; v.type = ParamType::Integer; v.integerValue = value;
+        return declareParameter(name, v, description, readOnly, std::move(onSet));
+    }
+    bool declareParameter(const char* name, double value, const char* description = "", bool readOnly = false, ParamSetCallback onSet = {})
+    {
+        ParamValue v; v.type = ParamType::Double; v.doubleValue = value;
+        return declareParameter(name, v, description, readOnly, std::move(onSet));
+    }
+    bool declareParameter(const char* name, const char* value, const char* description = "", bool readOnly = false, ParamSetCallback onSet = {})
+    {
+        ParamValue v; v.type = ParamType::String;
+        if (!value || strlen(value) >= sizeof(v.stringValue))
+            return false;
+        strcpy(v.stringValue, value);
+        return declareParameter(name, v, description, readOnly, std::move(onSet));
+    }
+    /// @brief A parameter's current value, or nullptr
+    const ParamValue* parameter(const char* name) const { return _params.value(name); }
+
     /// @brief Turn the 1 Hz /chatter publisher on or off at run time (the
     /// publisher stays declared; only the sends stop)
-    void setChatterEnabled(bool enabled) { _chatterEnabled = enabled; }
+    void setChatterEnabled(bool enabled)
+    {
+        _chatterEnabled = enabled;
+        ParamValue v; v.type = ParamType::Bool; v.boolValue = enabled;
+        _params.setLocal("chatterEnable", v);      // keep `ros2 param get` truthful
+    }
     bool isChatterEnabled() const { return _chatterEnabled; }
     uint8_t attachedDeviceCount() const { return _autoPubSource.attachedCount(); }
 
@@ -193,7 +240,7 @@ private:
     uint8_t _chatterSlot = RaftRuntime::Zenoh::ZenohAutoPubBackend::INVALID_SLOT;
     uint32_t _lastChatterSendMs = 0;
     uint32_t _chatterMsgIndex = 0;
-    static const uint32_t CHATTER_PUBLISH_INTERVAL_MS = 1000;
+    uint32_t _chatterPeriodMs = 1000;           ///< The chatterPeriodMs parameter
     void publishChatter(uint32_t nowMs);
 
     /// @brief One subscribed topic.  Like a published endpoint it is staged
@@ -274,6 +321,16 @@ private:
         return static_cast<RaftROS*>(context)->onRequest(request);
     }
 
+    // ---- Parameters ----
+    static const uint8_t MAX_PARAMETERS = 16;
+    RaftRuntime::AutoPub::AutoPubParameterStore<MAX_PARAMETERS> _params;
+    uint8_t _paramReplyBuf[1024] = {};          ///< One response at a time; copied by the registry
+    RaftJsonIF& _sysConfig;                     ///< The settings overlay `routerHost` persists into
+    char _routerHostPending[16] = {};           ///< A new router address, applied once its reply is out
+    void setupParameters();
+    bool persistRouterHost(const char* host);
+    void applyPendingRouterHost();
+
     // Loop-budget diagnostics, as on the RTPS build: the worst pass since boot
     // and the worst of each phase within a pass, so a slow pass can be placed
     uint32_t _loopPassMaxUs = 0;
@@ -312,7 +369,7 @@ private:
 
     // Buffers - one receive, one outbound message, both loop-task only
     uint8_t _rxBuf[1024] = {};
-    uint8_t _msgBuf[1024] = {};
+    uint8_t _msgBuf[1400] = {};     ///< A 1 kB service reply with its key, attachment and final
 
     // Diagnostics
     uint32_t _sessionCount = 0;         ///< Sessions established since boot

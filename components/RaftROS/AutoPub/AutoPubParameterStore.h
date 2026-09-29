@@ -149,11 +149,13 @@ public:
     /// @brief GetParameters: a value per requested name; unknown names get NotSet, as rclcpp answers
     uint32_t get(const uint8_t* request, uint32_t length, uint8_t* out, uint32_t capacity) const
     {
-        char names[MAX_PER_REQUEST][AUTOPUB_PARAM_NAME_MAX];
+        auto& names = _scratchNames;
         uint32_t count = 0;
         if (!AutoPubParamCodec_readNames(request, length, names, MAX_PER_REQUEST, count) || count > MAX_PER_REQUEST)
             return 0;
-        AutoPubParamValue values[MAX_PER_REQUEST];
+        auto& values = _scratchValues;
+        for (uint32_t index = 0; index < MAX_PER_REQUEST; ++index)
+            values[index] = AutoPubParamValue();
         for (uint32_t index = 0; index < count; ++index)
         {
             const uint8_t slot = find(names[index]);
@@ -166,11 +168,11 @@ public:
     /// @brief GetParameterTypes: a type per requested name; unknown names get NotSet
     uint32_t getTypes(const uint8_t* request, uint32_t length, uint8_t* out, uint32_t capacity) const
     {
-        char names[MAX_PER_REQUEST][AUTOPUB_PARAM_NAME_MAX];
+        auto& names = _scratchNames;
         uint32_t count = 0;
         if (!AutoPubParamCodec_readNames(request, length, names, MAX_PER_REQUEST, count) || count > MAX_PER_REQUEST)
             return 0;
-        AutoPubParamType types[MAX_PER_REQUEST];
+        auto& types = _scratchTypes;
         for (uint32_t index = 0; index < count; ++index)
         {
             const uint8_t slot = find(names[index]);
@@ -182,11 +184,13 @@ public:
     /// @brief DescribeParameters: a descriptor per requested name; unknown names are described NotSet
     uint32_t describe(const uint8_t* request, uint32_t length, uint8_t* out, uint32_t capacity) const
     {
-        char names[MAX_PER_REQUEST][AUTOPUB_PARAM_NAME_MAX];
+        auto& names = _scratchNames;
         uint32_t count = 0;
         if (!AutoPubParamCodec_readNames(request, length, names, MAX_PER_REQUEST, count) || count > MAX_PER_REQUEST)
             return 0;
-        AutoPubParamDescriptor descriptors[MAX_PER_REQUEST];
+        auto& descriptors = _scratchDescriptors;
+        for (uint32_t index = 0; index < MAX_PER_REQUEST; ++index)
+            descriptors[index] = AutoPubParamDescriptor();
         for (uint32_t index = 0; index < count; ++index)
         {
             const uint8_t slot = find(names[index]);
@@ -203,11 +207,13 @@ public:
     /// @brief SetParameters: each parameter checked and applied on its own, a result each
     uint32_t set(const uint8_t* request, uint32_t length, uint8_t* out, uint32_t capacity)
     {
-        AutoPubParamEntry entries[MAX_PER_REQUEST];
+        auto& entries = _scratchEntries;
         uint32_t count = 0;
         if (!AutoPubParamCodec_readSetRequest(request, length, entries, MAX_PER_REQUEST, count) || count > MAX_PER_REQUEST)
             return 0;
-        AutoPubParamResult results[MAX_PER_REQUEST];
+        auto& results = _scratchResults;
+        for (uint32_t index = 0; index < count; ++index)
+            results[index] = AutoPubParamResult();      // scratch is reused across requests
         for (uint32_t index = 0; index < count; ++index)
             results[index].successful = check(entries[index], results[index].reason, _reasons[index]) &&
                                         apply(entries[index], results[index].reason);
@@ -220,7 +226,7 @@ public:
     /// the store cannot undo an owner's side effects.
     uint32_t setAtomically(const uint8_t* request, uint32_t length, uint8_t* out, uint32_t capacity)
     {
-        AutoPubParamEntry entries[MAX_PER_REQUEST];
+        auto& entries = _scratchEntries;
         uint32_t count = 0;
         if (!AutoPubParamCodec_readSetRequest(request, length, entries, MAX_PER_REQUEST, count) || count > MAX_PER_REQUEST)
             return 0;
@@ -263,6 +269,15 @@ private:
     Param _params[CAPACITY];
     uint8_t _count = 0;
     char _reasons[MAX_PER_REQUEST][AUTOPUB_PARAM_TEXT_MAX] = {};   ///< A formatted refusal per parameter of one set request
+    // Per-request working space, held here rather than on the caller's stack:
+    // a 16-name dump needs ~2.3 kB, and the loop task's headroom is ~5 kB.
+    // One request at a time (loop task only), so one set serves every service.
+    mutable char _scratchNames[MAX_PER_REQUEST][AUTOPUB_PARAM_NAME_MAX] = {};
+    mutable AutoPubParamValue _scratchValues[MAX_PER_REQUEST];
+    mutable AutoPubParamType _scratchTypes[MAX_PER_REQUEST] = {};
+    mutable AutoPubParamDescriptor _scratchDescriptors[MAX_PER_REQUEST];
+    AutoPubParamEntry _scratchEntries[MAX_PER_REQUEST];
+    AutoPubParamResult _scratchResults[MAX_PER_REQUEST];
 
     static uint64_t levels(const char* name)
     {
