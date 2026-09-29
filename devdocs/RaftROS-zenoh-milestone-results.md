@@ -1,7 +1,8 @@
 # RaftROS Zenoh Milestone: Measured Results
 
 This is the findings record for the initial Zenoh milestone (completed
-2026-09-28): what was measured, on what, with what result. The dated sections
+2026-09-28) and the services and parameters work that followed it
+(2026-09-28/29): what was measured, on what, with what result. The dated sections
 of [RaftROS-development-status.md](RaftROS-development-status.md) hold the
 evidence and the fixes behind each number; this document is the summary.
 
@@ -11,7 +12,9 @@ VL6180 range sensor on the STEMMA QT connector (I2C 0x29), WiFi at RSSI -82 to
 runs through `rmw_zenohd` (`ros-jazzy-rmw-zenoh-cpp` 0.2.10), RTPS is checked
 against both CycloneDDS and FastDDS. "Under load" means a ROS 2 subscriber
 actually consuming the device's topic, not the idle figures the project
-carried before 2026-09-26.
+carried before 2026-09-26. Figures from 2026-09-28 on (services, parameters,
+the second soak) are from an Unexpected Maker ProS3 (ESP32-S3) with the same
+sensor, WiFi at RSSI about -71.
 
 ## What works, on both transports
 
@@ -72,6 +75,12 @@ every peer within a pass.
 Zenoh pays about 10 kB of RAM for its loop cost, close to the 11 kB its 16
 endpoint slots reserve for key expressions and liveliness tokens.
 
+With services and parameters (Zenoh, ProS3, 2026-09-29): image 1272 kB (28%
+of the slot free); free heap 147 kB under load (the 12 service slots with
+1 kB replies, the 16-entry parameter store and its working space); stack
+headroom 5564 B, unchanged in use because the parameter store's per-request
+arrays were moved off the loop task's stack.
+
 ## Twelve-hour soak (Zenoh, 2026-09-27/28)
 
 `GET /api/rosstat` sampled once a minute from the ROS host; 675 samples
@@ -90,6 +99,28 @@ endpoint slots reserve for key expressions and liveliness tokens.
 sits ~34 kB below steady state and is reached early and once. So the headroom to
 budget against on this load is **~143 kB**, not the 177 kB steady figure; and
 `heapFreeB`'s trend, not `heapMinB`, is the leak indicator.
+
+## Second soak: services and parameters (Zenoh, 2026-09-29, in progress)
+
+The pushed code (RaftROS `7e0071a`, RaftCore `78781c0`) freshly flashed, and a
+ROS host driving it for 12 h: an `rclpy` subscriber counting `/raft/range_1_29`
+and `/chatter` per minute, and every minute a `/raft_esp32/devices`,
+`/raft_esp32/range` (deferred) and `/raft_esp32/ping` call, a parameter get and
+a `chatterPeriodMs` set (alternating 900/1000 ms), with a full `ros2 param
+dump` every 10 minutes and `rosstat` read each time. No terminal attached.
+
+**At 4 h 22 min (262 minutes):**
+
+| | Result |
+| --- | --- |
+| Calls | 0 failures in ~1,300 service/parameter calls and 26 dumps; 1362 service requests accepted, 1362 completed, 0 timed out, 0 refused |
+| Session | one throughout; 0 connect failures |
+| Topics | range 286-298 samples/min (76,684 total), `/chatter` 60-67/min (16,508); no low minute |
+| Free heap | first-hour mean 146,971 B, latest hour 146,865 B (-106 B) - flat |
+| Minimum free heap | stepped to 114.3 kB by minute 20 and unchanged since (one-off transients, as in the first soak) |
+| Worst loop pass | 13.2 ms, unchanged since boot; stack headroom 5564 B throughout |
+
+The final 12 h figures replace this table when the run ends.
 
 ## Router reachability
 
@@ -166,11 +197,19 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
 
 ## Not done in this milestone
 
-- Services were added after the milestone (2026-09-28, Zenoh only, server
-  side) - see [RaftROS-services-implementation-plan.md](RaftROS-services-implementation-plan.md).
-  Parameters and RTPS services remain open there.
+- Services and parameters were added after the milestone (2026-09-28/29,
+  Zenoh only, server side) - see the
+  [services](RaftROS-services-implementation-plan.md) and
+  [parameters](RaftROS-parameters-implementation-plan.md) plans. On RTPS they
+  were ruled out (2026-09-29). Parameter events (`/parameter_events`) and ROS 2
+  actions are not implemented.
 - Runtime transport switching (deferred by design; one backend per image).
 - Hot-plug was re-verified on Zenoh only; RTPS hot-plug was verified in an
-  earlier phase and not repeated after the shared pipeline extraction.
+  earlier phase and not repeated after the shared pipeline extraction or the
+  RaftCore device-data fan-out (Zenoh is the focus; RTPS not re-tested).
+- The second soak's 32 kB minimum-heap dip (by minute 20) was not attributed
+  either; nothing in the Zenoh path allocates per request, so WiFi/lwIP
+  buffers or the web server serving `rosstat` during call bursts are the
+  likely holders.
 - The 17.7 kB transient heap dip 12 minutes into the soak was not attributed;
   it coincided with REST and graph-tool queries and never recurred.

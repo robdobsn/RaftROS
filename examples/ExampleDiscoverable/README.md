@@ -6,17 +6,19 @@ A minimal Raft ESP32 application that brings up the RaftROS SysMod so the ESP32 
 
 When connected to WiFi and booted:
 
-- Registers as DDS participant `/raft_esp32` on domain 0.
-- Responds to ROS 2 SPDP/SEDP discovery so `ros2 node list` and `ros2 topic list` see it as a first-class node.
+- Appears as ROS 2 node `/raft_esp32` on domain 0, so `ros2 node list` and
+  `ros2 topic list` see it as a first-class node.
 - Publishes `std_msgs/msg/String` on `/chatter` at 1 Hz with a payload like `Hello from raft_esp32 [N]` (RELIABLE + VOLATILE QoS).
-- Handles incoming HEARTBEAT / ACKNACK and retransmits lost SEDP and user-data DATA submessages.
+- Subscribes to `/chatter_in` and `/chatter_in2`.
 - **Auto-publishes every connected bus device** as a typed ROS 2 topic on
   `/raft/<slug>_<bus>_<addrHex>` (Phase 4). For example an MPU6050 at
   `bus=1, addr=0x68` appears as `/raft/imu_1_68` with type
   `sensor_msgs/msg/Imu`. See "Auto-publishing bus devices" below.
-- Does all of the above over **either** transport: native RTPS/DDS (the
-  default) or Zenoh via an `rmw_zenoh` router. The choice is made at build
-  time - see "Choosing the transport" below.
+- Does all of the above over **either** transport: Zenoh via an `rmw_zenoh`
+  router (the default) or native RTPS/DDS. The choice is made at build time -
+  see "Choosing the transport" below.
+- On the Zenoh build, also serves four ROS 2 services and the ROS 2
+  parameter services - see "Services" and "Parameters" below.
 
 ## Build and flash
 
@@ -135,11 +137,18 @@ transport.
 
 ### Services
 
-The Zenoh build also serves two ROS 2 services (the RTPS build compiles the
+The Zenoh build also serves four ROS 2 services (the RTPS build compiles the
 same application code; its `addService` logs a warning and returns -1):
 
+| Service | Type | Does |
+| --- | --- | --- |
+| `/raft_esp32/devices` | `std_srvs/srv/Trigger` | Reports attached devices, chatter state, heap |
+| `/raft_esp32/chatter_enable` | `std_srvs/srv/SetBool` | Starts / stops `/chatter` |
+| `/raft_esp32/range` | `std_srvs/srv/Trigger` | A fresh VL6180 reading - a *deferred* reply (below) |
+| `/raft_esp32/ping` | `std_srvs/srv/Empty` | Nothing - a round-trip check |
+
 ```bash
-ros2 service list -t                         # expect both, with their types
+ros2 service list -t                         # expect the four, plus the parameter services
 ros2 service call /raft_esp32/devices std_srvs/srv/Trigger
 #   success=True, message='1 device(s) attached, chatter on, chatter_in rx 0/0, heap free 173356 B'
 ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: false}"
