@@ -797,6 +797,9 @@ int main()
                         !results[4].first && results[4].second == "not an IPv4 address" &&
                         std::strcmp(store.value("routerHost")->stringValue, "192.168.86.192") == 0,
                         "set: each parameter judged on its own, with the node's reasons");
+            n = store.set(req, setReq({entry("chatterEnable", boolV(true))}), out, sizeof(out));
+            TEST_ASSERT(n && readResults(n, false, results) && results.size() == 1 && results[0].first && results[0].second.empty(),
+                        "set: a success after refusals carries no stale reason");
             AutoPubParamValue arrSet; arrSet.type = AutoPubParamType::Integer; arrSet.hasArrayData = true;
             {
                 // A set carrying array data on the wire
@@ -812,7 +815,7 @@ int main()
                         "atomic set: one refusal and nothing changes");
             n = store.setAtomically(req, setReq({entry("chatterPeriodMs", intV(250)), entry("chatterEnable", boolV(true))}), out, sizeof(out));
             TEST_ASSERT(n && readResults(n, true, results) && results[0].first && store.value("chatterPeriodMs")->integerValue == 250 &&
-                        store.value("chatterEnable")->boolValue && applied == 11, "atomic set: all applied, callbacks ran");
+                        store.value("chatterEnable")->boolValue && applied == 12, "atomic set: all applied, callbacks ran");
             TEST_ASSERT(store.setLocal("chatterPeriodMs", intV(400)) && store.value("chatterPeriodMs")->integerValue == 400 &&
                         !store.setLocal("chatterPeriodMs", boolV(true)), "setLocal keeps the type");
         }

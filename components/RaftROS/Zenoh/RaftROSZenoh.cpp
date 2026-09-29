@@ -44,7 +44,7 @@ using namespace RaftRuntime::Zenoh;
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 RaftROS::RaftROS(const char* pModuleName, RaftJsonIF& sysConfig)
-    : RaftSysMod(pModuleName, sysConfig)
+    : RaftSysMod(pModuleName, sysConfig), _sysConfig(sysConfig)
 {
 }
 
@@ -155,6 +155,9 @@ void RaftROS::setup()
     LOG_I(MODULE_PREFIX, "setup backend=zenoh router=%s:%u domain=%u node=%s%s session=%s",
           _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_domainId,
           _nodeNamespace.c_str(), _nodeName.c_str(), _sessionIdStr);
+
+    // The node's parameters and the six services that expose them
+    setupParameters();
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -225,6 +228,7 @@ void RaftROS::loop()
         case ConnState::READY:
             serviceSession(nowMs);
             publishChatter(nowMs);
+            applyPendingRouterHost();
             break;
     }
 
@@ -736,7 +740,7 @@ bool RaftROS::onDiscovery(const ZenohNetworkMessage::DiscoveryMessage& message)
 void RaftROS::publishChatter(uint32_t nowMs)
 {
     if (!_chatterEnabled || _connState != ConnState::READY ||
-        !Raft::isTimeout(nowMs, _lastChatterSendMs, CHATTER_PUBLISH_INTERVAL_MS))
+        !Raft::isTimeout(nowMs, _lastChatterSendMs, _chatterPeriodMs))
         return;
 
     char message[64];
@@ -1160,10 +1164,230 @@ bool RaftROS::stepServiceReplies(uint32_t nowMs)
         _services.sent();                   // cannot build it; move on rather than wedge
         return false;
     }
+    // The reply and its RESPONSE_FINAL go in one frame, as a real server sends
+    // them (S0 capture).  Sent on separate passes, a client that closes its
+    // query on the reply logs "ResponseFinal for unknown Request" for the final.
+    bool withFinal = false;
+    if (send.kind != AutoPubServiceSend::Kind::Final)
+    {
+        const size_t finalLen = ZenohNetworkMessage::writeResponseFinal(_msgBuf + msgLen, sizeof(_msgBuf) - msgLen,
+                                                                        send.requestId);
+        if (finalLen)
+        {
+            msgLen += finalLen;
+            withFinal = true;
+        }
+    }
     if (!_session.sendNetworkMessage(_msgBuf, msgLen, nowMs))
         return false;
     _services.sent();
+    if (withFinal)
+        _services.sent();                   // the final went with it
     return true;
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Parameters
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+/// @brief Declare the node's own parameters and the six rcl_interfaces
+/// services at <ns>/<node>/<service>.  Each service is Raw: the store reads
+/// the request CDR and writes the response CDR into _paramReplyBuf.
+void RaftROS::setupParameters()
+{
+    using namespace RaftRuntime::AutoPub;
+    // Every ROS 2 node has use_sim_time; ours cannot follow a clock topic
+    declareParameter("use_sim_time", false, "Simulated time is not supported on this node", true);
+    declareParameter("chatterEnable", _chatterEnabled, "Publish /chatter", false,
+        [this](const ParamValue& v, const char*&) { _chatterEnabled = v.boolValue; return true; });
+    declareParameter("chatterPeriodMs", (int64_t)_chatterPeriodMs, "Period of /chatter in ms (100-60000)", false,
+        [this](const ParamValue& v, const char*& reason)
+        {
+            if (v.integerValue < 100 || v.integerValue > 60000)
+            {
+                reason = "chatterPeriodMs must be 100-60000";
+                return false;
+            }
+            _chatterPeriodMs = (uint32_t)v.integerValue;
+            return true;
+        });
+    declareParameter("routerHost", _routerHost.c_str(),
+        "Zenoh router IPv4 address; persisted, applied on the next connection", false,
+        [this](const ParamValue& v, const char*& reason)
+        {
+            struct in_addr addr;
+            if (!inet_aton(v.stringValue, &addr))
+            {
+                reason = "routerHost must be an IPv4 address (DNS would block the loop)";
+                return false;
+            }
+            if (!persistRouterHost(v.stringValue))
+            {
+                reason = "could not persist routerHost to the settings overlay";
+                return false;
+            }
+            // Applied after this reply has gone out, not under it
+            strncpy(_routerHostPending, v.stringValue, sizeof(_routerHostPending) - 1);
+            return true;
+        });
+
+    struct ParamService { const char* name; const char* type; std::function<uint32_t(const uint8_t*, uint32_t, uint8_t*, uint32_t)> fn; };
+    auto& store = _params;
+    const ParamService services[] = {
+        {"list_parameters",          "rcl_interfaces::srv::dds_::ListParameters_",
+            [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.list(r, n, o, c); }},
+        {"get_parameters",           "rcl_interfaces::srv::dds_::GetParameters_",
+            [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.get(r, n, o, c); }},
+        {"get_parameter_types",      "rcl_interfaces::srv::dds_::GetParameterTypes_",
+            [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.getTypes(r, n, o, c); }},
+        {"set_parameters",           "rcl_interfaces::srv::dds_::SetParameters_",
+            [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.set(r, n, o, c); }},
+        {"set_parameters_atomically", "rcl_interfaces::srv::dds_::SetParametersAtomically_",
+            [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.setAtomically(r, n, o, c); }},
+        {"describe_parameters",      "rcl_interfaces::srv::dds_::DescribeParameters_",
+            [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.describe(r, n, o, c); }},
+    };
+    // <ns>/<node>: the namespace already ends in '/' when it is the root
+    String node = _nodeNamespace;
+    if (!node.endsWith("/"))
+        node += "/";
+    node += _nodeName;
+    for (const ParamService& svc : services)
+    {
+        const String name = node + "/" + svc.name;
+        auto fn = svc.fn;
+        if (addService(name.c_str(), svc.type,
+                [this, fn](const ServiceRequest& request, ServiceReply& reply)
+                {
+                    const uint32_t n = fn(request.fields.raw, request.fields.rawLen, _paramReplyBuf, sizeof(_paramReplyBuf));
+                    if (n == 0)
+                    {
+                        reply.reason = "bad request";
+                        return ServiceOutcome::Refused;
+                    }
+                    reply.fields.raw = _paramReplyBuf;
+                    reply.fields.rawLen = n;
+                    return ServiceOutcome::Replied;
+                }) < 0)
+            LOG_W(MODULE_PREFIX, "parameter service %s could not be added", name.c_str());
+    }
+}
+
+/// @brief Write routerHost into the persisted settings overlay - the same
+/// document /api/postsettings replaces - keeping every other section.  The
+/// overlay is small (it holds posted settings only), so this is a shallow
+/// merge of its top-level keys with a rebuilt RaftROS section.
+/// @brief Serialise the element at `path` of `json` back to JSON text, from
+/// its leaves.  RaftJson's getString() on an object returns "" when the
+/// object contains an escaped quote (RaftCore, found 2026-09-29), so objects
+/// and arrays are rebuilt member by member rather than taken as raw text.
+/// Leaf strings come back unescaped and are re-escaped here.
+static void serialiseJsonElement(const RaftJson& json, const String& path, String& out, int depth = 0)
+{
+    int arrayLen = 0;
+    const RaftJsonIF::RaftJsonType type = json.getType(path.c_str(), arrayLen);
+    if (depth > 8)
+    {
+        out += "null";
+        return;
+    }
+    switch (type)
+    {
+        case RaftJsonIF::RAFT_JSON_OBJECT:
+        {
+            std::vector<String> keys;
+            json.getKeys(path.c_str(), keys);
+            out += "{";
+            bool first = true;
+            for (const String& key : keys)
+            {
+                if (!first)
+                    out += ",";
+                first = false;
+                out += "\"" + key + "\":";
+                serialiseJsonElement(json, path.length() ? path + "/" + key : key, out, depth + 1);
+            }
+            out += "}";
+            return;
+        }
+        case RaftJsonIF::RAFT_JSON_ARRAY:
+            out += "[";
+            for (int index = 0; index < arrayLen; ++index)
+            {
+                if (index)
+                    out += ",";
+                serialiseJsonElement(json, path + "[" + String(index) + "]", out, depth + 1);
+            }
+            out += "]";
+            return;
+        case RaftJsonIF::RAFT_JSON_STRING:
+        {
+            String value = json.getString(path.c_str(), "");
+            value.replace("\\", "\\\\");
+            value.replace("\"", "\\\"");
+            out += "\"" + value + "\"";
+            return;
+        }
+        case RaftJsonIF::RAFT_JSON_NUMBER:
+        case RaftJsonIF::RAFT_JSON_BOOLEAN:
+            out += json.getString(path.c_str(), "null");
+            return;
+        default:
+            out += "null";
+            return;
+    }
+}
+
+bool RaftROS::persistRouterHost(const char* host)
+{
+    // Only the overlay's own document: the chained view (_sysConfig itself)
+    // also answers with the base SysTypes, and copying those into NVS would
+    // freeze them - later SysTypes changes would be silently overridden.
+    const char* overlayDoc = _sysConfig.getJsonDoc();
+    RaftJson overlay((overlayDoc && overlayDoc[0] == '{') ? overlayDoc : "{}");
+    std::vector<String> keys;
+    overlay.getKeys("", keys);
+    String doc = "{";
+    for (const String& key : keys)
+    {
+        if (key == "RaftROS")
+            continue;
+        doc += "\"" + key + "\":";
+        serialiseJsonElement(overlay, key, doc);
+        doc += ",";
+    }
+    doc += "\"RaftROS\":{";
+    std::vector<String> ourKeys;
+    overlay.getKeys("RaftROS", ourKeys);
+    for (const String& key : ourKeys)
+    {
+        if (key == "routerHost")
+            continue;
+        doc += "\"" + key + "\":";
+        serialiseJsonElement(overlay, "RaftROS/" + key, doc);
+        doc += ",";
+    }
+    doc += String("\"routerHost\":\"") + host + "\"}}";
+    // An NVS write: a flash operation on the loop, but only when someone sets
+    // routerHost.  No log line on success - it would add ~10 ms to the same pass.
+    const bool ok = _sysConfig.setJsonDoc(doc.c_str());
+    if (!ok)
+        LOG_W(MODULE_PREFIX, "routerHost %s could not be persisted (%u bytes of settings)", host, (unsigned)doc.length());
+    return ok;
+}
+
+/// @brief Switch to a router address set through the parameter service, once
+/// the set's own reply has left - closing the session under the reply would
+/// lose it and the client would report a timeout for a set that worked
+void RaftROS::applyPendingRouterHost()
+{
+    if (_routerHostPending[0] == '\0' || _services.inflightCount() != 0 || _session.outputSize() != 0)
+        return;
+    _routerHost = _routerHostPending;
+    _routerFromConfig = true;
+    _routerHostPending[0] = '\0';
+    _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
+    closeConnection("router address changed");
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -1200,7 +1424,7 @@ String RaftROS::getStatusJSON() const
              R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d,)"
              R"("heapFreeB":%u,"heapMinB":%u,"loopMaxUs":%u,"loopMaxDrainUs":%u,"loopMaxConnUs":%u,"loopMaxRxUs":%u,"loopMaxTxUs":%u,"loopMaxTxParts":"%u/%u/%u","loopMaxRxParts":"%u/%u/%uB",)"
              R"("services":%u,"svcAccepted":%u,"svcCompleted":%u,"svcDeferred":%u,"svcTimedOut":%u,)"
-             R"("svcRefused":%u,"svcUnknownKey":%u})",
+             R"("svcRefused":%u,"svcUnknownKey":%u,"params":%u})",
              _isEnabled ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
@@ -1235,7 +1459,8 @@ String RaftROS::getStatusJSON() const
              (unsigned)svcStats.accepted, (unsigned)svcStats.completed,
              (unsigned)svcStats.deferred, (unsigned)svcStats.timedOut,
              (unsigned)(svcStats.refusedBusy + svcStats.refusedBad + svcStats.refusedByHandler),
-             (unsigned)_requestsUnknownKey);
+             (unsigned)_requestsUnknownKey,
+             (unsigned)_params.count());
     return buf;
 }
 

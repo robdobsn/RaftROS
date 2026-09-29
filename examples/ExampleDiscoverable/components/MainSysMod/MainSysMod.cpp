@@ -110,6 +110,10 @@ void MainSysMod::setup()
                     _rangeRequestPending = true;
                     return RaftROS::ServiceOutcome::Deferred;
                 });
+            // A parameter of the application's own: read where it is used
+            // (serviceRangeRequest), so no callback is needed
+            //   ros2 param set /raft_esp32 rangeOffsetMm 4.5
+            pRaftROS->declareParameter("rangeOffsetMm", 0.0, "Added to every /raft_esp32/range reading, in mm");
             //   ros2 service call /raft_esp32/ping std_srvs/srv/Empty
             pRaftROS->addService("/raft_esp32/ping", "std_srvs::srv::dds_::Empty_",
                 [](const RaftROS::ServiceRequest&, RaftROS::ServiceReply&)
@@ -186,8 +190,11 @@ void MainSysMod::serviceRangeRequest()
     if (pDevicesIF && pDevicesIF->getLatestDecodedPollResponse(_rangeDeviceID.getAddress(),
                                                                &poll, sizeof(poll), _rangeDecodeState))
     {
-        snprintf(_rangeMsg, sizeof(_rangeMsg), "range %.1f mm valid=%d, read %u ms after the call",
-                 (double)poll.dist, (int)poll.valid, (unsigned)(millis() - _rangeRequestMs));
+        // The rangeOffsetMm parameter (ros2 param set /raft_esp32 rangeOffsetMm 4.5)
+        const RaftROS::ParamValue* pOffset = pRaftROS->parameter("rangeOffsetMm");
+        const double offsetMm = pOffset ? pOffset->doubleValue : 0.0;
+        snprintf(_rangeMsg, sizeof(_rangeMsg), "range %.1f mm (offset %.1f) valid=%d, read %u ms after the call",
+                 (double)poll.dist + offsetMm, offsetMm, (int)poll.valid, (unsigned)(millis() - _rangeRequestMs));
         reply.fields.success = true;
     }
     else

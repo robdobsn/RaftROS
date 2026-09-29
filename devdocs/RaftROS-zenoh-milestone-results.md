@@ -25,6 +25,7 @@ carried before 2026-09-26.
 | Device hot-plug (withdraw, fresh endpoint on return) | not re-tested | yes | graph watcher + `rosstat` |
 | Reconnect after router/session loss | n/a | yes | tokens re-declared, sequence continues |
 | Services (server side; `std_srvs` Trigger, SetBool, Empty) | no (planned) | yes (2026-09-28) | `ros2 service list -t`, `ros2 service call`; 50/50 calls answered, worst loop pass unchanged; re-declared within 5 s of a router restart |
+| Parameters (`ros2 param list/get/set/describe/dump`) | no | yes (2026-09-29) | all six `rcl_interfaces` services; refusals with reasons; `routerHost` persisted; `chatterPeriodMs` changes `/chatter` rate live |
 | Deferred service replies (handler never blocks the loop) | no | yes (2026-09-28) | `/raft_esp32/range` answers from the first poll result after the call (39-100 ms later); request path 1 ms in the loop; unplugged sensor -> `ERR` at the timeout |
 
 The application code is identical for both: the transport is a build-time
@@ -125,6 +126,16 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
   as garbage on a ROS host; only Range (float32) had ever been checked
   against one. Fixed at the origin in both helpers; the host tests' offsets
   were re-derived (they had been written from the encoder's own output).
+- (Parameters P3, 2026-09-29) Replies and their `RESPONSE_FINAL` on separate
+  passes made clients log "ResponseFinal for unknown Request"; they now share
+  one frame. Persisting `routerHost` first copied the whole base `RaftROS`
+  section into NVS (read through the chained config), freezing it; it now
+  merges the overlay alone.
+- (RaftCore, found 2026-09-29, **not fixed here**) `RaftJson` counts an escaped
+  quote inside a nested object as the end of a string, so every key after
+  that object disappears - a posted setting like `{"A":{"s":"a\"b"},
+  "RaftROS":{...}}` would hide the whole `RaftROS` section from `configGet*`.
+  Patch: `devdocs/patches/raftcore-json-escaped-quote.patch`.
 - A publish with a stale clock made the session's lease check wrap; the backend
   now takes the time every pass and the session compares rather than subtracts.
 - The liveliness writer sent sequence number 0 on the initial announce (invalid

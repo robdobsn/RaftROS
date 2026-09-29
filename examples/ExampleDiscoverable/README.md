@@ -244,6 +244,53 @@ figures on `rosstat` (`loopMaxUs` and the per-phase `loopMaxDrainUs`,
 `loopMaxConnUs`, `loopMaxRxUs`, `loopMaxTxUs`) should be read with no
 terminal open: that is the number an unattended device sees.
 
+### Parameters
+
+The Zenoh build is a full ROS 2 parameter server: the six `rcl_interfaces`
+services are declared for the node, so the standard tools work.
+
+```bash
+ros2 param list /raft_esp32
+ros2 param dump /raft_esp32
+#   chatterEnable: true
+#   chatterPeriodMs: 1000
+#   rangeOffsetMm: 0.0
+#   routerHost: 192.168.86.192
+#   use_sim_time: false
+ros2 param set /raft_esp32 chatterPeriodMs 250    # /chatter now at 4 Hz
+ros2 param set /raft_esp32 chatterEnable false
+ros2 param describe /raft_esp32 routerHost
+ros2 param set /raft_esp32 routerHost 192.168.86.50
+```
+
+| Parameter | Type | Effect |
+| --- | --- | --- |
+| `chatterEnable` | bool | Starts and stops `/chatter` at once |
+| `chatterPeriodMs` | int | Period of `/chatter`, 100-60000 ms |
+| `routerHost` | string | Zenoh router IPv4 address. **Persisted** in the same settings overlay `/api/postsettings` writes; the node reconnects to it once the reply has gone out |
+| `rangeOffsetMm` | double | The example's own: added to `/raft_esp32/range` readings |
+| `use_sim_time` | bool | Read-only `false` (every ROS 2 node has it) |
+
+A refused set reports why, in the words a stock ROS 2 node uses
+(`Wrong parameter type, expected 'Type.INTEGER' got 'Type.STRING'`,
+`Trying to set a read-only parameter: use_sim_time.`) or the parameter
+owner's own (`chatterPeriodMs must be 100-60000`). Only `chatterEnable` and
+`chatterPeriodMs` of the SysMod's settings are live; the rest take effect
+through `/api/postsettings` and a reboot as before.
+
+An application declares its own parameters on the SysMod and either reads
+them where they are used or takes a callback that can refuse a value:
+
+```cpp
+pRaftROS->declareParameter("rangeOffsetMm", 0.0, "Added to every /raft_esp32/range reading, in mm");
+...
+const RaftROS::ParamValue* pOffset = pRaftROS->parameter("rangeOffsetMm");
+```
+
+Scalars only (bool, int64, double, string up to 63 characters); 16
+parameters per node. A set arrives on the main loop; a callback must not
+block (a `routerHost` set writes NVS, the one flash operation, ~12 ms).
+
 ## Configuration
 
 The RaftROS SysMod and the overall system configuration live in `systypes/SysTypeMain/SysTypes.json`. The relevant RaftROS fields are the domain ID, the ROS 2 node name (`raft_esp32` by default), the SPDP announce interval and participant lease duration (RTPS), and the router address (Zenoh).
