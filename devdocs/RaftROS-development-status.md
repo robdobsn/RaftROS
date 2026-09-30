@@ -274,7 +274,7 @@ The console finding of 2026-09-28 (a log line costs ~10 ms unattended)
 applied to the RTPS build: runtime lines now take the pass's single log
 slot (`logSlot()`; `logSuppressed` in rosstat counts the rest), and the
 per-peer SEDP reader-port lines moved behind `DEBUG_SEDP_RDI` in the
-verbose block. Unattended A/B on the ProS3 with a CycloneDDS subscriber on
+verbose block. Unattended A/B on the ESP32-S3 TFT Feather with a CycloneDDS subscriber on
 the range topic and `ros2 topic info -v` every 15 s: worst pass 20.4 ms
 before, 15.4 ms after (two earlier runs 18.3/21.0 against 13.8/14.6);
 `logSuppressed` stayed 0 - the gain is the per-peer lines. The RTPS build
@@ -327,7 +327,7 @@ directly (the six parameter services will use it), the six
 ### Services on the Board; the Console Is the Loop's Worst Case (2026-09-28)
 
 Services S3 and S4 of the [implementation plan](RaftROS-services-implementation-plan.md)
-went onto the ProS3 in one flash. A service is three staged declarations on
+went onto the ESP32-S3 TFT Feather in one flash. A service is three staged declarations on
 the session - a key-expression id (`300+slot`, so the router's requests name
 it by id), a queryable on that id (`400+slot`) and the `SS` liveliness token
 (`500+slot`) - sent one per pass through the same priority chain as
@@ -2516,7 +2516,7 @@ Feather (2026-09-18/21). These are changes to RaftCore/RaftSysMods, not RaftROS.
   attached; the same logs replay as a multi-hour backlog when a monitor
   reattaches. RaftROS's chatty discovery logs are now debug-gated, but a
   Raft-level fix (drop, don't block, when nothing is reading) would protect
-  every app. Measured 2026-09-28 on the ProS3: ~10.5 ms per line whatever its
+  every app. Measured 2026-09-28 on the ESP32-S3 TFT Feather: ~10.5 ms per line whatever its
   length when nothing reads the USB-Serial-JTAG console. RaftROS now writes at
   most one line per loop pass on both backends.
 

@@ -125,7 +125,7 @@ services for its node at setup, maps `chatterEnable` and `routerHost`
 read-only set report their reasons; `ros2 param set /raft_esp32
 chatterEnable false` silences `/chatter`; `routerHost` set survives a
 reboot; loop maxima unchanged; image and heap deltas recorded.
-**Met 2026-09-29** on the ProS3 against `rmw_zenohd` 0.2.10: `ros2 param
+**Met 2026-09-29** on the ESP32-S3 TFT Feather against `rmw_zenohd` 0.2.10: `ros2 param
 list/get/describe/dump` for every parameter; sets of each type; refusals
 for wrong type, read-only, undeclared name, an invalid `routerHost` and an
 out-of-range `chatterPeriodMs`, each with its reason; `chatterEnable false`

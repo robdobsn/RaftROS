@@ -12,9 +12,8 @@ VL6180 range sensor on the STEMMA QT connector (I2C 0x29), WiFi at RSSI -82 to
 runs through `rmw_zenohd` (`ros-jazzy-rmw-zenoh-cpp` 0.2.10), RTPS is checked
 against both CycloneDDS and FastDDS. "Under load" means a ROS 2 subscriber
 actually consuming the device's topic, not the idle figures the project
-carried before 2026-09-26. Figures from 2026-09-28 on (services, parameters,
-the second soak) are from an Unexpected Maker ProS3 (ESP32-S3) with the same
-sensor, WiFi at RSSI about -71.
+carried before 2026-09-26. The services, parameters and second-soak figures
+(2026-09-28 on) are from the same board, at RSSI about -71.
 
 ## What works, on both transports
 
@@ -75,7 +74,7 @@ every peer within a pass.
 Zenoh pays about 10 kB of RAM for its loop cost, close to the 11 kB its 16
 endpoint slots reserve for key expressions and liveliness tokens.
 
-With services and parameters (Zenoh, ProS3, 2026-09-29): image 1272 kB (28%
+With services and parameters (Zenoh, 2026-09-29): image 1279 kB (28%
 of the slot free); free heap 147 kB under load (the 12 service slots with
 1 kB replies, the 16-entry parameter store and its working space); stack
 headroom 5564 B, unchanged in use because the parameter store's per-request
