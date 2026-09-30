@@ -1,7 +1,7 @@
 # RaftROS Parameters: Implementation Plan
 
 > **Status 2026-09-29: complete.** P0-P4 met on hardware (section 3). A 12 h soak
-> with parameter traffic is recorded in the results document.
+> with parameter traffic (2026-09-29/30) ran clean - see the results document.
 
 Written 2026-09-28, after the services plan
 ([RaftROS-services-implementation-plan.md](RaftROS-services-implementation-plan.md))

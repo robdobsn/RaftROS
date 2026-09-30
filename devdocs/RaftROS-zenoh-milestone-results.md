@@ -100,7 +100,7 @@ sits ~34 kB below steady state and is reached early and once. So the headroom to
 budget against on this load is **~143 kB**, not the 177 kB steady figure; and
 `heapFreeB`'s trend, not `heapMinB`, is the leak indicator.
 
-## Second soak: services and parameters (Zenoh, 2026-09-29, in progress)
+## Second soak: services and parameters (Zenoh, 2026-09-29/30)
 
 The pushed code (RaftROS `7e0071a`, RaftCore `78781c0`) freshly flashed, and a
 ROS host driving it for 12 h: an `rclpy` subscriber counting `/raft/range_1_29`
@@ -109,18 +109,19 @@ and `/chatter` per minute, and every minute a `/raft_esp32/devices`,
 a `chatterPeriodMs` set (alternating 900/1000 ms), with a full `ros2 param
 dump` every 10 minutes and `rosstat` read each time. No terminal attached.
 
-**At 4 h 22 min (262 minutes):**
-
-| | Result |
+| | Result (720 minutes) |
 | --- | --- |
-| Calls | 0 failures in ~1,300 service/parameter calls and 26 dumps; 1362 service requests accepted, 1362 completed, 0 timed out, 0 refused |
-| Session | one throughout; 0 connect failures |
-| Topics | range 286-298 samples/min (76,684 total), `/chatter` 60-67/min (16,508); no low minute |
-| Free heap | first-hour mean 146,971 B, latest hour 146,865 B (-106 B) - flat |
-| Minimum free heap | stepped to 114.3 kB by minute 20 and unchanged since (one-off transients, as in the first soak) |
-| Worst loop pass | 13.2 ms, unchanged since boot; stack headroom 5564 B throughout |
+| Calls | **0 failures** in 3,600 service/parameter calls and 72 dumps; 3744 service requests accepted, 3744 completed, 0 timed out, 0 refused |
+| Session | one throughout; 0 connect failures; 0 inbound samples dropped |
+| Topics | range 286-299 samples/min, `/chatter` 58-67/min, no low minute; the subscriber kept counting for 22 h (394,698 range and 82,860 chatter samples) |
+| Free heap | first-hour mean 146,971 B, last-hour 146,797 B (-174 B over 12 h, ~-15 B/h) - flat |
+| Minimum free heap | stepped to 114.3 kB by minute 20, unchanged for the remaining 11.7 h and after (one-off transients, as in the first soak) |
+| Worst loop pass | 13.2 ms for the whole 12 h; stack headroom 5564 B throughout |
+| Published | 256,985 samples |
 
-The final 12 h figures replace this table when the run ends.
+After the traffic stopped the board stayed up on the same session; by 22 h
+the worst pass had become 17.7 ms (idle, cause not recorded - still a third
+of the 50 ms contract).
 
 ## Router reachability
 

@@ -1,7 +1,7 @@
 # RaftROS Development Status
 
 **Last Updated:** 2026-09-29 (Zenoh services and parameters complete; RaftCore
-device-data fan-out; second soak in progress). Resume commands are in the
+device-data fan-out; second soak clean). Resume commands are in the
 [agent handoff](RaftROS-WSL-agent-handoff.md). The measured summary is
 [RaftROS-zenoh-milestone-results.md](RaftROS-zenoh-milestone-results.md);
 dated sections below hold the evidence, newest first after this table.
@@ -13,8 +13,9 @@ On Zenoh the node publishes, subscribes, auto-publishes bus devices, serves
 ROS 2 services ([plan](RaftROS-services-implementation-plan.md), S0-S5 met)
 and ROS 2 parameters ([plan](RaftROS-parameters-implementation-plan.md),
 P0-P4 met). Services and parameters on RTPS were ruled out (2026-09-29). A
-second 12 h soak with service and parameter traffic is running; at 4.4 h it
-was clean (see the results document).
+second 12 h soak with service and parameter traffic (2026-09-29/30) was
+clean: 0 failures in 3,600 calls, one session, free heap flat (-174 B over
+12 h), worst pass 13.2 ms (see the results document).
 
 ## Zenoh Alternative (history)
 
