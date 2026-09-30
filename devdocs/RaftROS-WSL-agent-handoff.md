@@ -10,7 +10,8 @@
 > - **Services and parameters exist** on Zenoh (server side) - the "no services,
 >   parameters" constraint below no longer applies. Actions and parameter
 >   events do not exist. Services/parameters on RTPS were ruled out.
-> - **Board:** Unexpected Maker ProS3 on Windows **COM18**, VL6180 at I2C 0x29,
+> - **Board:** Adafruit ESP32-S3 TFT Feather on Windows **COM18** (the UM ProS3 was
+>   retired, see item 4 below), VL6180 at I2C 0x29 (SDA 42 / SCL 41, GPIO 21 powers STEMMA QT),
 >   IP 192.168.86.230. Build: `cd examples/ExampleDiscoverable && raft build
 >   --no-docker -e /home/rob/esp/esp-idf-v6.0.2 .`; flash: `raft flash -p COM18
 >   --no-fs .`. Loop figures must be read from `GET /api/rosstat` with no

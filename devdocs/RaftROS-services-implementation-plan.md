@@ -191,7 +191,7 @@ service with the right type; `ros2 node info /raft_esp32` lists it under
 returns `success: True` with the message; a loop of 50 calls in a script
 completes with the loop's worst pass under 5 ms and the average unchanged;
 `loopBudget` warnings zero; reconnect re-declares the queryable.
-**Met 2026-09-28** on the ProS3 against `rmw_zenohd` 0.2.10: `ros2 service
+**Met 2026-09-28** on the ESP32-S3 TFT Feather against `rmw_zenohd` 0.2.10: `ros2 service
 list -t` shows both services with their types and `ros2 node info` lists them
 under *Service Servers*; every call in a 50-call `Trigger` loop returned
 `success=True` (0.31 s per call, all of it `ros2` CLI start-up); `rosstat`
@@ -281,7 +281,7 @@ backed by the SysMod's config with `postsettings`-style persistence, so
 | Oversized / undecodable request | refused, not crashed | `ERR` reply; session stays up |
 | Flash and RAM | within budget | image delta and `heapMinB` recorded in the results doc |
 
-**Status 2026-09-28** - every row shown on the ProS3 against `rmw_zenohd`:
+**Status 2026-09-28** - every row shown on the ESP32-S3 TFT Feather against `rmw_zenohd`:
 graph and `node info` (S3); `Trigger`, `SetBool` and `Empty`
 (`/raft_esp32/ping`) all answered from `ros2 service call`; two concurrent
 `ros2` clients on `/raft_esp32/devices` each received their reply (both
