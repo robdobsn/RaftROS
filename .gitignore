@@ -11,3 +11,4 @@ node_modules
 *.o
 ros-humble-*/
 docker/captures/
+third_party/
