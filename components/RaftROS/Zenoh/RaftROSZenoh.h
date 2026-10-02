@@ -209,6 +209,10 @@ private:
     uint32_t _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
     static const uint32_t RECONNECT_DELAY_MIN_MS = 1000;
     static const uint32_t RECONNECT_DELAY_MAX_MS = 30000;
+    /// @brief Ceiling while the router's host refuses the connection: the host
+    /// is up and the router is not listening yet (a restart, typically), and a
+    /// refused non-blocking connect costs almost nothing, so keep trying often
+    static const uint32_t RECONNECT_DELAY_REFUSED_MAX_MS = 4000;
     static const uint32_t CONNECT_TIMEOUT_MS = 10000;
 
     // Session, identity and the node's own liveliness token

@@ -8,7 +8,7 @@
 //     raftCoreApp.registerSysMod("RaftROS", RaftROS::create, true);
 //
 // The transport is a build-time choice (see RaftROSBackendSelect.h), so this
-// header just pulls in the one implementation that was selected.  The two
+// header just pulls in the one implementation that was selected.  The
 // implementations share the auto-publish pipeline but declare different
 // internals, and only one is ever compiled.
 //
@@ -22,6 +22,8 @@
 
 #if RAFTROS_BACKEND_ZENOH
 #include "Zenoh/RaftROSZenoh.h"
+#elif RAFTROS_BACKEND_ZENOH_PICO
+#include "ZenohPico/RaftROSZenohPico.h"
 #else
 #include "RTPS/RaftROSRTPS.h"
 #endif

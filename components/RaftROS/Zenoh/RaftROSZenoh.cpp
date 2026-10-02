@@ -490,6 +490,20 @@ void RaftROS::closeConnection(const char* reason)
     // router; a close of a live session is not (the router was there)
     if (_connState == ConnState::CONNECTING || _connState == ConnState::HANDSHAKE)
         noteConnectFailure(reason);
+
+    // When to try again.  A live session that was lost is retried promptly.
+    // Failed attempts back off - but only to RECONNECT_DELAY_REFUSED_MAX_MS
+    // while the host answers and refuses (a router restarting: recovery within
+    // a few seconds of it listening again), and to RECONNECT_DELAY_MAX_MS when
+    // the host does not answer at all.
+    if (_connState == ConnState::READY)
+        _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
+    else
+    {
+        const uint32_t ceiling = strcmp(reason, "connect refused") == 0 ?
+            RECONNECT_DELAY_REFUSED_MAX_MS : RECONNECT_DELAY_MAX_MS;
+        _reconnectDelayMs = _reconnectDelayMs * 2 > ceiling ? ceiling : _reconnectDelayMs * 2;
+    }
     if (_sock >= 0)
     {
         const int64_t closeUs = esp_timer_get_time();
@@ -524,8 +538,6 @@ void RaftROS::closeConnection(const char* reason)
         if (slot.state != ServiceSlot::State::FREE)
             slot.state = ServiceSlot::State::PENDING_KEYEXPR;
     _lastConnectAttemptMs = millis();
-    _reconnectDelayMs = _reconnectDelayMs >= RECONNECT_DELAY_MAX_MS ?
-        RECONNECT_DELAY_MAX_MS : _reconnectDelayMs * 2;
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
