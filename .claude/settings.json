@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cd:*)",
+      "Bash(raft monitor:*)",
+      "Bash(raft ports)",
+      "Bash(raft build:*)",
+      "Bash(raft flash:*)",
+      "Bash(/mnt/c/Users/rob/.cargo/bin/raft.exe:*)",
+      "Bash(idf.py:*)",
+      "Bash(make:*)",
+      "Bash(python3:*)",
+      "Bash(ssh rob@192.168.86.192:*)",
+      "Bash(wslpath:*)",
+      "Bash(/mnt/c/Windows/System32/tasklist.exe:*)",
+      "Bash(awk:*)",
+      "Bash(sed:*)",
+      "Bash(cut:*)",
+      "Bash(tr:*)",
+      "Bash(sort:*)",
+      "Bash(wc:*)",
+      "Bash(git:*)",
+      "Bash(timeout:*)",
+      "Bash(grep:*)",
+      "Bash(head:*)",
+      "Bash(tail:*)",
+      "Bash(ls:*)",
+      "Bash(cat:*)",
+      "Bash(for:*)",
+      "Bash(if:*)",
+      "Bash(echo:*)",
+      "Bash(sleep:*)",
+      "Bash(ps:*)"
+    ]
+  }
+}

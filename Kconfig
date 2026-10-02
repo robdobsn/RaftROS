@@ -21,12 +21,38 @@ menu "RaftROS"
                 Talk to ROS 2 through a Zenoh router over one TCP session, as
                 rmw_zenoh does.  A router must be reachable; ROS 2 peers must
                 also be running rmw_zenoh.
+
+        config RAFTROS_BACKEND_ZENOH_PICO
+            bool "Zenoh via zenoh-pico (experimental)"
+            help
+                The same ROS 2 layer as the Zenoh backend, with the Zenoh
+                session provided by Eclipse zenoh-pico instead of Raft's own
+                implementation.  For comparing cost and behaviour; Raft's own
+                Zenoh backend remains the default.
+
+                zenoh-pico is a third-party library (EPL-2.0 OR Apache-2.0),
+                not part of RaftROS and not in this repository.  Fetch the
+                pinned version with tools/fetch_zenoh_pico.sh before building.
+                It runs its own FreeRTOS task for receiving and lease upkeep,
+                and the session is opened from a short-lived helper task
+                because zenoh-pico's connect blocks.
     endchoice
+
+    config RAFTROS_ZENOH_PICO_TUNED
+        bool "Tune zenoh-pico for RaftROS (experimental)"
+        default n
+        depends on RAFTROS_BACKEND_ZENOH_PICO
+        help
+            Smaller zenoh-pico buffers (1 kB batches, 2 kB reassembly, 8
+            runtime tasks instead of 64), zenoh-pico's executor task at the
+            main loop's priority instead of priority 12, and the session
+            open/close helper tasks pinned to CPU0 at low priority.  For
+            measuring how much of zenoh-pico's cost is configuration.
 
     config RAFTROS_ZENOH_ROUTER_HOST
         string "Zenoh router host"
         default "192.168.86.192"
-        depends on RAFTROS_BACKEND_ZENOH
+        depends on RAFTROS_BACKEND_ZENOH || RAFTROS_BACKEND_ZENOH_PICO
         help
             IPv4 address of the Zenoh router to connect to.  This is only the
             built-in default: "routerHost" in the SysMod's SysTypes
@@ -43,7 +69,7 @@ menu "RaftROS"
         int "Zenoh router port"
         default 7447
         range 1 65535
-        depends on RAFTROS_BACKEND_ZENOH
+        depends on RAFTROS_BACKEND_ZENOH || RAFTROS_BACKEND_ZENOH_PICO
         help
             TCP port the Zenoh router listens on.  Overridden by the
             "routerPort" setting in the SysMod's SysTypes configuration.
