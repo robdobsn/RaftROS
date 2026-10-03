@@ -18,7 +18,10 @@ your own application.
 ## Status
 
 Verified on an ESP32-S3 against ROS 2 Jazzy
-([measured results](devdocs/RaftROS-zenoh-milestone-results.md)):
+([measured results](devdocs/RaftROS-zenoh-milestone-results.md)). The same
+Zenoh firmware also passes the full functional, robustness, load and hot-plug
+tests against **Kilted** and **Lyrical**
+([distribution support](devdocs/RaftROS-ros-distro-support.md)):
 
 | | Zenoh (default) | RTPS/DDS |
 | --- | --- | --- |
@@ -505,7 +508,9 @@ sudo chown $USER ~/raft_rtps.pcap
 - [RaftSysMods](https://github.com/robdobsn/RaftSysMods) - networking
 - [RaftWebServer](https://github.com/robdobsn/RaftWebServer) - `/api/rosstat` and settings endpoints
 - [RaftI2C](https://github.com/robdobsn/RaftI2C) - for I2C devices
-- ESP-IDF 6.0 (tested with 6.0.2); ROS 2 Jazzy on the host (`ros-jazzy-rmw-zenoh-cpp` for Zenoh)
+- ESP-IDF 6.0 (tested with 6.0.2); ROS 2 Jazzy, Kilted or Lyrical on the host
+  (`ros-<distro>-rmw-zenoh-cpp` for Zenoh; `docker/distros/` builds a test
+  container for each)
 
 ## License
 
