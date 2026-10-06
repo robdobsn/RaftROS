@@ -10,6 +10,7 @@ ARG DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ros-${ROS_DISTRO}-rmw-zenoh-cpp \
         ros-${ROS_DISTRO}-rmw-cyclonedds-cpp \
+        ros-${ROS_DISTRO}-foxglove-bridge \
         python3-venv python3-pip bc procps curl \
     && rm -rf /var/lib/apt/lists/*
 
