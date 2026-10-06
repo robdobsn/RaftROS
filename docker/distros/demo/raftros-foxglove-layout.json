@@ -1,0 +1,25 @@
+{
+  "configById": {
+    "Plot!raftrange": {
+      "title": "VL6180 range (m)",
+      "paths": [{ "value": "/raft/range_1_29.range", "enabled": true, "timestampMethod": "receiveTime", "label": "range" }],
+      "minYValue": 0,
+      "maxYValue": 0.25,
+      "showXAxisLabels": true,
+      "showYAxisLabels": true,
+      "showLegend": false,
+      "isSynced": true,
+      "xAxisVal": "timestamp",
+      "followingViewWidth": 30
+    },
+    "RawMessages!raftrange": {
+      "topicPath": "/raft/range_1_29",
+      "diffEnabled": false,
+      "expansion": "all"
+    }
+  },
+  "globalVariables": {},
+  "userNodes": {},
+  "playbackConfig": { "speed": 1 },
+  "layout": { "first": "Plot!raftrange", "second": "RawMessages!raftrange", "direction": "row", "splitPercentage": 66 }
+}

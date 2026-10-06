@@ -3,7 +3,8 @@
 **Date:** 2026-10-02/03. **Firmware:** the default Zenoh build, unchanged across
 all three distributions: one image serves Jazzy, Kilted and Lyrical.
 **Status:** Zenoh functional, robustness, load and hot-plug tests passed on all
-three. 12-hour soaks on Kilted and Lyrical are **running** (results pending).
+three. 12-hour soaks: **Lyrical clean**; **Kilted had 17 reconnects in three
+bursts** (open, see below; a re-run is needed before Kilted is called clean).
 
 ## Why one image works
 
@@ -62,7 +63,11 @@ Results are written to `~/distro-tests/<distro>/` on the ROS host.
 | Load: heap drift / minimum | −62 B / 115.9 kB | −263 B / 131.5 kB | −310 B / 124.8 kB |
 | Load: worst loop pass | 14.0 ms | 14.2 ms | 13.0 ms |
 | Load: range / chatter per minute at host | 293-295 / 63-64 | 292-296 / 63-64 | 292-296 / 63-64 |
-| 12 h soak | (2026-09-29/30: 0 failures in 3,600 calls) | **pending** | **pending** |
+| 12 h soak: calls / failures | (2026-09-29/30: 3,600 / 0) | 3,600 / **11** | 3,600 / **0** |
+| 12 h soak: sessions | 1 | **1 → 18** | 1 |
+| 12 h soak: heap drift / minimum | −174 B / 114.3 kB | −104 B / 88.4 kB | −162 B / 93.5 kB |
+| 12 h soak: worst loop pass | 13.2 ms | 17.7 ms | 12.9 ms |
+| 12 h soak: range per minute | 286-299 | **0**-301 | 282-297 |
 
 The functional checks cover:
 - `node list` and `node info`: publishers, subscriptions, 10 services
@@ -78,6 +83,23 @@ back-off was when the router started.
 Session bring-up captures (`session.pcapng`, 539-556 packets from a device
 reset) are kept per distribution. On Ubuntu 26.04, tshark's AppArmor profile
 cannot read files outside `/tmp`, so copy them there first.
+
+### The Kilted soak's reconnects (open)
+
+The reconnects came in three bursts on 2026-10-03: 17:38-17:42 (12 sessions in
+four minutes), 18:40-18:41, and 19:18. In between, and for the last five hours,
+the session was stable. Every reconnect succeeded on its first attempt
+(`connectFails` 0). At 18:41 the device's own REST status did not answer
+either, so the device was briefly unreachable on the network, not just its
+Zenoh session. The Kilted router logged no errors, only "Query not found"
+warnings for replies to queries from sessions that had just dropped. Heap
+stayed flat.
+
+This points to a WiFi or network event rather than a Kilted or zenoh-c 1.8.0
+incompatibility. The functional, robustness and load runs on Kilted were clean,
+and the Lyrical soak that followed overnight on the same setup had no drops.
+But it is not proven. **Next:** re-run the Kilted soak with the device's WiFi
+RSSI and disconnect reason logged each minute.
 
 ## Results: RTPS build (for reference only)
 
