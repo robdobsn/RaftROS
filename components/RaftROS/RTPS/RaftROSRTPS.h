@@ -373,12 +373,12 @@ private:
 
     /// @brief SEDP-announce a newly attached device's endpoints to every
     /// discovered participant, and advance the ros_discovery_info sequence
-    void autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondarySlot);
+    void autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondarySlot, uint8_t tertiarySlot);
 
     /// @brief SEDP-dispose a departing device's endpoints at every discovered
     /// participant.  Runs while the endpoints still exist - the backend needs
     /// their live entity ids.
-    void autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondarySlot);
+    void autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondarySlot, uint8_t tertiarySlot);
 
     /// @brief Advance the ros_discovery_info sequence after endpoints have gone
     void autoPubOnEndpointsDetached();

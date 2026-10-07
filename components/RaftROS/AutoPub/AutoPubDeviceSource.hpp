@@ -32,6 +32,8 @@ static_assert(offsetof(AutoPubAttrFieldDesc, offset) == offsetof(AttrFieldDesc, 
               "AutoPubAttrFieldDesc offset mismatch");
 static_assert(offsetof(AutoPubAttrFieldDesc, divisor) == offsetof(AttrFieldDesc, divisor),
               "AutoPubAttrFieldDesc divisor mismatch");
+static_assert(offsetof(AutoPubAttrFieldDesc, count) == offsetof(AttrFieldDesc, count),
+              "AutoPubAttrFieldDesc count mismatch");
 static_assert((uint8_t)AutoPubAttrType::Float == (uint8_t)AttrType::Float,
               "AutoPubAttrType enum ordering must match AttrType");
 static_assert((uint8_t)AutoPubAttrType::Bool == (uint8_t)AttrType::Bool,
@@ -319,26 +321,33 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
           AutoPubQoSProfile_name(plan.endpoints[0].qosProfileId),
           (unsigned)pCtx->fieldCount, (unsigned)pCtx->structSize);
 
-    // Composite second endpoint: shares the decoded record and field
-    // descriptors with the primary but gets its own publisher (distinct topic
+    // Composite extra endpoints: share the decoded record and field
+    // descriptors with the primary but get their own publisher (distinct topic
     // and wire identity).  Failure is non-fatal - the primary keeps publishing.
-    if (plan.endpointCount > 1)
+    for (uint8_t extraIndex = 1; extraIndex < plan.endpointCount && extraIndex < MAX_ENDPOINTS_PER_DEVICE; ++extraIndex)
     {
-        const uint8_t secSlot = _pBackend->createPublisher(plan.endpoints[1]);
-        if (secSlot == Backend::INVALID_SLOT || secSlot >= CAPACITY)
+        const AutoPubEndpointDesc& extra = plan.endpoints[extraIndex];
+        const uint8_t extraSlot = _pBackend->createPublisher(extra);
+        if (extraSlot == Backend::INVALID_SLOT || extraSlot >= CAPACITY)
         {
-            LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach composite backend full - only primary attached devID=%s",
-                  devID.toString().c_str());
+            LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach composite backend full - endpoint %u of %u not attached devID=%s",
+                  (unsigned)extraIndex + 1, (unsigned)plan.endpointCount, devID.toString().c_str());
+            break;
+        }
+        if (extraIndex == 1)
+        {
+            pCtx->secondarySlot = extraSlot;
+            pCtx->secondaryMsgKind = extra.msgKind;
         }
         else
         {
-            pCtx->secondarySlot = secSlot;
-            pCtx->secondaryMsgKind = plan.endpoints[1].msgKind;
-            LOG_I(AUTOPUB_SOURCE_PREFIX, "autoPubAttach secondary devID=%s slot=%u topic=%s type=%s qos=%s",
-                  devID.toString().c_str(), (unsigned)secSlot,
-                  plan.endpoints[1].topic, plan.endpoints[1].type,
-                  AutoPubQoSProfile_name(plan.endpoints[1].qosProfileId));
+            pCtx->tertiarySlot = extraSlot;
+            pCtx->tertiaryMsgKind = extra.msgKind;
         }
+        LOG_I(AUTOPUB_SOURCE_PREFIX, "autoPubAttach %s devID=%s slot=%u topic=%s type=%s qos=%s",
+              extraIndex == 1 ? "secondary" : "tertiary",
+              devID.toString().c_str(), (unsigned)extraSlot,
+              extra.topic, extra.type, AutoPubQoSProfile_name(extra.qosProfileId));
     }
 
     // Install the per-device data callback.  DeviceManager forwards this to the
@@ -359,7 +368,7 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     }
 
     if (_onAttached)
-        _onAttached(planDeviceId, slot, pCtx->secondarySlot);
+        _onAttached(planDeviceId, slot, pCtx->secondarySlot, pCtx->tertiarySlot);
     return true;
 }
 
@@ -398,21 +407,24 @@ void AutoPubDeviceSource<Backend, CAPACITY>::detachDevice(RaftDevice& device)
     // The transport may need the endpoints' live identity to withdraw them
     // (RTPS disposes each writer at each peer), so this runs before they go.
     const uint8_t secondarySlot = pCtx ? pCtx->secondarySlot : INVALID_SLOT;
+    const uint8_t tertiarySlot = pCtx ? pCtx->tertiarySlot : INVALID_SLOT;
     const AutoPubDeviceId planDeviceId = pCtx ? pCtx->planDeviceId : AutoPubDeviceId{};
     if (_onDetaching)
-        _onDetaching(planDeviceId, (uint8_t)slot, secondarySlot);
+        _onDetaching(planDeviceId, (uint8_t)slot, secondarySlot, tertiarySlot);
 
     _pBackend->destroyPublisher((uint8_t)slot);
     if (secondarySlot != INVALID_SLOT)
         _pBackend->destroyPublisher(secondarySlot);
+    if (tertiarySlot != INVALID_SLOT)
+        _pBackend->destroyPublisher(tertiarySlot);
 
-    LOG_I(AUTOPUB_SOURCE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d samples=%u",
-          devID.toString().c_str(), slot, (int)(int8_t)secondarySlot,
+    LOG_I(AUTOPUB_SOURCE_PREFIX, "autoPubDetach devID=%s slot=%d secSlot=%d terSlot=%d samples=%u",
+          devID.toString().c_str(), slot, (int)(int8_t)secondarySlot, (int)(int8_t)tertiarySlot,
           pCtx ? (unsigned)pCtx->sampleCount : 0u);
     delete pCtx;
 
     if (_onDetached)
-        _onDetached(planDeviceId, (uint8_t)slot, secondarySlot);
+        _onDetached(planDeviceId, (uint8_t)slot, secondarySlot, tertiarySlot);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -499,22 +511,25 @@ void AutoPubDeviceSource<Backend, CAPACITY>::drainSamples()
         batch.recordCount = 1;
         batch.fields = reinterpret_cast<const AutoPubAttrFieldDesc*>(pCtx->pFieldDescs);
         batch.fieldCount = pCtx->fieldCount;
-        const AutoPubSampleOutput outputs[] = {
+        const uint8_t slots[MAX_ENDPOINTS_PER_DEVICE] = {pCtx->slot, pCtx->secondarySlot, pCtx->tertiarySlot};
+        const AutoPubSampleOutput outputs[MAX_ENDPOINTS_PER_DEVICE] = {
             {pCtx->msgKind, _cdrBufs[0], CDR_BUF_SIZE},
             {pCtx->secondaryMsgKind,
              pCtx->secondarySlot == INVALID_SLOT ? nullptr : _cdrBufs[1],
+             CDR_BUF_SIZE},
+            {pCtx->tertiaryMsgKind,
+             pCtx->tertiarySlot == INVALID_SLOT ? nullptr : _cdrBufs[2],
              CDR_BUF_SIZE}
         };
-        AutoPubSampleResult results[2];
-        uint64_t emissionSeq[2] = {0, 0};
-        uint32_t emissionPeers[2] = {0, 0};
+        AutoPubSampleResult results[MAX_ENDPOINTS_PER_DEVICE];
+        uint64_t emissionSeq[MAX_ENDPOINTS_PER_DEVICE] = {0, 0, 0};
+        uint32_t emissionPeers[MAX_ENDPOINTS_PER_DEVICE] = {0, 0, 0};
         auto publish = [&](uint8_t outputIndex, const uint8_t* payload, uint32_t length, uint32_t) {
-            const uint8_t slot = outputIndex == 0 ? pCtx->slot : pCtx->secondarySlot;
-            return _pBackend->publish(slot, payload, length,
+            return _pBackend->publish(slots[outputIndex], payload, length,
                                       &emissionSeq[outputIndex], &emissionPeers[outputIndex]);
         };
 
-        const bool batchOK = AutoPubSampleRunner::run(batch, outputs, 2, results, publish);
+        const bool batchOK = AutoPubSampleRunner::run(batch, outputs, MAX_ENDPOINTS_PER_DEVICE, results, publish);
 
         // Rate-limit the per-sample log on the mailbox's stored-record count
         if (sample.produced > 3 && (sample.produced % 100) != 0)

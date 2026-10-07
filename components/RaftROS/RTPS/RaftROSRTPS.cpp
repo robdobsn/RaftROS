@@ -254,11 +254,11 @@ void RaftROS::setup()
     // endpoint's life - SEDP announce to already-discovered participants, and
     // dispose at each peer on the way out.
     _autoPubSource.setEndpointHooks(
-        [this](const RaftRuntime::AutoPub::AutoPubDeviceId&, uint8_t primarySlot, uint8_t secondarySlot) {
-            autoPubOnEndpointsAttached(primarySlot, secondarySlot);
+        [this](const RaftRuntime::AutoPub::AutoPubDeviceId&, uint8_t primarySlot, uint8_t secondarySlot, uint8_t tertiarySlot) {
+            autoPubOnEndpointsAttached(primarySlot, secondarySlot, tertiarySlot);
         },
-        [this](const RaftRuntime::AutoPub::AutoPubDeviceId&, uint8_t primarySlot, uint8_t secondarySlot) {
-            autoPubOnEndpointsDetaching(primarySlot, secondarySlot);
+        [this](const RaftRuntime::AutoPub::AutoPubDeviceId&, uint8_t primarySlot, uint8_t secondarySlot, uint8_t tertiarySlot) {
+            autoPubOnEndpointsDetaching(primarySlot, secondarySlot, tertiarySlot);
         },
         [this](const RaftRuntime::AutoPub::AutoPubDeviceId&, uint8_t, uint8_t) {
             autoPubOnEndpointsDetached();
@@ -2462,7 +2462,7 @@ RaftRetCode RaftROS::apiStatus(const String& reqStr, String& respStr, const APIS
 // build.  These hooks are what RTPS needs around it.
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
-void RaftROS::autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondarySlot)
+void RaftROS::autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondarySlot, uint8_t tertiarySlot)
 {
     // Announce the newly-allocated writer slot(s) to every already-discovered
     // participant.  Without this, a writer that comes up AFTER the initial
@@ -2474,6 +2474,8 @@ void RaftROS::autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondaryS
         (void)emitAutoPubSedpAnnounce(remote, primarySlot);
         if (secondarySlot != AutoPubDeviceSourceT::INVALID_SLOT)
             (void)emitAutoPubSedpAnnounce(remote, secondarySlot);
+        if (tertiarySlot != AutoPubDeviceSourceT::INVALID_SLOT)
+            (void)emitAutoPubSedpAnnounce(remote, tertiarySlot);
     }
 
     // Bump _rosDiscSeqNum only when at least one participant could already
@@ -2490,7 +2492,7 @@ void RaftROS::autoPubOnEndpointsAttached(uint8_t primarySlot, uint8_t secondaryS
 #endif
 }
 
-void RaftROS::autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondarySlot)
+void RaftROS::autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondarySlot, uint8_t tertiarySlot)
 {
     // Tell discovered peers to drop the writer now rather than waiting for the
     // participant lease to expire.  Runs before the slot is released: the
@@ -2522,6 +2524,7 @@ void RaftROS::autoPubOnEndpointsDetaching(uint8_t primarySlot, uint8_t secondary
 
     disposeSlot(primarySlot);
     disposeSlot(secondarySlot);
+    disposeSlot(tertiarySlot);
 }
 
 /// @brief Reliability/durability to announce for a reader on `ddsTopic`,

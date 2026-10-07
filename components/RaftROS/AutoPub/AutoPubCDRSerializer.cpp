@@ -19,6 +19,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 
 namespace RaftRuntime {
 namespace AutoPub {
@@ -32,6 +33,7 @@ static constexpr double DEG_TO_RAD           = 0.017453292519943295; ///< GYRO/A
 static constexpr double MM_TO_M              = 0.001;       ///< DIST: mm → m
 static constexpr double HPA_TO_PA            = 100.0;       ///< PRES: hPa → Pa
 static constexpr double PERCENT_TO_UNIT      = 0.01;        ///< RH: % → 0..1
+static constexpr double MICROTESLA_TO_T      = 1e-6;        ///< MAG: µT → T
 
 // Range (Humble) radiation_type constants.
 static constexpr uint8_t RANGE_RADIATION_INFRARED = 1;
@@ -41,6 +43,7 @@ static constexpr float   RANGE_DEFAULT_FOV        = 0.0f;
 static constexpr float   RANGE_MIN_DEFAULT        = 0.0f;
 static constexpr float   RANGE_MAX_PROX_DEFAULT   = 1.0f;       // normalised proximity
 static constexpr float   RANGE_MAX_DIST_DEFAULT   = 2.0f;       // ~2 m for VL6180 / VL53L4CD
+static constexpr float   RANGE_MAX_MULTIZONE      = 4.0f;       // VL53L5CX / L7CX / L8CX
 
 // ---------------------------------------------------------------------------
 // Field lookup helpers
@@ -73,70 +76,90 @@ static bool readBytesFromStruct(const AutoPubCDRContext& ctx,
     return true;
 }
 
-bool AutoPubCDRSerializer_readFieldDouble(
-        const AutoPubCDRContext& ctx, const char* name,
-        double& out, bool applyScale)
+static uint32_t attrTypeSize(AutoPubAttrType type)
 {
-    const AutoPubAttrFieldDesc* pDesc = findField(ctx, name);
-    if (!pDesc)
+    switch (type)
+    {
+        case AutoPubAttrType::Float:
+        case AutoPubAttrType::Int32:
+        case AutoPubAttrType::Uint32: return 4;
+        case AutoPubAttrType::Int16:
+        case AutoPubAttrType::Uint16: return 2;
+        case AutoPubAttrType::Int8:
+        case AutoPubAttrType::Uint8:
+        case AutoPubAttrType::Bool:   return 1;
+        default:                      return 0;
+    }
+}
+
+bool AutoPubCDRSerializer_readFieldElementDouble(
+        const AutoPubCDRContext& ctx, const AutoPubAttrFieldDesc& desc,
+        uint16_t index, double& out, bool applyScale)
+{
+    const uint32_t elemSize = attrTypeSize(desc.type);
+    const uint16_t count = desc.count ? desc.count : 1;
+    if (elemSize == 0 || index >= count)
+        return false;
+    const uint32_t offset = (uint32_t)desc.offset + (uint32_t)index * elemSize;
+    if (offset > 0xFFFF)
         return false;
 
     double raw = 0.0;
-    switch (pDesc->type)
+    switch (desc.type)
     {
         case AutoPubAttrType::Float:
         {
             float v = 0.0f;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 4, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 4, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Int32:
         {
             int32_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 4, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 4, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Uint32:
         {
             uint32_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 4, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 4, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Int16:
         {
             int16_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 2, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 2, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Uint16:
         {
             uint16_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 2, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 2, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Int8:
         {
             int8_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 1, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Uint8:
         {
             uint8_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 1, &v)) return false;
             raw = (double)v;
             break;
         }
         case AutoPubAttrType::Bool:
         {
             uint8_t v = 0;
-            if (!readBytesFromStruct(ctx, pDesc->offset, 1, &v)) return false;
+            if (!readBytesFromStruct(ctx, (uint16_t)offset, 1, &v)) return false;
             raw = v ? 1.0 : 0.0;
             break;
         }
@@ -146,13 +169,23 @@ bool AutoPubCDRSerializer_readFieldDouble(
 
     if (applyScale)
     {
-        if (pDesc->divisor != 0.0f && pDesc->divisor != 1.0f)
-            raw /= (double)pDesc->divisor;
-        if (pDesc->addend != 0.0f)
-            raw += (double)pDesc->addend;
+        if (desc.divisor != 0.0f && desc.divisor != 1.0f)
+            raw /= (double)desc.divisor;
+        if (desc.addend != 0.0f)
+            raw += (double)desc.addend;
     }
     out = raw;
     return true;
+}
+
+bool AutoPubCDRSerializer_readFieldDouble(
+        const AutoPubCDRContext& ctx, const char* name,
+        double& out, bool applyScale)
+{
+    const AutoPubAttrFieldDesc* pDesc = findField(ctx, name);
+    if (!pDesc)
+        return false;
+    return AutoPubCDRSerializer_readFieldElementDouble(ctx, *pDesc, 0, out, applyScale);
 }
 
 bool AutoPubCDRSerializer_readFieldInt32(
@@ -273,6 +306,46 @@ static bool serializeIlluminance(CDREncoder& enc, const AutoPubCDRContext& ctx)
     return true;
 }
 
+/// @brief Is zone `index` of a multizone frame a valid reading?  The status
+/// array, when the record has one, uses the ST target-status codes.
+static bool multizoneValid(const AutoPubCDRContext& ctx, uint16_t index)
+{
+    const AutoPubAttrFieldDesc* pStatus = findField(ctx, "status");
+    if (!pStatus || (pStatus->count ? pStatus->count : 1) <= index)
+        return true;
+    double status = 0.0;
+    if (!AutoPubCDRSerializer_readFieldElementDouble(ctx, *pStatus, index, status, false))
+        return true;
+    return status == 5.0 || status == 6.0 || status == 9.0;
+}
+
+/// @brief Zones in the frame: the `grid` field (4 or 8 a side) when present,
+/// else the whole distance array
+static uint16_t multizoneZones(const AutoPubCDRContext& ctx, const AutoPubAttrFieldDesc& dist)
+{
+    const uint16_t count = dist.count ? dist.count : 1;
+    double grid = 0.0;
+    if (AutoPubCDRSerializer_readFieldDouble(ctx, "grid", grid, false) && grid >= 1.0 && grid * grid <= count)
+        return (uint16_t)(grid * grid);
+    return count;
+}
+
+/// @brief Nearest valid zone's distance in metres, or +inf with none valid
+static double multizoneNearestM(const AutoPubCDRContext& ctx, const AutoPubAttrFieldDesc& dist)
+{
+    double nearestMm = std::numeric_limits<double>::infinity();
+    const uint16_t zones = multizoneZones(ctx, dist);
+    for (uint16_t zone = 0; zone < zones; zone++)
+    {
+        double mm = 0.0;
+        if (!multizoneValid(ctx, zone) || !AutoPubCDRSerializer_readFieldElementDouble(ctx, dist, zone, mm))
+            continue;
+        if (mm < nearestMm)
+            nearestMm = mm;
+    }
+    return std::isinf(nearestMm) ? nearestMm : nearestMm * MM_TO_M;
+}
+
 static bool serializeRange(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
@@ -282,7 +355,16 @@ static bool serializeRange(CDREncoder& enc, const AutoPubCDRContext& ctx)
 
     double rangeVal = 0.0;
     float  maxRange = RANGE_MAX_DIST_DEFAULT;
-    if (AutoPubCDRSerializer_readFieldDouble(ctx, "dist", rangeVal))
+    const AutoPubAttrFieldDesc* pDist = findField(ctx, "dist");
+    if (pDist && (pDist->count ? pDist->count : 1) > 1)
+    {
+        // A multizone frame: the nearest zone with a valid status (ST: 5 =
+        // valid, 6 and 9 = valid with lower confidence; no status array =
+        // every zone counts).  No valid zone gives +inf, per REP-117.
+        rangeVal = multizoneNearestM(ctx, *pDist);
+        maxRange = RANGE_MAX_MULTIZONE;
+    }
+    else if (AutoPubCDRSerializer_readFieldDouble(ctx, "dist", rangeVal))
     {
         rangeVal *= MM_TO_M;   // mm → m
         maxRange = RANGE_MAX_DIST_DEFAULT;
@@ -543,6 +625,159 @@ static bool serializeJoy(CDREncoder& enc, const AutoPubCDRContext& ctx)
     return true;
 }
 
+static bool serializeMagneticField(CDREncoder& enc, const AutoPubCDRContext& ctx)
+{
+    // sensor_msgs/MagneticField: Header, Vector3 magnetic_field (T), float64[9]
+    // covariance (all zero = unknown).  Device records give µT.
+    if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
+    const char* const axes[] = {"x", "y", "z"};
+    for (auto axis : axes)
+    {
+        double v = 0.0;
+        (void)AutoPubCDRSerializer_readFieldDouble(ctx, axis, v);
+        if (!enc.writeFloat64(v * MICROTESLA_TO_T)) return false;
+    }
+    return writeCovarianceZero9(enc);
+}
+
+static bool serializeBatteryState(CDREncoder& enc, const AutoPubCDRContext& ctx)
+{
+    // sensor_msgs/BatteryState.  A fuel gauge (MAX17048) reports voltage (V),
+    // charge (%) and chargeRate (%/h); everything it cannot measure is NaN,
+    // as the message definition asks.
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
+    double voltage = 0.0, charge = 0.0, chargeRate = 0.0;
+    const bool haveVoltage = AutoPubCDRSerializer_readFieldDouble(ctx, "voltage", voltage);
+    const bool haveCharge = AutoPubCDRSerializer_readFieldDouble(ctx, "charge", charge);
+    const bool haveRate = AutoPubCDRSerializer_readFieldDouble(ctx, "chargeRate", chargeRate);
+    if (!enc.writeFloat32(haveVoltage ? (float)voltage : nan)) return false;   // voltage
+    if (!enc.writeFloat32(nan)) return false;                                   // temperature
+    if (!enc.writeFloat32(nan)) return false;                                   // current
+    if (!enc.writeFloat32(nan)) return false;                                   // charge (Ah)
+    if (!enc.writeFloat32(nan)) return false;                                   // capacity
+    if (!enc.writeFloat32(nan)) return false;                                   // design_capacity
+    if (!enc.writeFloat32(haveCharge ? (float)(charge * PERCENT_TO_UNIT) : nan)) return false;   // percentage 0..1
+    // POWER_SUPPLY_STATUS_: UNKNOWN 0, CHARGING 1, DISCHARGING 2, NOT_CHARGING 3
+    uint8_t status = 0;
+    if (haveRate)
+        status = chargeRate > 0.5 ? 1 : chargeRate < -0.5 ? 2 : 3;
+    if (!enc.writeUint8(status)) return false;
+    if (!enc.writeUint8(0)) return false;           // power_supply_health UNKNOWN
+    if (!enc.writeUint8(0)) return false;           // power_supply_technology UNKNOWN
+    if (!enc.writeBool(true)) return false;         // present
+    if (!enc.writeSequenceLength(0)) return false;  // cell_voltage[]
+    if (!enc.writeSequenceLength(0)) return false;  // cell_temperature[]
+    if (!enc.writeString("")) return false;         // location
+    if (!enc.writeString("")) return false;         // serial_number
+    return true;
+}
+
+static bool serializeJointState(CDREncoder& enc, const AutoPubCDRContext& ctx)
+{
+    // sensor_msgs/JointState for a servo, motor or pump that reports back:
+    // one joint, position from "angle" (degrees -> rad), velocity from
+    // "velocity" when the device has it (taken as degrees/s -> rad/s, the
+    // same unit as its position), effort from "current" when it has that (as
+    // the device reports it - the records do not give its unit).
+    if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
+    double angle = 0.0, velocity = 0.0, current = 0.0;
+    (void)AutoPubCDRSerializer_readFieldDouble(ctx, "angle", angle);
+    const bool haveVelocity = AutoPubCDRSerializer_readFieldDouble(ctx, "velocity", velocity);
+    const bool haveCurrent = AutoPubCDRSerializer_readFieldDouble(ctx, "current", current);
+    if (!enc.writeSequenceLength(1)) return false;                  // name[]
+    if (!enc.writeString("joint")) return false;
+    if (!enc.writeSequenceLength(1)) return false;                  // position[]
+    if (!enc.writeFloat64(angle * DEG_TO_RAD)) return false;
+    if (!enc.writeSequenceLength(haveVelocity ? 1 : 0)) return false;   // velocity[]
+    if (haveVelocity && !enc.writeFloat64(velocity * DEG_TO_RAD)) return false;
+    if (!enc.writeSequenceLength(haveCurrent ? 1 : 0)) return false;    // effort[]
+    if (haveCurrent && !enc.writeFloat64(current)) return false;
+    return true;
+}
+
+/// @brief The numeric fallback: every attribute except the timestamp, as a
+/// float64 with a layout dimension labelled with the attribute's name, so
+/// `ros2 topic echo` shows which value is which and a subscriber can pick a
+/// value by label rather than position.
+static bool serializeFloat64MultiArray(CDREncoder& enc, const AutoPubCDRContext& ctx)
+{
+    auto included = [](const AutoPubAttrFieldDesc& d) {
+        return d.name && *d.name && std::strcmp(d.name, "timeMs") != 0;
+    };
+    auto elements = [](const AutoPubAttrFieldDesc& d) -> uint32_t { return d.count ? d.count : 1; };
+    uint32_t dims = 0, values = 0;
+    for (uint16_t i = 0; i < ctx.fieldCount; i++)
+    {
+        if (!included(ctx.pFieldDescs[i])) continue;
+        dims++;
+        values += elements(ctx.pFieldDescs[i]);
+    }
+
+    // MultiArrayLayout: dim[] of {string label, uint32 size, uint32 stride},
+    // uint32 data_offset.  An array attribute is one dim of its element count.
+    if (!enc.writeSequenceLength(dims)) return false;
+    for (uint16_t i = 0; i < ctx.fieldCount; i++)
+    {
+        const auto& d = ctx.pFieldDescs[i];
+        if (!included(d)) continue;
+        if (!enc.writeString(d.name)) return false;
+        if (!enc.writeUint32(elements(d))) return false;
+        if (!enc.writeUint32(elements(d))) return false;
+    }
+    if (!enc.writeUint32(0)) return false;
+
+    // float64 data[]
+    if (!enc.writeSequenceLength(values)) return false;
+    for (uint16_t i = 0; i < ctx.fieldCount; i++)
+    {
+        const auto& d = ctx.pFieldDescs[i];
+        if (!included(d)) continue;
+        for (uint16_t element = 0; element < elements(d); element++)
+        {
+            double v = 0.0;
+            (void)AutoPubCDRSerializer_readFieldElementDouble(ctx, d, element, v);
+            if (!enc.writeFloat64(v)) return false;
+        }
+    }
+    return true;
+}
+
+/// @brief sensor_msgs/Image, 32FC1, from a multizone ToF frame: one float32
+/// per zone in metres, row-major, NaN where the zone has no valid reading.
+/// Height and width come from the `grid` field (4 or 8); without one the
+/// frame is taken as square.
+static bool serializeDepthImage(CDREncoder& enc, const AutoPubCDRContext& ctx)
+{
+    const AutoPubAttrFieldDesc* pDist = findField(ctx, "dist");
+    if (!pDist)
+        return false;
+    const uint16_t zones = multizoneZones(ctx, *pDist);
+    uint32_t side = 1;
+    while ((side + 1) * (side + 1) <= zones)
+        side++;
+    const uint32_t width = side, height = zones / side;
+
+    if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
+    if (!enc.writeUint32(height)) return false;
+    if (!enc.writeUint32(width)) return false;
+    if (!enc.writeString("32FC1")) return false;
+    if (!enc.writeUint8(0)) return false;                       // is_bigendian: CDR LE
+    if (!enc.writeUint32(width * sizeof(float))) return false;  // step
+    if (!enc.writeSequenceLength(height * width * sizeof(float))) return false;
+    for (uint32_t zone = 0; zone < height * width; zone++)
+    {
+        double mm = 0.0;
+        float metres = std::numeric_limits<float>::quiet_NaN();
+        if (multizoneValid(ctx, (uint16_t)zone) && AutoPubCDRSerializer_readFieldElementDouble(ctx, *pDist, (uint16_t)zone, mm))
+            metres = (float)(mm * MM_TO_M);
+        uint8_t bytes[sizeof(float)];
+        std::memcpy(bytes, &metres, sizeof(bytes));
+        if (!enc.writeBytes(bytes, sizeof(bytes))) return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -594,6 +829,11 @@ bool AutoPubCDRSerializer_serialize(
         case AutoPubMsgKind::Float32MultiArray: ok = serializeFloat32MultiArray(enc, ctx); break;
         case AutoPubMsgKind::Wrench:            ok = serializeWrench(enc, ctx); break;
         case AutoPubMsgKind::Joy:               ok = serializeJoy(enc, ctx); break;
+        case AutoPubMsgKind::MagneticField:     ok = serializeMagneticField(enc, ctx); break;
+        case AutoPubMsgKind::BatteryState:      ok = serializeBatteryState(enc, ctx); break;
+        case AutoPubMsgKind::JointState:        ok = serializeJointState(enc, ctx); break;
+        case AutoPubMsgKind::Float64MultiArray: ok = serializeFloat64MultiArray(enc, ctx); break;
+        case AutoPubMsgKind::DepthImage:        ok = serializeDepthImage(enc, ctx); break;
         case AutoPubMsgKind::String:
         {
             // Slice 4.9 — generic JSON body.  Iterates every attribute in

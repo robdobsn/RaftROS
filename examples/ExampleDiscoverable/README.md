@@ -99,32 +99,42 @@ cannot reach it, its log says so and how to fix it.
 
 ### Telling the device where the router is (Zenoh)
 
-The router address is layered, each level overriding the one before:
+The router address is configuration, not part of the image. It is layered,
+each level overriding the one before:
 
-1. **Built-in default** - `CONFIG_RAFTROS_ZENOH_ROUTER_HOST` in menuconfig
-   (`192.168.86.192:7447` as shipped).
+1. **Build default** - `CONFIG_RAFTROS_ZENOH_ROUTER_HOST` in menuconfig,
+   empty as shipped (a build can bake one in).
 2. **SysTypes** - `"routerHost"` / `"routerPort"` in the `RaftROS` block of
    `systypes/SysTypeMain/SysTypes.json`.
-3. **Runtime, no rebuild** - post a settings overlay from any host on the
-   network; it persists in NVS and the device reboots into it:
+3. **Runtime, no rebuild** - the SysMod's own API, from any host on the
+   network. The change is applied at once (a live session is dropped and the
+   next connect uses the new address); `persist=1` also writes it to NVS for
+   later boots:
 
    ```bash
-   curl -X POST http://<device-ip>/api/postsettings/reboot \
-        -d '{"RaftROS":{"routerHost":"192.168.1.50"}}'
-   curl http://<device-ip>/api/getsettings/nv      # see what is set
-   curl http://<device-ip>/api/clearsettings       # back to SysTypes/default
+   curl 'http://<device-ip>/api/ros/set?routerHost=192.168.1.50&persist=1'
+   curl 'http://<device-ip>/api/ros/set?active=0'          # stop the node (until reboot)
+   curl 'http://<device-ip>/api/ros/set?active=1&persist=1'
+   curl http://<device-ip>/api/ros                           # status
+   curl http://<device-ip>/api/ros/clear                     # drop the persisted RaftROS settings
    ```
+
+   `POST /api/postsettings/reboot` with `{"RaftROS":{...}}` still works for
+   any key, and `/api/getsettings/nv` shows what is persisted.
 
 `routerHost` must be an IPv4 address: resolving a name would block the main
 loop for as long as the DNS query takes, so the SysMod refuses a hostname and
 says so in the log.
 
+**An active node with no address waits**, and says so once in the log with
+the `curl` line to set one; `/api/ros` shows `"conn":"unconfigured"`.
+
 **If the router isn't there, the device says so.** After three failed connection
 attempts, and every 30 s while it stays unreachable, the log carries a
 `ROUTER UNREACHABLE` warning that names the address, says whether the host
 answered (no router running there) or not (wrong address), says whether the
-address is the built-in default that was set for another network, and gives the
-`curl` line to change it. `GET /api/rosstat` reports the same:
+address is a build default that was set for another network, and gives the
+`curl` line to change it. `GET /api/ros` reports the same:
 `"routerSource":"default"|"config"`, `"routerReachable"`, `"connectFails"`,
 `"lastSessionAgoS"`.
 
@@ -312,8 +322,9 @@ A refused set reports why, in the words a stock ROS 2 node uses
 (`Wrong parameter type, expected 'Type.INTEGER' got 'Type.STRING'`,
 `Trying to set a read-only parameter: use_sim_time.`) or the parameter
 owner's own (`chatterPeriodMs must be 100-60000`). Only `chatterEnable` and
-`chatterPeriodMs` of the SysMod's settings are live; the rest take effect
-through `/api/postsettings` and a reboot as before.
+`chatterPeriodMs` of the SysMod's settings are live as parameters;
+`active`, `routerHost` and `routerPort` are live through `/api/ros/set`, and
+the rest take effect through `/api/postsettings` and a reboot as before.
 
 An application declares its own parameters on the SysMod and either reads
 them where they are used or takes a callback that can refuse a value:
@@ -336,12 +347,13 @@ time with `POST /api/postsettings/reboot` (persisted in NVS).
 
 | Key | Default | Meaning |
 | --- | --- | --- |
-| `enable` | 0 | Must be 1 for the SysMod to run |
+| `enable` | the `alwaysEnable` argument of `registerSysMod` | Whether SysManager creates the SysMod at all (with it off there is no node and no `/api/ros`) |
+| `active` | `enable`'s value, else 0 | Whether the node runs: connects to the router, publishes, serves. Changed live with `/api/ros/set?active=0\|1` |
 | `domainId` | 0 | ROS 2 domain |
 | `nodeName` / `nodeNamespace` | `raft_esp32` / `/` | The node's name |
 | `chatterEnable` | true | Publish `/chatter` |
 | `qosProfiles` | built-ins | Per-topic and per-class QoS (below) |
-| `routerHost` / `routerPort` | Kconfig (`CONFIG_RAFTROS_ZENOH_ROUTER_HOST`) / 7447 | Zenoh router, IPv4 only |
+| `routerHost` / `routerPort` | Kconfig (`CONFIG_RAFTROS_ZENOH_ROUTER_HOST`, empty as shipped) / 7447 | Zenoh router, IPv4 only; also set live with `/api/ros/set` |
 | `spdpIntervalMs` / `leaseDurationSec` | 5000 / 120 | RTPS discovery announce period and lease |
 
 `DevMan` in the same file declares the buses (`buslist`); auto-publishing
@@ -362,7 +374,7 @@ ros2 topic info -v /chatter_in     # Reliability: RELIABLE  Durability: TRANSIEN
 
 ## Auto-publishing bus devices
 
-With `RaftROS.enable = 1` and `DevMan.enable = 1`, every device that
+With the node active and `DevMan.enable = 1`, every device that
 `DeviceManager` brings online (I2C, BLE, ...) is automatically mirrored as a
 ROS 2 publisher. No per-device code, no per-topic config needed for the
 common case.
@@ -374,13 +386,30 @@ common case.
 - Message type is chosen by first-match on the device's `clas[]` tags and
   device type name (see `AutoPub/AutoPubClassMap.h`):
   - `{ACC, GYRO}` → `sensor_msgs/msg/Imu` (single writer).
-  - `{TEMP, RH}` → **two writers**: `Temperature` + `RelativeHumidity`.
+  - `{TEMP, RH}` → **two writers**: `Temperature` + `RelativeHumidity`;
+    with `CO2` as well (SCD30/SCD40/STCC4) a **third**, `std_msgs/Float32`
+    on slug `co2`.
   - `{PRES, TEMP}` → **two writers**: `FluidPressure` + `Temperature`.
-  - Single-class rules for TEMP, RH, PRES, LGHT, PROX, DIST, ANG, ROT,
-    ACC, TCH, BTN, FRCE, HRM, SOIL, GAME.
-  - Actuators (SRVO, PUMP, PIX) are excluded from publishing.
-  - Unknown classes fall back to `std_msgs/msg/String` with a JSON body of
-    every decoded field, topic slug `raw`.
+  - `{PROX, LGHT}` (VCNL4040) → **two writers**: `Illuminance` + `Range`
+    on slug `proximity`.
+  - Single-class rules: TEMP, RH, PRES → the `sensor_msgs` type; LGHT →
+    `Illuminance`; PROX, DIST → `Range`; ACC → `Imu` (accelerometer only);
+    MAG → `MagneticField` (µT → T); ANG, ANGL, SOIL, CO2, O2, WGHT →
+    `std_msgs/Float32`; ROT → `Int32`; BTN → `Bool`; TCH → `ByteMultiArray`;
+    FRCE → `geometry_msgs/Wrench`; HRM → `Float32MultiArray`; GAME →
+    `sensor_msgs/Joy`; FUEL, BATT → `sensor_msgs/BatteryState`; SRVO, MOTR,
+    PUMP → `sensor_msgs/JointState` (an actuator that reports its angle,
+    velocity and current back is a joint: position in rad, effort as the
+    device gives its current).
+  - The ST multizone ToFs (VL53L5CX / L7CX / L8CX) → **two writers**: a
+    `sensor_msgs/Image` (`32FC1`, 4×4 or 8×8, metres, NaN where the zone has
+    no valid target) on slug `depth`, and a `Range` of the nearest valid zone
+    on slug `range`.
+  - Output-only devices (PIX, LED) publish nothing.
+  - Any other class falls back to `std_msgs/msg/Float64MultiArray`, topic
+    slug `data`: every decoded field as a float64, with a
+    `layout.dim` entry labelled with the field's name, so a value can be
+    picked by name (`ros2 topic echo` shows the labels).
 - Unit scaling follows REP-103 (g→m/s², °/s→rad/s, mm→m, hPa→Pa,
   %→0..1). `Header.stamp` is taken from the poll record's `timeMs` field,
   so subscribers see sample-time not emit-time.
@@ -391,17 +420,17 @@ Four built-in profiles (see `AutoPub/AutoPubQoSProfile.h`):
 
 | Profile           | Reliability | Durability       | Depth | Default for                                      |
 |-------------------|-------------|------------------|-------|--------------------------------------------------|
-| `fast_sensor`     | BEST_EFFORT | VOLATILE         | 10    | ACC, GYRO, IMU, PROX, LGHT, DIST, ANG, HRM, FRCE |
-| `slow_sensor`     | RELIABLE    | VOLATILE         | 5     | TEMP, RH, PRES, SOIL, BTHM                       |
+| `fast_sensor`     | BEST_EFFORT | VOLATILE         | 10    | ACC, GYRO, IMU, PROX, LGHT, DIST, ANG, ANGL, MAG, HRM, FRCE, SRVO, MOTR, PUMP |
+| `slow_sensor`     | RELIABLE    | VOLATILE         | 5     | TEMP, RH, PRES, SOIL, BTHM, CO2, O2, VOC, FUEL, BATT |
 | `event`           | RELIABLE    | TRANSIENT_LOCAL  | 20    | BTN, TCH, ROT, GAME                              |
-| `fallback_string` | RELIABLE    | VOLATILE         | 10    | any unmapped class                               |
+| `fallback_string` | RELIABLE    | VOLATILE         | 10    | any class not listed                             |
 
 Override in SysTypes (resolution order: per-device alias → per-class
 override → built-in default):
 
 ```jsonc
 "RaftROS": {
-  "enable": 1,
+  "active": 1,
   "qosProfiles": {
     "imu_1_6a":         "slow_sensor",            // per-device alias (topic tail)
     "temperature_1_38": "event",

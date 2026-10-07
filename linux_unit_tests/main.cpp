@@ -3352,18 +3352,61 @@ int main()
         { const char* c[] = {"SOIL"};      checkPrimary("AdafruitSoilSensor", c, 1, RTPSAutoPubMsgKind::Float32, "soil_moisture"); }
         { const char* c[] = {"GAME"};      checkPrimary("AdafruitGamepad",    c, 1, RTPSAutoPubMsgKind::Joy,     "joy"); }
 
-        // ---- VCNL4040: [PROX, LGHT] — PROX wins single-class ordering? ----
-        // Design §5.2 splits VCNL4040 into two topics (illuminance + proximity)
-        // via Slice 4.10 composite.  For now the single-class fallthrough
-        // picks LGHT (illuminance) since LGHT is checked before PROX.
+        // ---- VCNL4040: [PROX, LGHT] composite: illuminance + proximity ----
         {
             const char* c[] = {"PROX", "LGHT"};
             const auto m = RTPSAutoPubClassMap_lookup(c, 2, "VCNL4040");
             TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Illuminance,
-                        "VCNL4040: primary = Illuminance (LGHT ordering)");
+                        "VCNL4040: primary = Illuminance");
             TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "illuminance") == 0,
                         "VCNL4040: slug = illuminance");
+            TEST_ASSERT(m.secondaryKind == RTPSAutoPubMsgKind::Range &&
+                        std::strcmp(m.secondaryTopicSlug, "proximity") == 0,
+                        "VCNL4040: secondary = Range proximity");
+            TEST_ASSERT(!m.hasTertiary(), "VCNL4040: no tertiary");
         }
+        // ---- SCD40: [CO2, TEMP, RH] composite with a CO2 tertiary ---------
+        {
+            const char* c[] = {"CO2", "TEMP", "RH"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 3, "SCD40");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Temperature &&
+                        m.secondaryKind == RTPSAutoPubMsgKind::RelativeHumidity,
+                        "SCD40: Temperature + RelativeHumidity");
+            TEST_ASSERT(m.tertiaryKind == RTPSAutoPubMsgKind::Float32 &&
+                        std::strcmp(m.tertiaryTopicSlug, "co2") == 0,
+                        "SCD40: tertiary = Float32 co2");
+            const char* cTR[] = {"TEMP", "RH"};
+            TEST_ASSERT(!RTPSAutoPubClassMap_lookup(cTR, 2, "AHT20").hasTertiary(),
+                        "AHT20: no tertiary without CO2");
+        }
+        // ---- ST multizone ToF: depth Image + nearest-zone Range -----------
+        {
+            const char* c[] = {"DIST"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 1, "VL53L5CX");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::DepthImage &&
+                        std::strcmp(m.primaryTopicSlug, "depth") == 0,
+                        "VL53L5CX: primary = depth Image");
+            TEST_ASSERT(m.secondaryKind == RTPSAutoPubMsgKind::Range &&
+                        std::strcmp(m.secondaryTopicSlug, "range") == 0,
+                        "VL53L5CX: secondary = Range");
+            TEST_ASSERT(RTPSAutoPubClassMap_lookup(c, 1, "VL53L8CX").primaryKind == RTPSAutoPubMsgKind::DepthImage,
+                        "VL53L8CX: also a depth Image");
+            TEST_ASSERT(RTPSAutoPubClassMap_lookup(c, 1, "VL53L4CD").primaryKind == RTPSAutoPubMsgKind::Range,
+                        "VL53L4CD: single-zone stays Range");
+        }
+        // ---- New single-class mappings -----------------------------------
+        { const char* c[] = {"MAG"};         checkPrimary("MMC5603",    c, 1, RTPSAutoPubMsgKind::MagneticField, "magnetic_field"); }
+        { const char* c[] = {"FUEL", "BATT"}; checkPrimary("MAX17048",  c, 2, RTPSAutoPubMsgKind::BatteryState,  "battery"); }
+        { const char* c[] = {"BATT"};        checkPrimary("Gauge",      c, 1, RTPSAutoPubMsgKind::BatteryState,  "battery"); }
+        { const char* c[] = {"ANGL"};        checkPrimary("RoboticalAngleSensor", c, 1, RTPSAutoPubMsgKind::Float32, "angle"); }
+        { const char* c[] = {"WGHT"};        checkPrimary("M5-Weight",  c, 1, RTPSAutoPubMsgKind::Float32, "weight"); }
+        { const char* c[] = {"CO2"};         checkPrimary("CO2Only",    c, 1, RTPSAutoPubMsgKind::Float32, "co2"); }
+        { const char* c[] = {"O2"};          checkPrimary("GravityO2",  c, 1, RTPSAutoPubMsgKind::Float32, "oxygen"); }
+        { const char* c[] = {"SRVO"};        checkPrimary("RoboticalServo",     c, 1, RTPSAutoPubMsgKind::JointState, "joint_state"); }
+        { const char* c[] = {"MOTR"};        checkPrimary("RoboticalDCMotor",   c, 1, RTPSAutoPubMsgKind::JointState, "joint_state"); }
+        { const char* c[] = {"PUMP"};        checkPrimary("RoboticalWaterPump", c, 1, RTPSAutoPubMsgKind::JointState, "joint_state"); }
+        { const char* c[] = {"VOC"};         checkPrimary("SGP30",      c, 1, RTPSAutoPubMsgKind::Float64MultiArray, "data"); }
+        { const char* c[] = {"LIQD"};        checkPrimary("RoboticalLiquidSensor", c, 1, RTPSAutoPubMsgKind::Float64MultiArray, "data"); }
 
         // ---- Device-type overrides ---------------------------------------
         // MCP9808 is mis-tagged LGHT in the JSON; override forces TEMP.
@@ -3389,50 +3432,45 @@ int main()
                         "RoboticalLightSensor: slug = light");
         }
 
-        // ---- Actuator exclusions ----------------------------------------
-        {
-            const char* cS[] = {"SRVO"};
-            const auto m = RTPSAutoPubClassMap_lookup(cS, 1, "RoboticalServo");
-            TEST_ASSERT(m.excluded, "RoboticalServo: excluded");
-            TEST_ASSERT(!m.hasPrimary(), "RoboticalServo: no primary writer");
-        }
-        {
-            const char* cP[] = {"PUMP"};
-            const auto m = RTPSAutoPubClassMap_lookup(cP, 1, "RoboticalWaterPump");
-            TEST_ASSERT(m.excluded, "RoboticalWaterPump: excluded");
-        }
+        // ---- Output-only exclusions --------------------------------------
         {
             const char* cPx[] = {"PIX"};
             const auto m = RTPSAutoPubClassMap_lookup(cPx, 1, "QwiicLEDStick");
             TEST_ASSERT(m.excluded, "QwiicLEDStick: excluded");
+            TEST_ASSERT(!m.hasPrimary(), "QwiicLEDStick: no primary writer");
+        }
+        {
+            const char* cL[] = {"LED"};
+            const auto m = RTPSAutoPubClassMap_lookup(cL, 1, "RoboticalLEDRing");
+            TEST_ASSERT(m.excluded, "RoboticalLEDRing: excluded");
         }
 
-        // ---- Fallback / BTHome (pending Slice 4.10) ---------------------
+        // ---- Fallback: labelled Float64MultiArray -------------------------
         {
             const char* c[] = {"BTHM"};
             const auto m = RTPSAutoPubClassMap_lookup(c, 1, "BLEBTHome");
-            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::String,
-                        "BLEBTHome: falls through to String (pending 4.10)");
-            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "raw") == 0,
-                        "BLEBTHome: slug = raw");
-            TEST_ASSERT(!m.excluded, "BLEBTHome: still published as String");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Float64MultiArray,
+                        "BLEBTHome: falls through to Float64MultiArray");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "data") == 0,
+                        "BLEBTHome: slug = data");
+            TEST_ASSERT(!m.excluded, "BLEBTHome: still published");
         }
         {
             const char* c[] = {"ZZZ_UNKNOWN"};
             const auto m = RTPSAutoPubClassMap_lookup(c, 1, "SomeNewDevice");
-            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::String,
-                        "unknown clas: fallback String");
-            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "raw") == 0,
-                        "unknown clas: slug = raw");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::Float64MultiArray,
+                        "unknown clas: fallback Float64MultiArray");
+            TEST_ASSERT(std::strcmp(m.primaryTopicSlug, "data") == 0,
+                        "unknown clas: slug = data");
         }
         {
             // Empty / null clas array still yields a usable fallback.
             const auto mEmpty = RTPSAutoPubClassMap_lookup(nullptr, 0, nullptr);
-            TEST_ASSERT(mEmpty.primaryKind == RTPSAutoPubMsgKind::String,
-                        "empty clas: fallback String");
+            TEST_ASSERT(mEmpty.primaryKind == RTPSAutoPubMsgKind::Float64MultiArray,
+                        "empty clas: fallback Float64MultiArray");
             const auto mNullArr = RTPSAutoPubClassMap_lookup(nullptr, 5, "X");
-            TEST_ASSERT(mNullArr.primaryKind == RTPSAutoPubMsgKind::String,
-                        "null clasArray: fallback String");
+            TEST_ASSERT(mNullArr.primaryKind == RTPSAutoPubMsgKind::Float64MultiArray,
+                        "null clasArray: fallback Float64MultiArray");
         }
 
         // ---- Every returned non-excluded kind has a valid type name -----
@@ -3444,13 +3482,21 @@ int main()
             RTPSAutoPubMsgKind::Int32, RTPSAutoPubMsgKind::Bool,
             RTPSAutoPubMsgKind::ByteMultiArray, RTPSAutoPubMsgKind::Wrench,
             RTPSAutoPubMsgKind::Float32MultiArray, RTPSAutoPubMsgKind::Joy,
-            RTPSAutoPubMsgKind::String,
+            RTPSAutoPubMsgKind::MagneticField, RTPSAutoPubMsgKind::BatteryState,
+            RTPSAutoPubMsgKind::JointState, RTPSAutoPubMsgKind::Float64MultiArray,
+            RTPSAutoPubMsgKind::DepthImage, RTPSAutoPubMsgKind::String,
         };
         for (auto k : allKinds)
         {
             const char* tn = RTPSAutoPubClassMap_typeName(k);
             TEST_ASSERT(tn != nullptr && tn[0] != '\0',
                         "every message kind has a non-empty type name");
+            const char* th = RaftRuntime::AutoPub::AutoPubClassMap_typeHash(k);
+            TEST_ASSERT(th != nullptr && std::strlen(th) == 71 && std::strncmp(th, "RIHS01_", 7) == 0,
+                        "every message kind has a well-formed type hash");
+            TEST_ASSERT(RaftRuntime::AutoPub::AutoPubClassMap_kindForTypeName(tn) == k ||
+                        k == RTPSAutoPubMsgKind::Accel,
+                        "type name round-trips to its kind");
         }
     }
 
@@ -3979,6 +4025,227 @@ int main()
                         "String: empty fields produces {\"ts\":1234}");
         }
 
+        // XCDR1 alignment is relative to the byte after the 4-byte encapsulation header
+        auto a4 = [](uint32_t p) { return ((p - 4 + 3) & ~3u) + 4; };
+        auto a8 = [](uint32_t p) { return ((p - 4 + 7) & ~7u) + 4; };
+
+        // ---- Float64MultiArray fallback: labelled, timeMs skipped --------
+        {
+            struct pollGeneric { uint32_t timeMs; uint16_t co2; float ph; uint8_t status; } __attribute__((packed));
+            pollGeneric s{100, 812, 7.25f, 3};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollGeneric, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"co2",    offsetof(pollGeneric, co2),    RTPSAutoPubAttrType::Uint16, "", 1.0f, 0.0f},
+                {"ph",     offsetof(pollGeneric, ph),     RTPSAutoPubAttrType::Float,  "", 1.0f, 0.0f},
+                {"status", offsetof(pollGeneric, status), RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Float64MultiArray, ctx, buf, sizeof(buf), written),
+                        "Float64MultiArray: serialize ok");
+            // layout.dim[] count, then dim[0] = {label "co2", size 1, stride 1}
+            TEST_ASSERT(le32(buf + 4) == 3, "Float64MultiArray: three dims (timeMs skipped)");
+            TEST_ASSERT(le32(buf + 8) == 4 && std::memcmp(buf + 12, "co2", 4) == 0,
+                        "Float64MultiArray: first dim labelled with the attribute name");
+            TEST_ASSERT(le32(buf + 16) == 1 && le32(buf + 20) == 1, "Float64MultiArray: dim size/stride 1");
+            // Walk to the data: dim[1] label "ph" (len 3, padded to 4), dim[2] "status" (len 7, padded to 8)
+            uint32_t pos = 24;
+            pos += 4 + 4 + 8;           // "ph" + size + stride
+            pos += 4 + 8 + 8;           // "status" + size + stride
+            pos += 4;                   // data_offset
+            TEST_ASSERT(le32(buf + pos) == 3, "Float64MultiArray: three data elements");
+            pos = a8(pos + 4);
+            double v[3];
+            std::memcpy(v, buf + pos, sizeof(v));
+            TEST_ASSERT(v[0] == 812.0 && std::fabs(v[1] - 7.25) < 1e-9 && v[2] == 3.0,
+                        "Float64MultiArray: values in attribute order");
+        }
+
+        // ---- Float64MultiArray: an array attribute carries every element --
+        {
+            struct pollArr { uint32_t timeMs; int16_t grid[4]; uint8_t n; } __attribute__((packed));
+            pollArr s{100, {10, 20, 30, 40}, 4};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollArr, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f, 0},
+                {"grid",   offsetof(pollArr, grid),   RTPSAutoPubAttrType::Int16,  "", 10.0f, 0.0f, 4},
+                {"n",      offsetof(pollArr, n),      RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 3;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Float64MultiArray, ctx, buf, sizeof(buf), written),
+                        "Float64MultiArray array: serialize ok");
+            TEST_ASSERT(le32(buf + 4) == 2, "Float64MultiArray array: two dims");
+            TEST_ASSERT(le32(buf + 8) == 5 && std::memcmp(buf + 12, "grid", 5) == 0 && le32(buf + 20) == 4,
+                        "Float64MultiArray array: grid dim has size 4");
+            uint32_t pos = 28;            // "n" label length (grid's size and stride at 20 and 24)
+            pos += 4 + 2;                 // "n\0"
+            pos = a4(pos) + 8;            // size, stride
+            pos += 4;                     // data_offset
+            TEST_ASSERT(le32(buf + pos) == 5, "Float64MultiArray array: five values");
+            pos = a8(pos + 4);
+            double v[5]; std::memcpy(v, buf + pos, sizeof(v));
+            TEST_ASSERT(v[0] == 1.0 && v[1] == 2.0 && v[2] == 3.0 && v[3] == 4.0 && v[4] == 4.0,
+                        "Float64MultiArray array: elements scaled and in order");
+        }
+
+        // ---- Multizone ToF: depth Image and nearest-zone Range -------------
+        {
+            // A 4x4 frame in a 64-zone record (VL53L5CX layout): zones 0..15 used
+            struct pollTof { uint32_t timeMs; uint8_t grid; uint8_t seq; int8_t tempC; uint8_t nValid; int16_t dist[64]; uint8_t status[64]; } __attribute__((packed));
+            pollTof s{}; s.grid = 4; s.nValid = 3;
+            for (int i = 0; i < 64; i++) { s.dist[i] = (int16_t)(1000 + i * 10); s.status[i] = 255; }
+            s.status[0] = 5; s.status[5] = 6; s.status[9] = 9;      // valid zones: 1000, 1050, 1090 mm
+            s.status[3] = 4; s.dist[3] = 100;                      // invalid status: ignored though nearest
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollTof, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f, 0},
+                {"grid",   offsetof(pollTof, grid),   RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+                {"seq",    offsetof(pollTof, seq),    RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+                {"tempC",  offsetof(pollTof, tempC),  RTPSAutoPubAttrType::Int8,   "", 1.0f, 0.0f, 1},
+                {"nValid", offsetof(pollTof, nValid), RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+                {"dist",   offsetof(pollTof, dist),   RTPSAutoPubAttrType::Int16,  "", 1.0f, 0.0f, 64},
+                {"status", offsetof(pollTof, status), RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 64},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 7;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.frameId = "raft";
+
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::DepthImage, ctx, buf, sizeof(buf), written),
+                        "DepthImage: serialize ok");
+            uint32_t pos = a4(4 + 4 + 4 + 4 + 5);              // after the header
+            TEST_ASSERT(le32(buf + pos) == 4 && le32(buf + pos + 4) == 4, "DepthImage: 4x4 from the grid field");
+            pos += 8;
+            TEST_ASSERT(le32(buf + pos) == 6 && std::memcmp(buf + pos + 4, "32FC1", 6) == 0, "DepthImage: encoding 32FC1");
+            pos += 4 + 6;
+            TEST_ASSERT(buf[pos] == 0, "DepthImage: little-endian");
+            pos = a4(pos + 1);
+            TEST_ASSERT(le32(buf + pos) == 16, "DepthImage: step = 4 floats");
+            pos += 4;
+            TEST_ASSERT(le32(buf + pos) == 64, "DepthImage: 64 data bytes for 16 zones");
+            pos += 4;
+            float px[16]; std::memcpy(px, buf + pos, sizeof(px));
+            TEST_ASSERT(std::fabs(px[0] - 1.0f) < 1e-6f && std::fabs(px[5] - 1.05f) < 1e-6f && std::fabs(px[9] - 1.09f) < 1e-6f,
+                        "DepthImage: valid zones in metres");
+            TEST_ASSERT(std::isnan(px[1]) && std::isnan(px[3]) && std::isnan(px[15]), "DepthImage: invalid zones are NaN");
+            TEST_ASSERT(written == pos + 64, "DepthImage: message ends after the pixels");
+
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Range, ctx, buf, sizeof(buf), written),
+                        "Range multizone: serialize ok");
+            pos = 4 + 4 + 4 + 4 + 5;    // the uint8 radiation_type follows the frame_id string unpadded
+            pos = a4(pos + 1);
+            float r[3]; std::memcpy(r, buf + pos, sizeof(r));   // fov, min, max
+            TEST_ASSERT(r[2] == 4.0f, "Range multizone: max range 4 m");
+            float range; std::memcpy(&range, buf + pos + 12, 4);
+            TEST_ASSERT(std::fabs(range - 1.0f) < 1e-6f, "Range multizone: nearest valid zone (not the invalid 100 mm)");
+
+            // No valid zone at all -> +inf
+            for (int i = 0; i < 64; i++) s.status[i] = 255;
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Range, ctx, buf, sizeof(buf), written),
+                        "Range multizone: serialize ok with no valid zone");
+            std::memcpy(&range, buf + pos + 12, 4);
+            TEST_ASSERT(std::isinf(range) && range > 0, "Range multizone: no valid zone -> +inf");
+        }
+
+        // ---- JointState: degrees -> rad, velocity/effort when present -----
+        {
+            struct pollServo { uint32_t timeMs; int16_t angle; int8_t current; uint8_t state; int16_t velocity; } __attribute__((packed));
+            pollServo s{100, 900, 12, 1, 450};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",   offsetof(pollServo, timeMs),   RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"angle",    offsetof(pollServo, angle),    RTPSAutoPubAttrType::Int16,  "", 10.0f, 0.0f},
+                {"current",  offsetof(pollServo, current),  RTPSAutoPubAttrType::Int8,   "", 1.0f, 0.0f},
+                {"state",    offsetof(pollServo, state),    RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f},
+                {"velocity", offsetof(pollServo, velocity), RTPSAutoPubAttrType::Int16,  "", 1.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 5;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::JointState, ctx, buf, sizeof(buf), written),
+                        "JointState: serialize ok");
+            // header: sec(4) nanosec(4) frame_id len(4) + "raft\0" (5), then align 4
+            uint32_t pos = a4(4 + 4 + 4 + 4 + 5);
+            TEST_ASSERT(le32(buf + pos) == 1, "JointState: one name");
+            pos += 4;
+            TEST_ASSERT(le32(buf + pos) == 6 && std::memcmp(buf + pos + 4, "joint", 6) == 0, "JointState: name is joint");
+            pos = a4(pos + 4 + 6);      // "joint\0"
+            TEST_ASSERT(le32(buf + pos) == 1, "JointState: one position");
+            pos = a8(pos + 4);
+            double position; std::memcpy(&position, buf + pos, 8);
+            TEST_ASSERT(std::fabs(position - 90.0 * 0.017453292519943295) < 1e-9, "JointState: 90 deg -> rad");
+            pos += 8;
+            TEST_ASSERT(le32(buf + pos) == 1, "JointState: velocity present");
+            pos = a8(pos + 4);
+            double velocity; std::memcpy(&velocity, buf + pos, 8);
+            TEST_ASSERT(std::fabs(velocity - 450.0 * 0.017453292519943295) < 1e-9, "JointState: velocity deg/s -> rad/s");
+            pos += 8;
+            TEST_ASSERT(le32(buf + pos) == 1, "JointState: effort present");
+            pos = a8(pos + 4);
+            double effort; std::memcpy(&effort, buf + pos, 8);
+            TEST_ASSERT(effort == 12.0, "JointState: effort is the current as reported");
+        }
+
+        // ---- BatteryState: voltage, percentage, status from chargeRate ----
+        {
+            struct pollGauge { uint32_t timeMs; uint16_t voltage; uint16_t charge; int16_t chargeRate; } __attribute__((packed));
+            pollGauge s{100, 3 * 12800 + 12800 * 7 / 10, 80 * 256, (int16_t)(-2 * 4.808f)};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs",     offsetof(pollGauge, timeMs),     RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"voltage",    offsetof(pollGauge, voltage),    RTPSAutoPubAttrType::Uint16, "", 12800.0f, 0.0f},
+                {"charge",     offsetof(pollGauge, charge),     RTPSAutoPubAttrType::Uint16, "", 256.0f, 0.0f},
+                {"chargeRate", offsetof(pollGauge, chargeRate), RTPSAutoPubAttrType::Int16,  "", 4.808f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::BatteryState, ctx, buf, sizeof(buf), written),
+                        "BatteryState: serialize ok");
+            uint32_t pos = a4(4 + 4 + 4 + 4 + 5);   // encapsulation + header
+            float f[7]; std::memcpy(f, buf + pos, sizeof(f));
+            TEST_ASSERT(std::fabs(f[0] - 3.7f) < 1e-3f, "BatteryState: voltage 3.7 V");
+            TEST_ASSERT(std::isnan(f[1]) && std::isnan(f[2]) && std::isnan(f[3]) && std::isnan(f[4]) && std::isnan(f[5]),
+                        "BatteryState: unmeasured fields are NaN");
+            TEST_ASSERT(std::fabs(f[6] - 0.8f) < 1e-3f, "BatteryState: percentage 0.8");
+            pos += sizeof(f);
+            TEST_ASSERT(buf[pos] == 2, "BatteryState: negative chargeRate -> DISCHARGING");
+            TEST_ASSERT(buf[pos + 1] == 0 && buf[pos + 2] == 0 && buf[pos + 3] == 1,
+                        "BatteryState: health/technology unknown, present");
+        }
+
+        // ---- MagneticField: µT -> T ---------------------------------------
+        {
+            struct pollMag { uint32_t timeMs; uint16_t x; uint16_t y; uint16_t z; } __attribute__((packed));
+            pollMag s{100, 250, 0, 500};
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollMag, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f},
+                {"x",      offsetof(pollMag, x),      RTPSAutoPubAttrType::Uint16, "", 10.0f, 0.0f},
+                {"y",      offsetof(pollMag, y),      RTPSAutoPubAttrType::Uint16, "", 10.0f, 0.0f},
+                {"z",      offsetof(pollMag, z),      RTPSAutoPubAttrType::Uint16, "", 10.0f, 0.0f},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 4;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.frameId = "raft";
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::MagneticField, ctx, buf, sizeof(buf), written),
+                        "MagneticField: serialize ok");
+            uint32_t pos = a8(4 + 4 + 4 + 4 + 5);
+            double v[3]; std::memcpy(v, buf + pos, sizeof(v));
+            TEST_ASSERT(std::fabs(v[0] - 25e-6) < 1e-12 && v[1] == 0.0 && std::fabs(v[2] - 50e-6) < 1e-12,
+                        "MagneticField: 25 uT, 0, 50 uT in tesla");
+            TEST_ASSERT(written == pos + 3 * 8 + 9 * 8, "MagneticField: covariance follows");
+        }
+
         // ---- std_msgs/String helper: explicit body -----------------------
         {
             const char* payload = "{\"hello\":\"world\"}";
@@ -4401,19 +4668,40 @@ int main()
                         askedAliases.size() == 2,
                     "attach plan: each endpoint resolves its own QoS");
 
-        // Actuators publish nothing
-        const char* actuatorClas[] = {"SRVO"};
-        auto excluded = AutoPubAttachPlan_build(devId, actuatorClas, 1, "SERVO", resolveQoS);
-        TEST_ASSERT(excluded.excluded && excluded.endpointCount == 0,
-                    "attach plan: actuator excluded with no endpoints");
+        // Three-endpoint composite (CO2+TEMP+RH)
+        askedAliases.clear();
+        const char* co2Clas[] = {"CO2", "TEMP", "RH"};
+        const AutoPubDeviceId co2Id{1, 0x62, 0};
+        auto triple = AutoPubAttachPlan_build(co2Id, co2Clas, 3, "SCD40", resolveQoS);
+        TEST_ASSERT(triple.endpointCount == 3, "attach plan: CO2+TEMP+RH yields three endpoints");
+        TEST_ASSERT(triple.endpoints[2].msgKind == AutoPubMsgKind::Float32 &&
+                        std::string(triple.endpoints[2].topic) == "/raft/co2_1_62" &&
+                        triple.endpoints[2].deviceId.subIndex == 2,
+                    "attach plan: tertiary is the co2 Float32 with subIndex 2");
+        TEST_ASSERT(askedAliases.size() == 3 && askedAliases[2] == std::string("co2_1_62"),
+                    "attach plan: tertiary resolves its own QoS");
 
-        // Unknown class falls back to std_msgs/String
+        // Output-only devices publish nothing
+        const char* pixClas[] = {"PIX"};
+        auto excluded = AutoPubAttachPlan_build(devId, pixClas, 1, "QwiicLEDStick", resolveQoS);
+        TEST_ASSERT(excluded.excluded && excluded.endpointCount == 0,
+                    "attach plan: output-only device excluded with no endpoints");
+
+        // An actuator that reports back is a JointState
+        const char* actuatorClas[] = {"SRVO"};
+        auto servo = AutoPubAttachPlan_build(devId, actuatorClas, 1, "SERVO", resolveQoS);
+        TEST_ASSERT(!servo.excluded && servo.endpointCount == 1 &&
+                        servo.endpoints[0].msgKind == AutoPubMsgKind::JointState &&
+                        std::string(servo.endpoints[0].topic) == "/raft/joint_state_1_29",
+                    "attach plan: servo publishes a JointState");
+
+        // Unknown class falls back to the labelled Float64MultiArray
         const char* unknownClas[] = {"ZZZZ"};
         auto fallback = AutoPubAttachPlan_build(devId, unknownClas, 1, "MysteryDev", resolveQoS);
         TEST_ASSERT(fallback.endpointCount == 1 &&
-                        std::string(fallback.endpoints[0].type) == "std_msgs::msg::dds_::String_" &&
-                        std::string(fallback.endpoints[0].topic) == "/raft/raw_1_29",
-                    "attach plan: unknown class falls back to raw String topic");
+                        std::string(fallback.endpoints[0].type) == "std_msgs::msg::dds_::Float64MultiArray_" &&
+                        std::string(fallback.endpoints[0].topic) == "/raft/data_1_29",
+                    "attach plan: unknown class falls back to the data topic");
 
         // No class tags at all still yields the fallback endpoint
         auto noClas = AutoPubAttachPlan_build(devId, nullptr, 0, nullptr, resolveQoS);
