@@ -401,6 +401,10 @@ common case.
     PUMP → `sensor_msgs/JointState` (an actuator that reports its angle,
     velocity and current back is a joint: position in rad, effort as the
     device gives its current).
+  - The ST multizone ToFs (VL53L5CX / L7CX / L8CX) → **two writers**: a
+    `sensor_msgs/Image` (`32FC1`, 4×4 or 8×8, metres, NaN where the zone has
+    no valid target) on slug `depth`, and a `Range` of the nearest valid zone
+    on slug `range`.
   - Output-only devices (PIX, LED) publish nothing.
   - Any other class falls back to `std_msgs/msg/Float64MultiArray`, topic
     slug `data`: every decoded field as a float64, with a

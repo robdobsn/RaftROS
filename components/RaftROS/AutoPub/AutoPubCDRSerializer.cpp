@@ -43,6 +43,7 @@ static constexpr float   RANGE_DEFAULT_FOV        = 0.0f;
 static constexpr float   RANGE_MIN_DEFAULT        = 0.0f;
 static constexpr float   RANGE_MAX_PROX_DEFAULT   = 1.0f;       // normalised proximity
 static constexpr float   RANGE_MAX_DIST_DEFAULT   = 2.0f;       // ~2 m for VL6180 / VL53L4CD
+static constexpr float   RANGE_MAX_MULTIZONE      = 4.0f;       // VL53L5CX / L7CX / L8CX
 
 // ---------------------------------------------------------------------------
 // Field lookup helpers
@@ -305,6 +306,46 @@ static bool serializeIlluminance(CDREncoder& enc, const AutoPubCDRContext& ctx)
     return true;
 }
 
+/// @brief Is zone `index` of a multizone frame a valid reading?  The status
+/// array, when the record has one, uses the ST target-status codes.
+static bool multizoneValid(const AutoPubCDRContext& ctx, uint16_t index)
+{
+    const AutoPubAttrFieldDesc* pStatus = findField(ctx, "status");
+    if (!pStatus || (pStatus->count ? pStatus->count : 1) <= index)
+        return true;
+    double status = 0.0;
+    if (!AutoPubCDRSerializer_readFieldElementDouble(ctx, *pStatus, index, status, false))
+        return true;
+    return status == 5.0 || status == 6.0 || status == 9.0;
+}
+
+/// @brief Zones in the frame: the `grid` field (4 or 8 a side) when present,
+/// else the whole distance array
+static uint16_t multizoneZones(const AutoPubCDRContext& ctx, const AutoPubAttrFieldDesc& dist)
+{
+    const uint16_t count = dist.count ? dist.count : 1;
+    double grid = 0.0;
+    if (AutoPubCDRSerializer_readFieldDouble(ctx, "grid", grid, false) && grid >= 1.0 && grid * grid <= count)
+        return (uint16_t)(grid * grid);
+    return count;
+}
+
+/// @brief Nearest valid zone's distance in metres, or +inf with none valid
+static double multizoneNearestM(const AutoPubCDRContext& ctx, const AutoPubAttrFieldDesc& dist)
+{
+    double nearestMm = std::numeric_limits<double>::infinity();
+    const uint16_t zones = multizoneZones(ctx, dist);
+    for (uint16_t zone = 0; zone < zones; zone++)
+    {
+        double mm = 0.0;
+        if (!multizoneValid(ctx, zone) || !AutoPubCDRSerializer_readFieldElementDouble(ctx, dist, zone, mm))
+            continue;
+        if (mm < nearestMm)
+            nearestMm = mm;
+    }
+    return std::isinf(nearestMm) ? nearestMm : nearestMm * MM_TO_M;
+}
+
 static bool serializeRange(CDREncoder& enc, const AutoPubCDRContext& ctx)
 {
     if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
@@ -314,7 +355,16 @@ static bool serializeRange(CDREncoder& enc, const AutoPubCDRContext& ctx)
 
     double rangeVal = 0.0;
     float  maxRange = RANGE_MAX_DIST_DEFAULT;
-    if (AutoPubCDRSerializer_readFieldDouble(ctx, "dist", rangeVal))
+    const AutoPubAttrFieldDesc* pDist = findField(ctx, "dist");
+    if (pDist && (pDist->count ? pDist->count : 1) > 1)
+    {
+        // A multizone frame: the nearest zone with a valid status (ST: 5 =
+        // valid, 6 and 9 = valid with lower confidence; no status array =
+        // every zone counts).  No valid zone gives +inf, per REP-117.
+        rangeVal = multizoneNearestM(ctx, *pDist);
+        maxRange = RANGE_MAX_MULTIZONE;
+    }
+    else if (AutoPubCDRSerializer_readFieldDouble(ctx, "dist", rangeVal))
     {
         rangeVal *= MM_TO_M;   // mm → m
         maxRange = RANGE_MAX_DIST_DEFAULT;
@@ -693,6 +743,41 @@ static bool serializeFloat64MultiArray(CDREncoder& enc, const AutoPubCDRContext&
     return true;
 }
 
+/// @brief sensor_msgs/Image, 32FC1, from a multizone ToF frame: one float32
+/// per zone in metres, row-major, NaN where the zone has no valid reading.
+/// Height and width come from the `grid` field (4 or 8); without one the
+/// frame is taken as square.
+static bool serializeDepthImage(CDREncoder& enc, const AutoPubCDRContext& ctx)
+{
+    const AutoPubAttrFieldDesc* pDist = findField(ctx, "dist");
+    if (!pDist)
+        return false;
+    const uint16_t zones = multizoneZones(ctx, *pDist);
+    uint32_t side = 1;
+    while ((side + 1) * (side + 1) <= zones)
+        side++;
+    const uint32_t width = side, height = zones / side;
+
+    if (!writeHeader(enc, ctx.timestampMs, ctx.frameId)) return false;
+    if (!enc.writeUint32(height)) return false;
+    if (!enc.writeUint32(width)) return false;
+    if (!enc.writeString("32FC1")) return false;
+    if (!enc.writeUint8(0)) return false;                       // is_bigendian: CDR LE
+    if (!enc.writeUint32(width * sizeof(float))) return false;  // step
+    if (!enc.writeSequenceLength(height * width * sizeof(float))) return false;
+    for (uint32_t zone = 0; zone < height * width; zone++)
+    {
+        double mm = 0.0;
+        float metres = std::numeric_limits<float>::quiet_NaN();
+        if (multizoneValid(ctx, (uint16_t)zone) && AutoPubCDRSerializer_readFieldElementDouble(ctx, *pDist, (uint16_t)zone, mm))
+            metres = (float)(mm * MM_TO_M);
+        uint8_t bytes[sizeof(float)];
+        std::memcpy(bytes, &metres, sizeof(bytes));
+        if (!enc.writeBytes(bytes, sizeof(bytes))) return false;
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Public entry points
 // ---------------------------------------------------------------------------
@@ -748,6 +833,7 @@ bool AutoPubCDRSerializer_serialize(
         case AutoPubMsgKind::BatteryState:      ok = serializeBatteryState(enc, ctx); break;
         case AutoPubMsgKind::JointState:        ok = serializeJointState(enc, ctx); break;
         case AutoPubMsgKind::Float64MultiArray: ok = serializeFloat64MultiArray(enc, ctx); break;
+        case AutoPubMsgKind::DepthImage:        ok = serializeDepthImage(enc, ctx); break;
         case AutoPubMsgKind::String:
         {
             // Slice 4.9 — generic JSON body.  Iterates every attribute in
