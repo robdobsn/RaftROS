@@ -61,11 +61,14 @@ inline bool AutoPubTopicNaming_formatClassTopic(
 {
     if (!pOutBuf || outBufLen == 0 || !pSlug || !pSlug[0])
         return false;
+    // The whole bus element address: for a device behind an I2C mux it
+    // carries the slot in the upper bits (0x229 = address 0x29 on slot 2),
+    // and two of the same sensor on different slots must get different topics
     const int written = std::snprintf(pOutBuf, outBufLen,
                                       "/raft/%s_%u_%02x",
                                       pSlug,
                                       (unsigned)busNum,
-                                      (unsigned)(address & 0xFFu));
+                                      (unsigned)address);
     if (written < 0)
     {
         pOutBuf[0] = '\0';

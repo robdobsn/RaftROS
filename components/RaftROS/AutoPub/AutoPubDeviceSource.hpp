@@ -85,6 +85,32 @@ void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceStatusChange(
     }
 }
 
+/// @brief Attach every bus device that is already identified.  DeviceManager
+/// only reports changes, so a listener registered after a device came online
+/// (the node activated through /api/ros with sensors plugged in) would wait
+/// for a re-plug; this walks the buses and attaches as a status change would.
+template <typename Backend, uint8_t CAPACITY>
+void AutoPubDeviceSource<Backend, CAPACITY>::attachOnlineDevices()
+{
+    for (RaftBus* pBus : raftBusSystem.getBusList())
+    {
+        RaftBusDevicesIF* pDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
+        if (!pDevicesIF)
+            continue;
+        std::vector<BusElemAddrType> addresses;
+        pDevicesIF->getDeviceAddresses(addresses, true);
+        for (BusElemAddrType address : addresses)
+        {
+            DeviceTypeIndexType deviceTypeIndex = DEVICE_TYPE_INDEX_INVALID;
+            pDevicesIF->getDevTypeInfoJsonByAddr(address, false, deviceTypeIndex);
+            if (deviceTypeIndex == DEVICE_TYPE_INDEX_INVALID)
+                continue;
+            RaftDevice busDevice("BusDevice", "{}", RaftDeviceID(pBus->getBusNum(), address));
+            attachDevice(busDevice, BusAddrStatus(address, DeviceOnlineState::ONLINE, true, true, deviceTypeIndex));
+        }
+    }
+}
+
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 // QoS overrides
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////

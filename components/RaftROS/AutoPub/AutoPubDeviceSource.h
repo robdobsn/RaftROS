@@ -46,6 +46,7 @@
 #include "DevicePollingInfo.h"
 #include "DeviceTypeRecords.h"
 #include "RaftBusDevicesIF.h"
+#include "RaftBusSystem.h"
 #include "RaftDevice.h"
 #include "RaftDeviceConsts.h"
 #include "RaftJson.h"
@@ -129,6 +130,10 @@ public:
                 this->onDeviceStatusChange(device, addrStatus);
             });
         _statusCBRegistered = true;
+        // Devices identified before this listener existed never report a
+        // status change to it - the case when the node is activated at run
+        // time with sensors already attached - so attach them now
+        attachOnlineDevices();
         return true;
     }
 
@@ -226,6 +231,7 @@ private:
 
     // Device lifecycle
     void onDeviceStatusChange(RaftDevice& device, const BusAddrStatus& addrStatus);
+    void attachOnlineDevices();
     bool attachDevice(RaftDevice& device, const BusAddrStatus& addrStatus);
     void detachDevice(RaftDevice& device);
     void onDeviceData(std::vector<uint8_t> data, const void* pCallbackInfo);

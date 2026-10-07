@@ -73,7 +73,10 @@ struct AutoPubSampleResult
 class AutoPubSampleRunner
 {
 public:
-    static constexpr uint8_t MAX_OUTPUTS = 2;
+    /// @brief Endpoints a device can publish: primary, secondary and tertiary
+    /// (AutoPubDeviceSource::MAX_ENDPOINTS_PER_DEVICE); a run with more outputs
+    /// than this is refused
+    static constexpr uint8_t MAX_OUTPUTS = 3;
 
     /// @brief Serialise the latest record into each enabled output, in order,
     /// calling `publish(outputIndex, payload, length, timestampMs)` (returning

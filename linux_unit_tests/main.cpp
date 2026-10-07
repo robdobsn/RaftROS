@@ -3104,13 +3104,13 @@ int main()
                         "topic format: edge case bus=0 addr=0");
         }
 
-        // ---- address masked to low 8 bits (I2C 7-bit convention) -----
+        // ---- the whole bus element address (mux slot in the upper bits) ----
         {
             char buf[64];
             TEST_ASSERT(RTPSAutoPubTopicNaming_formatFallbackTopic(buf, sizeof(buf), 1, 0x1138),
-                        "topic format: address masked to 8 bits");
-            TEST_ASSERT(std::strcmp(buf, "/raft/raw_1_38") == 0,
-                        "topic format: high bits of address stripped");
+                        "topic format: wide address accepted");
+            TEST_ASSERT(std::strcmp(buf, "/raft/raw_1_1138") == 0,
+                        "topic format: high bits of address kept (slot of a muxed device)");
         }
 
         // ---- topic formatting: input validation ----------------------
@@ -4319,6 +4319,20 @@ int main()
         };
         TEST_ASSERT(AutoPubSampleRunner::run(batch, outputs, 2, results, publish),
                     "sample runner: valid composite batch");
+        {
+            // Three outputs, the third unused (what the device source passes
+            // for every device): accepted, and the unused output is skipped
+            AutoPubSampleOutput three[] = {outputs[0], outputs[1], {AutoPubMsgKind::Unknown, nullptr, 0}};
+            AutoPubSampleResult threeResults[3];
+            unsigned threeCalls = 0;
+            auto count = [&](uint8_t, const uint8_t*, uint32_t, uint32_t) { ++threeCalls; return AutoPubPublishResult::Accepted; };
+            TEST_ASSERT(AutoPubSampleRunner::run(batch, three, 3, threeResults, count),
+                        "sample runner: three outputs accepted (MAX_OUTPUTS covers a tertiary endpoint)");
+            TEST_ASSERT(threeCalls == 2 && !threeResults[2].serialized,
+                        "sample runner: unused third output skipped");
+            TEST_ASSERT(!AutoPubSampleRunner::run(batch, three, 4, threeResults, count),
+                        "sample runner: more than MAX_OUTPUTS refused");
+        }
         TEST_ASSERT(calls == 2 && results[0].serialized && results[1].serialized,
                     "sample runner: emits both composite outputs");
         TEST_ASSERT(results[0].publishResult == AutoPubPublishResult::Accepted &&
@@ -4400,7 +4414,7 @@ int main()
         TEST_ASSERT(!AutoPubSampleRunner::run(batch, nullptr, 2, results, noPublish) &&
                         !AutoPubSampleRunner::run(batch, outputs, 2, nullptr, noPublish) &&
                         !AutoPubSampleRunner::run(batch, outputs, 0, results, noPublish) &&
-                        !AutoPubSampleRunner::run(batch, outputs, 3, results, noPublish),
+                        !AutoPubSampleRunner::run(batch, outputs, AutoPubSampleRunner::MAX_OUTPUTS + 1, results, noPublish),
                     "sample runner: validates output and result bounds");
         outputs[0].kind = AutoPubMsgKind::Unknown;
         outputs[1].data = nullptr;
@@ -4667,6 +4681,12 @@ int main()
         TEST_ASSERT(composite.endpoints[1].qosProfileId == AutoPubQoSProfileId::SlowSensor &&
                         askedAliases.size() == 2,
                     "attach plan: each endpoint resolves its own QoS");
+
+        // A device behind an I2C mux keeps its slot in the topic
+        const AutoPubDeviceId muxId{1, 0x229, 0};
+        auto mux = AutoPubAttachPlan_build(muxId, distClas, 1, "VL6180", resolveQoS);
+        TEST_ASSERT(std::string(mux.endpoints[0].topic) == "/raft/range_1_229",
+                    "attach plan: mux slot kept in the topic address");
 
         // Three-endpoint composite (CO2+TEMP+RH)
         askedAliases.clear();
