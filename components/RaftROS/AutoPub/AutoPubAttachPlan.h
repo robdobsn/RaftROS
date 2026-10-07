@@ -7,9 +7,9 @@
 // caller supplies QoS override resolution (SysTypes alias/class overrides live
 // in the SysMod), so this header stays unit-testable on the host.
 //
-// Mirrors the behaviour the RTPS wrapper had inline: actuators are excluded,
-// an unmapped class falls back to std_msgs/String with the "raw" slug, and a
-// composite device yields a second endpoint with subIndex 1.
+// Output-only devices are excluded, an unmapped class falls back to a labelled
+// std_msgs/Float64MultiArray with the "data" slug, and a composite device
+// yields up to two further endpoints with subIndex 1 and 2.
 //
 // Rob Dobson 2026
 //
@@ -26,10 +26,10 @@
 namespace RaftRuntime {
 namespace AutoPub {
 
-/// @brief Endpoints a device should publish (at most one composite pair)
+/// @brief Endpoints a device should publish (a primary and up to two composite extras)
 struct AutoPubAttachPlan
 {
-    static constexpr uint8_t MAX_ENDPOINTS = 2;
+    static constexpr uint8_t MAX_ENDPOINTS = 3;
     bool excluded = false;                          ///< Device is an actuator - publish nothing
     uint8_t endpointCount = 0;
     AutoPubEndpointDesc endpoints[MAX_ENDPOINTS];
@@ -89,31 +89,37 @@ inline AutoPubAttachPlan AutoPubAttachPlan_build(
                                       clasArray, clasCount, deviceTypeName);
     plan.endpointCount = 1;
 
-    // Composite secondary endpoint (e.g. AHT20 -> Temperature + RelativeHumidity).
-    // A secondary that cannot be named is dropped; the primary still publishes.
-    if (!mapping.hasSecondary())
-        return plan;
-    const char* const secondarySlug = mapping.secondaryTopicSlug ? mapping.secondaryTopicSlug : "raw2";
-    const char* const secondaryType = AutoPubClassMap_typeName(mapping.secondaryKind)
-                                    ? AutoPubClassMap_typeName(mapping.secondaryKind)
-                                    : AUTOPUB_FALLBACK_TYPE;
-    char secTopicBuf[AUTOPUB_TOPIC_MAX_LEN];
-    if (!AutoPubTopicNaming_formatClassTopic(secTopicBuf, sizeof(secTopicBuf), secondarySlug,
-                                             deviceId.busNum, deviceId.address))
-        return plan;
-
-    AutoPubEndpointDesc& secondary = plan.endpoints[1];
-    if (!secondary.setNames(secTopicBuf, secondaryType))
+    // Composite extra endpoints (e.g. AHT20 -> Temperature + RelativeHumidity,
+    // SCD40 -> those plus a CO2 Float32).  An extra that cannot be named is
+    // dropped, along with any after it; the primary still publishes.
+    const AutoPubMsgKind extraKinds[] = {mapping.secondaryKind, mapping.tertiaryKind};
+    const char* const extraSlugs[] = {mapping.secondaryTopicSlug, mapping.tertiaryTopicSlug};
+    for (uint8_t extraIndex = 0; extraIndex < 2; ++extraIndex)
     {
-        secondary = AutoPubEndpointDesc();
-        return plan;
-    }
-    secondary.deviceId = deviceId;
-    secondary.deviceId.subIndex = 1;
-    secondary.msgKind = mapping.secondaryKind;
-    secondary.qosProfileId = resolveQoS(AutoPubAttachPlan_topicAlias(secondary.topic),
+        if (extraKinds[extraIndex] == AutoPubMsgKind::Unknown)
+            return plan;
+        const char* const extraSlug = extraSlugs[extraIndex] ? extraSlugs[extraIndex] : "data2";
+        const char* const extraType = AutoPubClassMap_typeName(extraKinds[extraIndex])
+                                    ? AutoPubClassMap_typeName(extraKinds[extraIndex])
+                                    : AUTOPUB_FALLBACK_TYPE;
+        char extraTopicBuf[AUTOPUB_TOPIC_MAX_LEN];
+        if (!AutoPubTopicNaming_formatClassTopic(extraTopicBuf, sizeof(extraTopicBuf), extraSlug,
+                                                 deviceId.busNum, deviceId.address))
+            return plan;
+
+        AutoPubEndpointDesc& extra = plan.endpoints[1 + extraIndex];
+        if (!extra.setNames(extraTopicBuf, extraType))
+        {
+            extra = AutoPubEndpointDesc();
+            return plan;
+        }
+        extra.deviceId = deviceId;
+        extra.deviceId.subIndex = 1 + extraIndex;
+        extra.msgKind = extraKinds[extraIndex];
+        extra.qosProfileId = resolveQoS(AutoPubAttachPlan_topicAlias(extra.topic),
                                         clasArray, clasCount, deviceTypeName);
-    plan.endpointCount = 2;
+        plan.endpointCount = 2 + extraIndex;
+    }
     return plan;
 }
 

@@ -138,6 +138,11 @@ inline AutoPubQoSProfileId AutoPubQoSProfile_defaultForClass(const char* clasCod
     if (std::strcmp(clasCode, "ANG")  == 0) return AutoPubQoSProfileId::FastSensor;
     if (std::strcmp(clasCode, "HRM")  == 0) return AutoPubQoSProfileId::FastSensor;
     if (std::strcmp(clasCode, "FRCE") == 0) return AutoPubQoSProfileId::FastSensor;
+    if (std::strcmp(clasCode, "MAG")  == 0) return AutoPubQoSProfileId::FastSensor;
+    if (std::strcmp(clasCode, "ANGL") == 0) return AutoPubQoSProfileId::FastSensor;
+    if (std::strcmp(clasCode, "SRVO") == 0) return AutoPubQoSProfileId::FastSensor;
+    if (std::strcmp(clasCode, "MOTR") == 0) return AutoPubQoSProfileId::FastSensor;
+    if (std::strcmp(clasCode, "PUMP") == 0) return AutoPubQoSProfileId::FastSensor;
 
     // Slow environmental sensors.
     if (std::strcmp(clasCode, "TEMP") == 0) return AutoPubQoSProfileId::SlowSensor;
@@ -145,6 +150,11 @@ inline AutoPubQoSProfileId AutoPubQoSProfile_defaultForClass(const char* clasCod
     if (std::strcmp(clasCode, "PRES") == 0) return AutoPubQoSProfileId::SlowSensor;
     if (std::strcmp(clasCode, "SOIL") == 0) return AutoPubQoSProfileId::SlowSensor;
     if (std::strcmp(clasCode, "BTHM") == 0) return AutoPubQoSProfileId::SlowSensor;
+    if (std::strcmp(clasCode, "CO2")  == 0) return AutoPubQoSProfileId::SlowSensor;
+    if (std::strcmp(clasCode, "O2")   == 0) return AutoPubQoSProfileId::SlowSensor;
+    if (std::strcmp(clasCode, "VOC")  == 0) return AutoPubQoSProfileId::SlowSensor;
+    if (std::strcmp(clasCode, "FUEL") == 0) return AutoPubQoSProfileId::SlowSensor;
+    if (std::strcmp(clasCode, "BATT") == 0) return AutoPubQoSProfileId::SlowSensor;
 
     // Event-like inputs (latched state, want last-value latch for late-joiners).
     if (std::strcmp(clasCode, "BTN")  == 0) return AutoPubQoSProfileId::Event;

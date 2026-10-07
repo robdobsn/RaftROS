@@ -51,15 +51,18 @@ menu "RaftROS"
 
     config RAFTROS_ZENOH_ROUTER_HOST
         string "Zenoh router host"
-        default "192.168.86.192"
+        default ""
         depends on RAFTROS_BACKEND_ZENOH || RAFTROS_BACKEND_ZENOH_PICO
         help
-            IPv4 address of the Zenoh router to connect to.  This is only the
-            built-in default: "routerHost" in the SysMod's SysTypes
-            configuration overrides it, and a device can be re-pointed without
-            a rebuild by posting {"RaftROS":{"routerHost":"<ip>"}} to
-            /api/postsettings/reboot.  A device that cannot reach its router
-            says so in the log, and says which of these its address came from.
+            IPv4 address of the Zenoh router to connect to.  Empty by default:
+            the address is configuration, not part of the image.  "routerHost"
+            in the SysMod's SysTypes block sets it, and a device is pointed at
+            a router (or re-pointed) without a rebuild with
+            /api/ros/set?routerHost=<ip>&persist=1, or by posting
+            {"RaftROS":{"routerHost":"<ip>"}} to /api/postsettings/reboot.
+            An active node with no address waits, saying so once in the log;
+            one that cannot reach its router says so, and says where its
+            address came from.
 
             This must be an address, not a hostname: resolving a name blocks
             for as long as the DNS query takes, which would break the Raft

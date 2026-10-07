@@ -26,6 +26,7 @@
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <algorithm>
 
 static const char* MODULE_PREFIX = "RaftROS";
 
@@ -59,105 +60,144 @@ RaftROS::~RaftROS()
 
 void RaftROS::setup()
 {
-    // Configure from JSON config (with defaults)
-    _isEnabled = configGetBool("enable", false);
+    // Configure from JSON config (with defaults).  `active` says whether the
+    // node runs; for configurations written before it existed, `enable` in
+    // this block means the same thing (SysManager has already honoured it as
+    // "create the SysMod").
+    _active = configGetBool("active", configGetBool("enable", false));
     _domainId = configGetLong("domainId", 0);
     _nodeName = configGetString("nodeName", "raft_esp32");
     _nodeNamespace = configGetString("nodeNamespace", "/");
-    // The router address is layered: the Kconfig default, overridden by
-    // "routerHost" in SysTypes, overridden by a value posted to
-    // /api/postsettings (persisted in NVS).  Remember which, so a device that
-    // cannot reach its router can say whether it is running on a default that
-    // was never set for this network.
+    // The router address is layered: the Kconfig default (empty unless the
+    // build sets one), overridden by "routerHost" in SysTypes, overridden by a
+    // value posted to /api/postsettings or /api/ros/set (persisted in NVS).
+    // Remember which, so a device that cannot reach its router can say whether
+    // it is running on a default that was never set for this network.
     _routerFromConfig = configGetString("routerHost", "").length() > 0;
 #ifdef CONFIG_RAFTROS_ZENOH_ROUTER_HOST
-    _routerHost = configGetString("routerHost", CONFIG_RAFTROS_ZENOH_ROUTER_HOST);
+    setRouterHost(configGetString("routerHost", CONFIG_RAFTROS_ZENOH_ROUTER_HOST).c_str());
     _routerPort = configGetLong("routerPort", CONFIG_RAFTROS_ZENOH_ROUTER_PORT);
 #else
-    _routerHost = configGetString("routerHost", "");
+    setRouterHost(configGetString("routerHost", "").c_str());
     _routerPort = configGetLong("routerPort", 7447);
 #endif
+    if (_routerPort == 0 || _routerPort > 65535)
+        _routerPort = 7447;
 
-    if (!_isEnabled)
+    if (!_active)
     {
-        LOG_I(MODULE_PREFIX, "setup DISABLED");
+        LOG_I(MODULE_PREFIX, "setup node INACTIVE - activate with /api/ros/set?active=1 (persist=1 to keep it) or \"active\":1 in SysTypes");
         return;
     }
+    startNode();
+}
 
-    // A hostname would need a DNS lookup, and the resolver blocks for as long
-    // as the query takes - well past the main-loop budget.  Require an address.
+/// @brief Remember the router address and whether it is usable.  A hostname
+/// would need a DNS lookup, and the resolver blocks for as long as the query
+/// takes - well past the main-loop budget - so only an IPv4 address is used.
+void RaftROS::setRouterHost(const char* host)
+{
+    _routerHost = host ? host : "";
     struct in_addr parsed;
-    if (inet_aton(_routerHost.c_str(), &parsed) == 0)
-    {
-        LOG_E(MODULE_PREFIX, "setup routerHost '%s' is not an IPv4 address - DNS would block the main loop, so it is not used. Disabled.",
+    _routerAddrValid = _routerHost.length() > 0 && inet_aton(_routerHost.c_str(), &parsed) != 0;
+    if (_routerHost.length() > 0 && !_routerAddrValid)
+        LOG_E(MODULE_PREFIX, "routerHost '%s' is not an IPv4 address (DNS would block the main loop) - not used",
               _routerHost.c_str());
-        _isEnabled = false;
-        return;
-    }
+    _noRouterLogged = false;
+}
 
-    if (!buildNodeIdentity())
+/// @brief Make the node run: build its identity, publishers and parameters
+/// the first time, then let the loop connect.  Everything built here stays
+/// for the life of the SysMod - deactivating closes the session and stops the
+/// loop from reconnecting; it does not take the node apart.
+bool RaftROS::startNode()
+{
+    if (!_nodeBuilt)
     {
-        LOG_E(MODULE_PREFIX, "setup could not build node identity for node '%s' namespace '%s' - disabled",
-              _nodeName.c_str(), _nodeNamespace.c_str());
-        _isEnabled = false;
-        return;
-    }
-
-    // Bind the auto-publish backend to this session and node identity.  The
-    // string members it borrows are owned by this SysMod and never reassigned
-    // after setup.
-    ZenohAutoPubBackendDeps deps;
-    deps.session = &_session;
-    deps.sendBuf = _msgBuf;
-    deps.sendBufLen = sizeof(_msgBuf);
-    deps.domainId = _domainId;
-    deps.sessionId = _sessionIdStr;
-    deps.nodeId = 1;
-    deps.enclave = "/";
-    deps.nodeNamespace = _nodeNamespace.c_str();
-    deps.nodeName = _nodeName.c_str();
-    _autoPubBackend.setup(deps);
-
-    // A standing /chatter publisher, created through the backend exactly as a
-    // device endpoint is
-    _chatterEnabled = configGetBool("chatterEnable", true);
-    if (_chatterEnabled)
-    {
-        RaftRuntime::AutoPub::AutoPubEndpointDesc chatter;
-        chatter.deviceId = {0, 0, 0};
-        chatter.msgKind = RaftRuntime::AutoPub::AutoPubMsgKind::String;
-        chatter.qosProfileId = RaftRuntime::AutoPub::AutoPubQoSProfileId::FallbackString;
-        if (!chatter.setNames("/chatter", RaftRuntime::AutoPub::AutoPubClassMap_typeName(
-                                              RaftRuntime::AutoPub::AutoPubMsgKind::String)))
-            _chatterEnabled = false;
-        else
-            _chatterSlot = _autoPubBackend.createPublisher(chatter);
-        if (_chatterSlot == ZenohAutoPubBackend::INVALID_SLOT)
+        if (!buildNodeIdentity())
         {
-            LOG_W(MODULE_PREFIX, "setup could not create the /chatter publisher");
-            _chatterEnabled = false;
+            LOG_E(MODULE_PREFIX, "setup could not build node identity for node '%s' namespace '%s' - node inactive",
+                  _nodeName.c_str(), _nodeNamespace.c_str());
+            _active = false;
+            return false;
         }
+
+        // Bind the auto-publish backend to this session and node identity.  The
+        // string members it borrows are owned by this SysMod and never reassigned
+        // after this.
+        ZenohAutoPubBackendDeps deps;
+        deps.session = &_session;
+        deps.sendBuf = _msgBuf;
+        deps.sendBufLen = sizeof(_msgBuf);
+        deps.domainId = _domainId;
+        deps.sessionId = _sessionIdStr;
+        deps.nodeId = 1;
+        deps.enclave = "/";
+        deps.nodeNamespace = _nodeNamespace.c_str();
+        deps.nodeName = _nodeName.c_str();
+        _autoPubBackend.setup(deps);
+
+        // A standing /chatter publisher, created through the backend exactly as a
+        // device endpoint is
+        _chatterEnabled = configGetBool("chatterEnable", true);
+        if (_chatterEnabled)
+        {
+            RaftRuntime::AutoPub::AutoPubEndpointDesc chatter;
+            chatter.deviceId = {0, 0, 0};
+            chatter.msgKind = RaftRuntime::AutoPub::AutoPubMsgKind::String;
+            chatter.qosProfileId = RaftRuntime::AutoPub::AutoPubQoSProfileId::FallbackString;
+            if (!chatter.setNames("/chatter", RaftRuntime::AutoPub::AutoPubClassMap_typeName(
+                                                  RaftRuntime::AutoPub::AutoPubMsgKind::String)))
+                _chatterEnabled = false;
+            else
+                _chatterSlot = _autoPubBackend.createPublisher(chatter);
+            if (_chatterSlot == ZenohAutoPubBackend::INVALID_SLOT)
+            {
+                LOG_W(MODULE_PREFIX, "setup could not create the /chatter publisher");
+                _chatterEnabled = false;
+            }
+        }
+
+        // Auto-publish every bus device DeviceManager reports, through the same
+        // pipeline the RTPS build uses.  Endpoints created while the session is
+        // down are staged by the backend and declared once it is up.
+        if (_autoPubSource.setup(_autoPubBackend, getSysManager(),
+                                 configGetString("qosProfiles", "{}").c_str()))
+        {
+            LOG_I(MODULE_PREFIX, "setup auto-publish listener registered with DeviceManager");
+        }
+        else
+        {
+            LOG_W(MODULE_PREFIX, "setup no DeviceManager - auto-publishing disabled");
+        }
+
+        LOG_I(MODULE_PREFIX, "setup backend=zenoh router=%s:%u domain=%u node=%s%s session=%s",
+              _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_domainId,
+              _nodeNamespace.c_str(), _nodeName.c_str(), _sessionIdStr);
+
+        // The node's parameters and the six services that expose them
+        setupParameters();
+        _nodeBuilt = true;
     }
 
-    // Auto-publish every bus device DeviceManager reports, through the same
-    // pipeline the RTPS build uses.  Endpoints created while the session is
-    // down are staged by the backend and declared once it is up.
-    if (_autoPubSource.setup(_autoPubBackend, getSysManager(),
-                             configGetString("qosProfiles", "{}").c_str()))
-    {
-        LOG_I(MODULE_PREFIX, "setup auto-publish listener registered with DeviceManager");
-    }
-    else
-    {
-        LOG_W(MODULE_PREFIX, "setup no DeviceManager - auto-publishing disabled");
-    }
+    _active = true;
+    _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
+    _lastConnectAttemptMs = 0;
+    _connectFailures = 0;
+    _firstFailureMs = 0;
+    _noRouterLogged = false;
+    return true;
+}
 
-    LOG_I(MODULE_PREFIX, "setup backend=zenoh router=%s:%u domain=%u node=%s%s session=%s",
-          _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_domainId,
-          _nodeNamespace.c_str(), _nodeName.c_str(), _sessionIdStr);
-
-    // The node's parameters and the six services that expose them
-    setupParameters();
+/// @brief Stop the node: drop the router session and stop reconnecting.  The
+/// DeviceManager listener stays registered, so devices that come and go while
+/// inactive are tracked and declared again on the next activation.
+void RaftROS::stopNode(const char* reason)
+{
+    _active = false;
+    if (_connState != ConnState::DISCONNECTED)
+        closeConnection(reason);
+    LOG_I(MODULE_PREFIX, "node inactive (%s)", reason);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -195,7 +235,10 @@ bool RaftROS::buildNodeIdentity()
 
 void RaftROS::loop()
 {
-    if (!_isEnabled)
+    // A change posted through /api/ros is applied here, on the loop task
+    if (_pendingConfigReady.load(std::memory_order_acquire))
+        applyPendingConfig();
+    if (!_active)
         return;
     const uint32_t nowMs = millis();
     const int64_t passStartUs = esp_timer_get_time();
@@ -210,6 +253,20 @@ void RaftROS::loop()
     {
         case ConnState::DISCONNECTED:
             warnRouterUnreachable();        // the remaining lines of a warning in progress, one per pass
+            if (!_routerAddrValid)
+            {
+                // Active but nowhere to connect to: say so once, then wait for
+                // an address (this is the state a freshly provisioned device
+                // is in until someone points it at a router)
+                if (!_noRouterLogged && getLocalIP() != 0)
+                {
+                    LOG_W(MODULE_PREFIX, "no router address configured - nothing reaches ROS 2 until one is set: "
+                          "curl 'http://%s/api/ros/set?routerHost=<router-ip>&persist=1'",
+                          inet_ntoa(*(struct in_addr*)&(uint32_t&)_localIpForLog));
+                    _noRouterLogged = true;
+                }
+                break;
+            }
             if (Raft::isTimeout(nowMs, _lastConnectAttemptMs, _reconnectDelayMs) && getLocalIP() != 0)
             {
                 const int64_t startUs = esp_timer_get_time();
@@ -515,8 +572,15 @@ void RaftROS::closeConnection(const char* reason)
     {
         // One line for the whole event: each console line costs ~10 ms of loop
         // time when no host is reading the USB-Serial-JTAG port
-        LOG_W(MODULE_PREFIX, "disconnected from %s:%u (%s%s%d), retrying in %ums", _routerHost.c_str(),
-              (unsigned)_routerPort, reason, _closeDetail ? " code=" : "", _closeDetail, (unsigned)_reconnectDelayMs);
+        if (_active)
+        {
+            LOG_W(MODULE_PREFIX, "disconnected from %s:%u (%s%s%d), retrying in %ums", _routerHost.c_str(),
+                  (unsigned)_routerPort, reason, _closeDetail ? " code=" : "", _closeDetail, (unsigned)_reconnectDelayMs);
+        }
+        else
+        {
+            LOG_I(MODULE_PREFIX, "disconnected from %s:%u (%s)", _routerHost.c_str(), (unsigned)_routerPort, reason);
+        }
         _connState = ConnState::DISCONNECTED;
     }
     _closeDetail = 0;
@@ -588,13 +652,13 @@ void RaftROS::warnRouterUnreachable()
                   "ROUTER UNREACHABLE: the address is %s.",
                   _routerFromConfig
                       ? "RaftROS.routerHost from SysTypes or posted settings"
-                      : "the built-in default (CONFIG_RAFTROS_ZENOH_ROUTER_HOST), which was set for a different network and probably needs changing for this one");
+                      : "the build's default (CONFIG_RAFTROS_ZENOH_ROUTER_HOST), which was set for a different network and probably needs changing for this one");
             break;
         case 3:
             LOG_W(MODULE_PREFIX,
-                  "ROUTER UNREACHABLE: to change it without a rebuild, from any host on the network: "
-                  "curl -X POST http://%s/api/postsettings/reboot -d '{\"RaftROS\":{\"routerHost\":\"<router-ip>\"}}' "
-                  "- or set RaftROS.routerHost in SysTypes.json, or CONFIG_RAFTROS_ZENOH_ROUTER_HOST in menuconfig, and rebuild.",
+                  "ROUTER UNREACHABLE: to change it, from any host on the network: "
+                  "curl 'http://%s/api/ros/set?routerHost=<router-ip>&persist=1' "
+                  "(applied at once; persist=1 keeps it across reboots) - or set RaftROS.routerHost in SysTypes.json and rebuild.",
                   inet_ntoa(*(struct in_addr*)&(uint32_t&)_localIpForLog));
             break;
         default:
@@ -1233,7 +1297,9 @@ void RaftROS::setupParameters()
                 reason = "routerHost must be an IPv4 address (DNS would block the loop)";
                 return false;
             }
-            if (!persistRouterHost(v.stringValue))
+            char changes[sizeof(v.stringValue) + 24];
+            snprintf(changes, sizeof(changes), "{\"routerHost\":\"%s\"}", v.stringValue);
+            if (!persistSettings(changes))
             {
                 reason = "could not persist routerHost to the settings overlay";
                 return false;
@@ -1285,10 +1351,6 @@ void RaftROS::setupParameters()
     }
 }
 
-/// @brief Write routerHost into the persisted settings overlay - the same
-/// document /api/postsettings replaces - keeping every other section.  The
-/// overlay is small (it holds posted settings only), so this is a shallow
-/// merge of its top-level keys with a rebuilt RaftROS section.
 /// @brief Serialise the element at `path` of `json` back to JSON text, from
 /// its leaves.  RaftJson's getString() on an object returns "" when the
 /// object contains an escaped quote (RaftCore, found 2026-09-29), so objects
@@ -1350,13 +1412,22 @@ static void serialiseJsonElement(const RaftJson& json, const String& path, Strin
     }
 }
 
-bool RaftROS::persistRouterHost(const char* host)
+/// @brief Write a set of RaftROS keys into the persisted settings overlay -
+/// the same document /api/postsettings replaces - keeping every other section
+/// and every other RaftROS key.  The overlay is small (it holds posted
+/// settings only), so this is a shallow merge of its top-level keys with a
+/// rebuilt RaftROS section.
+/// @param changesJson the keys to set, e.g. {"routerHost":"192.168.1.5","active":true}
+bool RaftROS::persistSettings(const char* changesJson)
 {
     // Only the overlay's own document: the chained view (_sysConfig itself)
     // also answers with the base SysTypes, and copying those into NVS would
     // freeze them - later SysTypes changes would be silently overridden.
     const char* overlayDoc = _sysConfig.getJsonDoc();
     RaftJson overlay((overlayDoc && overlayDoc[0] == '{') ? overlayDoc : "{}");
+    RaftJson changes((changesJson && changesJson[0] == '{') ? changesJson : "{}");
+    std::vector<String> changedKeys;
+    changes.getKeys("", changedKeys);
     std::vector<String> keys;
     overlay.getKeys("", keys);
     String doc = "{";
@@ -1371,21 +1442,113 @@ bool RaftROS::persistRouterHost(const char* host)
     doc += "\"RaftROS\":{";
     std::vector<String> ourKeys;
     overlay.getKeys("RaftROS", ourKeys);
+    bool first = true;
     for (const String& key : ourKeys)
     {
-        if (key == "routerHost")
+        if (std::find(changedKeys.begin(), changedKeys.end(), key) != changedKeys.end())
             continue;
-        doc += "\"" + key + "\":";
+        doc += (first ? "\"" : ",\"") + key + "\":";
         serialiseJsonElement(overlay, "RaftROS/" + key, doc);
-        doc += ",";
+        first = false;
     }
-    doc += String("\"routerHost\":\"") + host + "\"}}";
-    // An NVS write: a flash operation on the loop, but only when someone sets
-    // routerHost.  No log line on success - it would add ~10 ms to the same pass.
+    for (const String& key : changedKeys)
+    {
+        doc += (first ? "\"" : ",\"") + key + "\":";
+        serialiseJsonElement(changes, key, doc);
+        first = false;
+    }
+    doc += "}}";
+    // An NVS write: a flash operation on the loop, but only when someone
+    // changes a setting.  No log line on success - it would add ~10 ms to the
+    // same pass.
     const bool ok = _sysConfig.setJsonDoc(doc.c_str());
     if (!ok)
-        LOG_W(MODULE_PREFIX, "routerHost %s could not be persisted (%u bytes of settings)", host, (unsigned)doc.length());
+        LOG_W(MODULE_PREFIX, "settings %s could not be persisted (%u bytes of settings)", changesJson, (unsigned)doc.length());
     return ok;
+}
+
+/// @brief Remove the RaftROS section from the persisted settings overlay, so
+/// the SysTypes values apply again from the next boot
+bool RaftROS::clearPersistedSettings()
+{
+    const char* overlayDoc = _sysConfig.getJsonDoc();
+    RaftJson overlay((overlayDoc && overlayDoc[0] == '{') ? overlayDoc : "{}");
+    std::vector<String> keys;
+    overlay.getKeys("", keys);
+    String doc = "{";
+    bool first = true;
+    for (const String& key : keys)
+    {
+        if (key == "RaftROS")
+            continue;
+        doc += (first ? "\"" : ",\"") + key + "\":";
+        serialiseJsonElement(overlay, key, doc);
+        first = false;
+    }
+    doc += "}";
+    return _sysConfig.setJsonDoc(doc.c_str());
+}
+
+/// @brief Apply a change parked by the REST API: router address and port take
+/// effect at once (a live session is dropped and the next connect uses the new
+/// address), `active` starts or stops the node, and with `persist` the same
+/// keys go into the settings overlay for the next boot.
+void RaftROS::applyPendingConfig()
+{
+    const PendingConfig cfg = _pendingConfig;
+    _pendingConfigReady.store(false, std::memory_order_release);
+
+    if (cfg.clear)
+    {
+        const bool ok = clearPersistedSettings();
+        LOG_I(MODULE_PREFIX, "persisted settings %s (SysTypes values apply from the next boot)", ok ? "cleared" : "could not be cleared");
+        return;
+    }
+
+    bool routerChanged = false;
+    if (cfg.hasRouterHost && _routerHost != cfg.routerHost)
+    {
+        setRouterHost(cfg.routerHost);
+        _routerFromConfig = true;
+        routerChanged = true;
+    }
+    if (cfg.hasRouterPort && cfg.routerPort != _routerPort)
+    {
+        _routerPort = cfg.routerPort;
+        routerChanged = true;
+    }
+    if (routerChanged)
+    {
+        _connectFailures = 0;
+        _firstFailureMs = 0;
+        _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
+        _lastConnectAttemptMs = 0;
+        if (_connState != ConnState::DISCONNECTED)
+            closeConnection("router address changed");
+    }
+    if (cfg.hasActive)
+    {
+        if (cfg.active && !_active)
+            startNode();
+        else if (!cfg.active && _active)
+            stopNode("deactivated by /api/ros/set");
+    }
+
+    if (cfg.persist)
+    {
+        String changes = "{";
+        if (cfg.hasRouterHost)
+            changes += String("\"routerHost\":\"") + cfg.routerHost + "\"";
+        if (cfg.hasRouterPort)
+            changes += String(changes.length() > 1 ? "," : "") + "\"routerPort\":" + String(cfg.routerPort);
+        if (cfg.hasActive)
+            changes += String(changes.length() > 1 ? "," : "") + "\"active\":" + (cfg.active ? "1" : "0");
+        changes += "}";
+        if (changes.length() > 2)
+            persistSettings(changes.c_str());
+    }
+    LOG_I(MODULE_PREFIX, "config applied active=%d router=%s:%u%s", (int)_active, _routerHost.c_str(),
+          (unsigned)_routerPort, cfg.persist ? " (persisted)" : "");
 }
 
 /// @brief Switch to a router address set through the parameter service, once
@@ -1395,7 +1558,7 @@ void RaftROS::applyPendingRouterHost()
 {
     if (_routerHostPending[0] == '\0' || _services.inflightCount() != 0 || _session.outputSize() != 0)
         return;
-    _routerHost = _routerHostPending;
+    setRouterHost(_routerHostPending);
     _routerFromConfig = true;
     _routerHostPending[0] = '\0';
     _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
@@ -1414,6 +1577,82 @@ void RaftROS::addRestAPIEndpoints(RestAPIEndpointManager& endpointManager)
                                           std::placeholders::_1, std::placeholders::_2,
                                           std::placeholders::_3),
                                 "Get RaftROS status");
+    endpointManager.addEndpoint("ros", RestAPIEndpoint::EndpointType::ENDPOINT_CALLBACK,
+                                RestAPIEndpoint::EndpointMethod::ENDPOINT_GET,
+                                std::bind(&RaftROS::apiRos, this,
+                                          std::placeholders::_1, std::placeholders::_2,
+                                          std::placeholders::_3),
+                                "ros - status; ros/set?active=0|1&routerHost=<ipv4>&routerPort=<n>&persist=0|1 - configure (applied at once, persist=1 keeps it); ros/clear - remove persisted settings");
+}
+
+/// @brief /api/ros, /api/ros/set and /api/ros/clear.  Runs on whichever task
+/// serves the request, so a change is validated here and handed to the loop.
+RaftRetCode RaftROS::apiRos(const String& reqStr, String& respStr, const APISourceInfo& /*sourceInfo*/)
+{
+    const String subCmd = RestAPIEndpointManager::getNthArgStr(reqStr.c_str(), 1);
+    if (subCmd.length() == 0)
+    {
+        respStr = getStatusJSON();
+        return RaftRetCode::RAFT_OK;
+    }
+    if (_pendingConfigReady.load(std::memory_order_acquire))
+        return Raft::setJsonErrorResult(reqStr.c_str(), respStr, "busy - a change is still being applied");
+
+    PendingConfig cfg;
+    if (subCmd.equalsIgnoreCase("clear"))
+    {
+        cfg.clear = true;
+    }
+    else if (subCmd.equalsIgnoreCase("set"))
+    {
+        std::vector<String> params;
+        std::vector<RaftJson::NameValuePair> nameValues;
+        RestAPIEndpointManager::getParamsAndNameValues(reqStr.c_str(), params, nameValues);
+        for (const auto& nv : nameValues)
+        {
+            if (nv.name.equalsIgnoreCase("active"))
+            {
+                cfg.hasActive = true;
+                cfg.active = nv.value == "1" || nv.value.equalsIgnoreCase("true");
+            }
+            else if (nv.name.equalsIgnoreCase("routerHost"))
+            {
+                struct in_addr parsed;
+                if (nv.value.length() >= sizeof(cfg.routerHost) || inet_aton(nv.value.c_str(), &parsed) == 0)
+                    return Raft::setJsonErrorResult(reqStr.c_str(), respStr, "routerHost must be an IPv4 address");
+                cfg.hasRouterHost = true;
+                strncpy(cfg.routerHost, nv.value.c_str(), sizeof(cfg.routerHost) - 1);
+            }
+            else if (nv.name.equalsIgnoreCase("routerPort"))
+            {
+                const long port = nv.value.toInt();
+                if (port < 1 || port > 65535)
+                    return Raft::setJsonErrorResult(reqStr.c_str(), respStr, "routerPort must be 1-65535");
+                cfg.hasRouterPort = true;
+                cfg.routerPort = (uint32_t)port;
+            }
+            else if (nv.name.equalsIgnoreCase("persist"))
+            {
+                cfg.persist = nv.value == "1" || nv.value.equalsIgnoreCase("true");
+            }
+            else
+            {
+                return Raft::setJsonErrorResult(reqStr.c_str(), respStr,
+                        "unknown key - use active, routerHost, routerPort, persist");
+            }
+        }
+        if (!cfg.hasActive && !cfg.hasRouterHost && !cfg.hasRouterPort)
+            return Raft::setJsonErrorResult(reqStr.c_str(), respStr,
+                    "nothing to set - use ros/set?active=0|1&routerHost=<ipv4>&routerPort=<n>&persist=0|1");
+    }
+    else
+    {
+        return Raft::setJsonErrorResult(reqStr.c_str(), respStr, "unknown command - use ros, ros/set or ros/clear");
+    }
+
+    _pendingConfig = cfg;
+    _pendingConfigReady.store(true, std::memory_order_release);
+    return Raft::setJsonBoolResult(reqStr.c_str(), respStr, true, "\"applied\":\"next loop pass\"");
 }
 
 String RaftROS::getStatusJSON() const
@@ -1421,7 +1660,7 @@ String RaftROS::getStatusJSON() const
     const char* stStr = "off";
     switch (_connState)
     {
-        case ConnState::DISCONNECTED: stStr = "disconnected"; break;
+        case ConnState::DISCONNECTED: stStr = !_active ? "inactive" : !_routerAddrValid ? "unconfigured" : "disconnected"; break;
         case ConnState::CONNECTING:   stStr = "connecting"; break;
         case ConnState::HANDSHAKE:    stStr = "handshake"; break;
         case ConnState::READY:        stStr = "ready"; break;
@@ -1430,14 +1669,16 @@ String RaftROS::getStatusJSON() const
     const auto svcStats = _services.stats();
     char buf[700];
     snprintf(buf, sizeof(buf),
-             R"({"rslt":"ok","backend":"zenoh","en":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
+             R"({"rslt":"ok","backend":"zenoh","en":%s,"active":%s,"routerConfigured":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
              R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u,)"
              R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d,)"
              R"("heapFreeB":%u,"heapMinB":%u,"loopMaxUs":%u,"loopMaxDrainUs":%u,"loopMaxConnUs":%u,"loopMaxRxUs":%u,"loopMaxTxUs":%u,"loopMaxTxParts":"%u/%u/%u","loopMaxRxParts":"%u/%u/%uB",)"
              R"("services":%u,"svcAccepted":%u,"svcCompleted":%u,"svcDeferred":%u,"svcTimedOut":%u,)"
              R"("svcRefused":%u,"svcUnknownKey":%u,"params":%u})",
-             _isEnabled ? "true" : "false",
+             _active ? "true" : "false",
+             _active ? "true" : "false",
+             _routerAddrValid ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
              _nodeNamespace.c_str(),

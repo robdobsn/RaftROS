@@ -12,22 +12,24 @@
 //
 // Precedence (first match wins):
 //   1. Device-type-name overrides (e.g. MCP9808 tagged LGHT → TEMP).
-//   2. Actuator classes → excluded (no publishing).
+//   2. Output-only classes (PIX, LED) → excluded: nothing to publish.
 //   3. Composite rules — first match wins among:
 //        a. {ACC, GYRO} ⊆ clas           → Imu (single writer).
-//        b. {TEMP, RH}  ⊆ clas           → Temperature + RelativeHumidity.
-//        c. {PRES, TEMP}⊆ clas           → FluidPressure + Temperature.
-//   4. Single-class rules (TEMP, RH, PRES, LGHT, PROX, DIST, ANG, ROT,
-//      ACC, TCH, BTN, FRCE, HRM, SOIL, GAME).
-//   5. Fallback: std_msgs/String (slug "raw").
+//        b. {TEMP, RH, CO2} ⊆ clas       → Temperature + RelativeHumidity + Float32 co2.
+//        c. {TEMP, RH}  ⊆ clas           → Temperature + RelativeHumidity.
+//        d. {PRES, TEMP}⊆ clas           → FluidPressure + Temperature.
+//        e. {PROX, LGHT} ⊆ clas          → Illuminance + Range proximity.
+//   4. Single-class rules (TEMP, RH, PRES, LGHT, PROX, DIST, ANG/ANGL, ROT,
+//      ACC, MAG, TCH, BTN, FRCE, HRM, SOIL, GAME, CO2, O2, WGHT,
+//      FUEL/BATT, and SRVO/MOTR/PUMP as JointState - an actuator reports
+//      its position and current).
+//   5. Fallback: std_msgs/Float64MultiArray (slug "data"), one labelled
+//      element per attribute, so a device with no typed mapping is still
+//      numeric in ROS 2.
 //
-// The returned `primaryTopicSlug` / `secondaryTopicSlug` are short bare slugs
-// (no "rt/raft/" prefix, no device-address suffix).  The full topic is
-// formatted by the caller as `rt/<namespace>/<alias>/<slug>` in later slices.
-//
-// Slice 4.10 will extend the per-device-type overrides for BTHome
-// per-attribute splitting; today BLEBTHome falls through to the fallback
-// String writer, which keeps Success Criterion 5 satisfied.
+// The returned `primaryTopicSlug` / `secondaryTopicSlug` / `tertiaryTopicSlug`
+// are short bare slugs (no "rt/raft/" prefix, no device-address suffix).  The
+// full topic is formatted by the caller as `rt/<namespace>/<alias>/<slug>`.
 //
 // Rob Dobson 2026
 //
@@ -65,6 +67,10 @@ enum class AutoPubMsgKind : uint8_t
     Wrench,
     Float32MultiArray,
     Joy,
+    MagneticField,
+    BatteryState,
+    JointState,
+    Float64MultiArray,      ///< The labelled numeric fallback: one element per attribute
     String,
 };
 
@@ -101,6 +107,14 @@ inline const char* AutoPubClassMap_typeName(AutoPubMsgKind kind)
             return "std_msgs::msg::dds_::Float32MultiArray_";
         case AutoPubMsgKind::Joy:
             return "sensor_msgs::msg::dds_::Joy_";
+        case AutoPubMsgKind::MagneticField:
+            return "sensor_msgs::msg::dds_::MagneticField_";
+        case AutoPubMsgKind::BatteryState:
+            return "sensor_msgs::msg::dds_::BatteryState_";
+        case AutoPubMsgKind::JointState:
+            return "sensor_msgs::msg::dds_::JointState_";
+        case AutoPubMsgKind::Float64MultiArray:
+            return "std_msgs::msg::dds_::Float64MultiArray_";
         case AutoPubMsgKind::String:
             return "std_msgs::msg::dds_::String_";
         case AutoPubMsgKind::Unknown:
@@ -166,6 +180,14 @@ inline const char* AutoPubClassMap_typeHash(AutoPubMsgKind kind)
             return "RIHS01_0599f6f85b4bfca379873a0b4375a0aca022156bd2d7021275d116ed1fa8bfe0";
         case AutoPubMsgKind::Joy:
             return "RIHS01_0d356c79cad3401e35ffeb75a96a96e08be3ef896b8b83841d73e890989372c5";
+        case AutoPubMsgKind::MagneticField:
+            return "RIHS01_e80f32f56a20486c9923008fc1a1db07bbb273cbbf6a5b3bfa00835ee00e4dff";
+        case AutoPubMsgKind::BatteryState:
+            return "RIHS01_4bee5dfce981c98faa6828b868307a0a73f992ed0789f374ee96c8f840e69741";
+        case AutoPubMsgKind::JointState:
+            return "RIHS01_a13ee3a330e346c9d87b5aa18d24e11690752bd33a0350f11c5882bc9179260e";
+        case AutoPubMsgKind::Float64MultiArray:
+            return "RIHS01_1025ddc6b9552d191f89ef1a8d2f60f3d373e28b283d8891ddcc974e8c55397f";
         case AutoPubMsgKind::String:
             return "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18";
         case AutoPubMsgKind::Unknown:
@@ -204,18 +226,21 @@ inline const char* AutoPubClassMap_serviceTypeHash(const char* wireType)
 }
 
 /// @brief Result of a class-map lookup.  `primary*` is always populated unless
-///        `excluded == true`.  `secondary*` is populated only for composite
-///        two-writer rules (TEMP+RH, PRES+TEMP).
+///        `excluded == true`.  `secondary*` and `tertiary*` are populated only
+///        for composite rules (TEMP+RH, PRES+TEMP, PROX+LGHT, TEMP+RH+CO2).
 struct AutoPubClassMapping
 {
     AutoPubMsgKind primaryKind   = AutoPubMsgKind::Unknown;
     const char*        primaryTopicSlug   = nullptr;
     AutoPubMsgKind secondaryKind = AutoPubMsgKind::Unknown;
     const char*        secondaryTopicSlug = nullptr;
+    AutoPubMsgKind tertiaryKind  = AutoPubMsgKind::Unknown;
+    const char*        tertiaryTopicSlug  = nullptr;
     bool               excluded = false;
 
     bool hasPrimary()   const { return primaryKind   != AutoPubMsgKind::Unknown; }
     bool hasSecondary() const { return secondaryKind != AutoPubMsgKind::Unknown; }
+    bool hasTertiary()  const { return tertiaryKind  != AutoPubMsgKind::Unknown; }
 };
 
 // ---------------------------------------------------------------------------
@@ -240,8 +265,8 @@ inline bool AutoPubClassMap_hasClas(
 /// @param clasCount        number of entries in clasArray
 /// @param deviceTypeName   device type name (nullable) — used for per-device
 ///                         overrides such as the MCP9808 `LGHT` mis-tag.
-/// @return mapping with `primary`/`secondary` kinds + topic slugs, or
-///         `excluded = true` for actuators (SRVO/PUMP/PIX).
+/// @return mapping with `primary`/`secondary`/`tertiary` kinds + topic slugs,
+///         or `excluded = true` for output-only devices (PIX/LED).
 inline AutoPubClassMapping AutoPubClassMap_lookup(
         const char* const* clasArray, size_t clasCount,
         const char* deviceTypeName)
@@ -272,11 +297,12 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
     }
 
     // -----------------------------------------------------------------
-    // 2. Actuator classes → excluded (no poll data to publish).
+    // 2. Output-only classes → excluded (no poll data to publish).  An
+    //    actuator that reports back (servo, motor, pump) is not output-only:
+    //    it is published as a JointState below.
     // -----------------------------------------------------------------
-    if (AutoPubClassMap_hasClas(clasArray, clasCount, "SRVO") ||
-        AutoPubClassMap_hasClas(clasArray, clasCount, "PUMP") ||
-        AutoPubClassMap_hasClas(clasArray, clasCount, "PIX"))
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "PIX") ||
+        AutoPubClassMap_hasClas(clasArray, clasCount, "LED"))
     {
         out.excluded = true;
         return out;
@@ -290,6 +316,9 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
     const bool hasTemp = AutoPubClassMap_hasClas(clasArray, clasCount, "TEMP");
     const bool hasRH   = AutoPubClassMap_hasClas(clasArray, clasCount, "RH");
     const bool hasPres = AutoPubClassMap_hasClas(clasArray, clasCount, "PRES");
+    const bool hasCO2  = AutoPubClassMap_hasClas(clasArray, clasCount, "CO2");
+    const bool hasLght = AutoPubClassMap_hasClas(clasArray, clasCount, "LGHT");
+    const bool hasProx = AutoPubClassMap_hasClas(clasArray, clasCount, "PROX");
 
     if (hasAcc && hasGyro)
     {
@@ -303,6 +332,12 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
         out.primaryTopicSlug   = "temperature";
         out.secondaryKind = AutoPubMsgKind::RelativeHumidity;
         out.secondaryTopicSlug = "humidity";
+        if (hasCO2)
+        {
+            // SCD30/SCD40/STCC4: the CO2 reading is the point of the device
+            out.tertiaryKind = AutoPubMsgKind::Float32;
+            out.tertiaryTopicSlug = "co2";
+        }
         return out;
     }
     if (hasPres && hasTemp)
@@ -313,6 +348,15 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
         out.secondaryTopicSlug = "temperature";
         return out;
     }
+    if (hasProx && hasLght)
+    {
+        // VCNL4040: ambient light and proximity are two different readings
+        out.primaryKind   = AutoPubMsgKind::Illuminance;
+        out.primaryTopicSlug   = "illuminance";
+        out.secondaryKind = AutoPubMsgKind::Range;
+        out.secondaryTopicSlug = "proximity";
+        return out;
+    }
 
     // -----------------------------------------------------------------
     // 4. Single-class rules
@@ -320,18 +364,19 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
     if (hasTemp) { out.primaryKind = AutoPubMsgKind::Temperature;      out.primaryTopicSlug = "temperature"; return out; }
     if (hasRH)   { out.primaryKind = AutoPubMsgKind::RelativeHumidity; out.primaryTopicSlug = "humidity";    return out; }
     if (hasPres) { out.primaryKind = AutoPubMsgKind::FluidPressure;    out.primaryTopicSlug = "pressure";    return out; }
-    if (AutoPubClassMap_hasClas(clasArray, clasCount, "LGHT"))
-        { out.primaryKind = AutoPubMsgKind::Illuminance; out.primaryTopicSlug = "illuminance"; return out; }
-    if (AutoPubClassMap_hasClas(clasArray, clasCount, "PROX"))
-        { out.primaryKind = AutoPubMsgKind::Range;       out.primaryTopicSlug = "proximity";   return out; }
+    if (hasLght) { out.primaryKind = AutoPubMsgKind::Illuminance;      out.primaryTopicSlug = "illuminance"; return out; }
+    if (hasProx) { out.primaryKind = AutoPubMsgKind::Range;            out.primaryTopicSlug = "proximity";   return out; }
     if (AutoPubClassMap_hasClas(clasArray, clasCount, "DIST"))
         { out.primaryKind = AutoPubMsgKind::Range;       out.primaryTopicSlug = "range";       return out; }
-    if (AutoPubClassMap_hasClas(clasArray, clasCount, "ANG"))
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "ANG") ||
+        AutoPubClassMap_hasClas(clasArray, clasCount, "ANGL"))
         { out.primaryKind = AutoPubMsgKind::Float32;     out.primaryTopicSlug = "angle";       return out; }
     if (AutoPubClassMap_hasClas(clasArray, clasCount, "ROT"))
         { out.primaryKind = AutoPubMsgKind::Int32;       out.primaryTopicSlug = "encoder";     return out; }
     if (hasAcc)
         { out.primaryKind = AutoPubMsgKind::Accel;       out.primaryTopicSlug = "accel";       return out; }
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "MAG"))
+        { out.primaryKind = AutoPubMsgKind::MagneticField; out.primaryTopicSlug = "magnetic_field"; return out; }
     if (AutoPubClassMap_hasClas(clasArray, clasCount, "TCH"))
         { out.primaryKind = AutoPubMsgKind::ByteMultiArray; out.primaryTopicSlug = "touch";    return out; }
     if (AutoPubClassMap_hasClas(clasArray, clasCount, "BTN"))
@@ -344,12 +389,26 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
         { out.primaryKind = AutoPubMsgKind::Float32;     out.primaryTopicSlug = "soil_moisture"; return out; }
     if (AutoPubClassMap_hasClas(clasArray, clasCount, "GAME"))
         { out.primaryKind = AutoPubMsgKind::Joy;         out.primaryTopicSlug = "joy";         return out; }
+    if (hasCO2)
+        { out.primaryKind = AutoPubMsgKind::Float32;     out.primaryTopicSlug = "co2";         return out; }
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "O2"))
+        { out.primaryKind = AutoPubMsgKind::Float32;     out.primaryTopicSlug = "oxygen";      return out; }
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "WGHT"))
+        { out.primaryKind = AutoPubMsgKind::Float32;     out.primaryTopicSlug = "weight";      return out; }
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "FUEL") ||
+        AutoPubClassMap_hasClas(clasArray, clasCount, "BATT"))
+        { out.primaryKind = AutoPubMsgKind::BatteryState; out.primaryTopicSlug = "battery";    return out; }
+    if (AutoPubClassMap_hasClas(clasArray, clasCount, "SRVO") ||
+        AutoPubClassMap_hasClas(clasArray, clasCount, "MOTR") ||
+        AutoPubClassMap_hasClas(clasArray, clasCount, "PUMP"))
+        { out.primaryKind = AutoPubMsgKind::JointState;  out.primaryTopicSlug = "joint_state"; return out; }
 
     // -----------------------------------------------------------------
-    // 5. Fallback — unknown clas, or `BTHM` (pending Slice 4.10 split).
+    // 5. Fallback — a class with no typed mapping (VOC, SND, LIQD, POWR,
+    //    TCAM, BTHM, ...): every attribute, labelled, as float64.
     // -----------------------------------------------------------------
-    out.primaryKind = AutoPubMsgKind::String;
-    out.primaryTopicSlug = "raw";
+    out.primaryKind = AutoPubMsgKind::Float64MultiArray;
+    out.primaryTopicSlug = "data";
     return out;
 }
 

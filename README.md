@@ -52,7 +52,7 @@ visible to the build and depend on it - as the example does:
 ```cmake
 # systypes/Common/features.cmake
 set(RAFT_COMPONENTS
-    RaftCore@main          # RaftCore 78781c0 or later
+    RaftCore@main          # RaftCore 6e5bb96 or later (AttrFieldDesc with element count)
     RaftSysMods@main
     RaftWebServer@main     # for /api/rosstat and settings
     RaftI2C@main           # if you have I2C devices
@@ -75,9 +75,10 @@ your `sdkconfig.defaults` (and delete the build's `sdkconfig`):
 CONFIG_RAFTROS_BACKEND_RTPS=y
 ```
 
-For Zenoh, also set the router's address - `CONFIG_RAFTROS_ZENOH_ROUTER_HOST`
-(and `..._PORT`, default 7447) is the built-in default, `routerHost` in
-SysTypes overrides it, and a posted setting overrides both (see step 4).
+For Zenoh the router's address is configuration, not part of the image:
+`routerHost` in SysTypes, or a setting posted to the running device (see
+step 4). `CONFIG_RAFTROS_ZENOH_ROUTER_HOST` (and `..._PORT`, default 7447)
+exists for a build that wants a baked-in default; it is empty as shipped.
 
 Two sdkconfig settings the example uses and you probably want:
 `CONFIG_ESP_MAIN_TASK_AFFINITY_CPU1=y` (keeps the SysMod loop off the WiFi
@@ -113,7 +114,7 @@ your buses, for auto-publishing):
 
 ```json
 "RaftROS": {
-    "enable": 1,
+    "active": 1,
     "domainId": 0,
     "nodeName": "my_robot",
     "nodeNamespace": "/",
@@ -122,14 +123,23 @@ your buses, for auto-publishing):
 }
 ```
 
-Any key can be changed at run time from any host, persisted in NVS:
+`active` says whether the node runs; the SysMod itself is always there (it
+was registered with `alwaysEnable`), so a product can ship with `active` off
+and no router address, and be switched on and pointed at a router from the
+network, with nothing rebuilt or reflashed:
 
 ```bash
-curl -X POST http://<device-ip>/api/postsettings/reboot -d '{"RaftROS":{"routerHost":"192.168.1.50"}}'
+curl 'http://<device-ip>/api/ros/set?active=1&routerHost=192.168.1.50&persist=1'
+curl http://<device-ip>/api/ros          # status: active, router, session state, counters
+curl http://<device-ip>/api/ros/clear    # drop the persisted settings; SysTypes applies again
 ```
 
-On Zenoh the node reports an unreachable router in its log with the cause and
-the fix. The full list of keys is in the
+`ros/set` takes `active`, `routerHost` (IPv4), `routerPort` and `persist`;
+the change is applied on the next loop pass, and with `persist=1` it is also
+written to NVS for later boots. The other keys can be changed with
+`POST /api/postsettings/reboot` as before. On Zenoh an active node with no
+router address says so once in the log and waits; one that cannot reach its
+router reports the cause and the fix. The full list of keys is in the
 [example's Configuration section](examples/ExampleDiscoverable/README.md#configuration).
 
 At this point, with no application code, the node appears in ROS 2, publishes
@@ -230,8 +240,9 @@ if discovery doesn't work.
   node's own settings (`chatterEnable`, `chatterPeriodMs`, `routerHost` -
   persisted) and any the application declares.
 - CDR serialisation for the standard ROS 2 message types.
-- Planned: subscriptions for actuator classes (SRVO/PUMP/PIX) wired to
-  `DeviceManager`; ROS 2 actions; parameter events.
+- Planned: subscriptions for actuator classes (SRVO/MOTR/PUMP/PIX) wired to
+  `DeviceManager`, so ROS 2 can drive them (they already publish their state
+  as `JointState`); ROS 2 actions; parameter events.
 
 ## Demo: ExampleDiscoverable + DemoSimple + Foxglove
 

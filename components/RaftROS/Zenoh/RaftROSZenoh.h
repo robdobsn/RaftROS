@@ -41,6 +41,7 @@
 #include "ZenohROSCodec.h"
 #include "ZenohTCPSession.h"
 #include <array>
+#include <atomic>
 #include <functional>
 
 class APISourceInfo;
@@ -168,7 +169,16 @@ public:
 
 private:
     // Configuration
-    bool _isEnabled = false;
+    /// @brief Whether the node runs.  `active` in SysTypes or posted settings
+    /// decides it at boot (falling back to the block's `enable` for older
+    /// configurations); /api/ros/set changes it live.  The SysMod itself is
+    /// always present once SysManager has created it, so its REST API is there
+    /// to activate it - SysManager's own `enable` key is what decides whether
+    /// the SysMod exists at all.
+    bool _active = false;
+    bool _nodeBuilt = false;        ///< Identity, backend, publishers and parameters set up (once, on first activation)
+    bool _routerAddrValid = false;  ///< _routerHost parses as an IPv4 address
+    bool _noRouterLogged = false;   ///< The "active but no router configured" line has been printed
     uint32_t _domainId = 0;
     String _nodeName;
     String _nodeNamespace;
@@ -329,11 +339,35 @@ private:
     static const uint8_t MAX_PARAMETERS = 16;
     RaftRuntime::AutoPub::AutoPubParameterStore<MAX_PARAMETERS> _params;
     uint8_t _paramReplyBuf[1024] = {};          ///< One response at a time; copied by the registry
-    RaftJsonIF& _sysConfig;                     ///< The settings overlay `routerHost` persists into
+    RaftJsonIF& _sysConfig;                     ///< The settings overlay posted settings persist into
     char _routerHostPending[16] = {};           ///< A new router address, applied once its reply is out
     void setupParameters();
-    bool persistRouterHost(const char* host);
+    bool persistSettings(const char* changesJson);
+    bool clearPersistedSettings();
     void applyPendingRouterHost();
+
+    // ---- Configuration API ----
+    // /api/ros, /api/ros/set and /api/ros/clear.  A REST handler runs on the
+    // web server's task, so it only validates and parks the change here; the
+    // loop task applies it (and persists it), keeping every piece of node
+    // state on one task.
+    struct PendingConfig
+    {
+        bool hasActive = false;
+        bool active = false;
+        bool hasRouterHost = false;
+        char routerHost[16] = {};
+        bool hasRouterPort = false;
+        uint32_t routerPort = 0;
+        bool persist = false;       ///< Also write the change to the settings overlay (NVS)
+        bool clear = false;         ///< Remove the persisted RaftROS settings instead
+    };
+    PendingConfig _pendingConfig;
+    std::atomic<bool> _pendingConfigReady{false};
+    void applyPendingConfig();
+    void setRouterHost(const char* host);
+    bool startNode();
+    void stopNode(const char* reason);
 
     // Loop-budget diagnostics, as on the RTPS build: the worst pass since boot
     // and the worst of each phase within a pass, so a slow pass can be placed
@@ -420,4 +454,5 @@ private:
 
     // API
     RaftRetCode apiStatus(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
+    RaftRetCode apiRos(const String& reqStr, String& respStr, const APISourceInfo& sourceInfo);
 };
