@@ -84,14 +84,17 @@ public:
 
     /// @brief 64 bytes covers every generated poll record (largest is 36);
     /// attach rejects a larger one rather than truncating it
-    static constexpr uint32_t MAILBOX_RECORD_SIZE = 64;
+    /// @brief Largest decoded poll record a device can hand over: a multizone
+    /// ToF frame (VL53L5CX: 64 distances and 64 statuses, 200 B) is the
+    /// biggest in the catalogue
+    static constexpr uint32_t MAILBOX_RECORD_SIZE = 256;
 
     /// @brief A bus task must not wait on the loop task for long
     static constexpr uint32_t PRODUCER_LOCK_TIMEOUT_MS = 2;
 
-    /// @brief Sized for the largest message the serialiser emits
-    /// (sensor_msgs/Imu ~320 B plus frame_id margin)
-    static constexpr uint32_t CDR_BUF_SIZE = 512;
+    /// @brief Sized for the largest message the serialiser emits: a 64-zone
+    /// depth Image (~320 B) or a 64-element labelled Float64MultiArray (~560 B)
+    static constexpr uint32_t CDR_BUF_SIZE = 1024;
 
     /// @brief Called when a device's endpoints are created or about to go.
     /// `secondarySlot` and `tertiarySlot` are INVALID_SLOT unless the device

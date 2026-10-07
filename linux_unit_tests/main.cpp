@@ -3379,6 +3379,21 @@ int main()
             TEST_ASSERT(!RTPSAutoPubClassMap_lookup(cTR, 2, "AHT20").hasTertiary(),
                         "AHT20: no tertiary without CO2");
         }
+        // ---- ST multizone ToF: depth Image + nearest-zone Range -----------
+        {
+            const char* c[] = {"DIST"};
+            const auto m = RTPSAutoPubClassMap_lookup(c, 1, "VL53L5CX");
+            TEST_ASSERT(m.primaryKind == RTPSAutoPubMsgKind::DepthImage &&
+                        std::strcmp(m.primaryTopicSlug, "depth") == 0,
+                        "VL53L5CX: primary = depth Image");
+            TEST_ASSERT(m.secondaryKind == RTPSAutoPubMsgKind::Range &&
+                        std::strcmp(m.secondaryTopicSlug, "range") == 0,
+                        "VL53L5CX: secondary = Range");
+            TEST_ASSERT(RTPSAutoPubClassMap_lookup(c, 1, "VL53L8CX").primaryKind == RTPSAutoPubMsgKind::DepthImage,
+                        "VL53L8CX: also a depth Image");
+            TEST_ASSERT(RTPSAutoPubClassMap_lookup(c, 1, "VL53L4CD").primaryKind == RTPSAutoPubMsgKind::Range,
+                        "VL53L4CD: single-zone stays Range");
+        }
         // ---- New single-class mappings -----------------------------------
         { const char* c[] = {"MAG"};         checkPrimary("MMC5603",    c, 1, RTPSAutoPubMsgKind::MagneticField, "magnetic_field"); }
         { const char* c[] = {"FUEL", "BATT"}; checkPrimary("MAX17048",  c, 2, RTPSAutoPubMsgKind::BatteryState,  "battery"); }
@@ -3469,7 +3484,7 @@ int main()
             RTPSAutoPubMsgKind::Float32MultiArray, RTPSAutoPubMsgKind::Joy,
             RTPSAutoPubMsgKind::MagneticField, RTPSAutoPubMsgKind::BatteryState,
             RTPSAutoPubMsgKind::JointState, RTPSAutoPubMsgKind::Float64MultiArray,
-            RTPSAutoPubMsgKind::String,
+            RTPSAutoPubMsgKind::DepthImage, RTPSAutoPubMsgKind::String,
         };
         for (auto k : allKinds)
         {
@@ -4075,6 +4090,67 @@ int main()
             double v[5]; std::memcpy(v, buf + pos, sizeof(v));
             TEST_ASSERT(v[0] == 1.0 && v[1] == 2.0 && v[2] == 3.0 && v[3] == 4.0 && v[4] == 4.0,
                         "Float64MultiArray array: elements scaled and in order");
+        }
+
+        // ---- Multizone ToF: depth Image and nearest-zone Range -------------
+        {
+            // A 4x4 frame in a 64-zone record (VL53L5CX layout): zones 0..15 used
+            struct pollTof { uint32_t timeMs; uint8_t grid; uint8_t seq; int8_t tempC; uint8_t nValid; int16_t dist[64]; uint8_t status[64]; } __attribute__((packed));
+            pollTof s{}; s.grid = 4; s.nValid = 3;
+            for (int i = 0; i < 64; i++) { s.dist[i] = (int16_t)(1000 + i * 10); s.status[i] = 255; }
+            s.status[0] = 5; s.status[5] = 6; s.status[9] = 9;      // valid zones: 1000, 1050, 1090 mm
+            s.status[3] = 4; s.dist[3] = 100;                      // invalid status: ignored though nearest
+            RTPSAutoPubAttrFieldDesc descs[] = {
+                {"timeMs", offsetof(pollTof, timeMs), RTPSAutoPubAttrType::Uint32, "", 1.0f, 0.0f, 0},
+                {"grid",   offsetof(pollTof, grid),   RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+                {"seq",    offsetof(pollTof, seq),    RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+                {"tempC",  offsetof(pollTof, tempC),  RTPSAutoPubAttrType::Int8,   "", 1.0f, 0.0f, 1},
+                {"nValid", offsetof(pollTof, nValid), RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 1},
+                {"dist",   offsetof(pollTof, dist),   RTPSAutoPubAttrType::Int16,  "", 1.0f, 0.0f, 64},
+                {"status", offsetof(pollTof, status), RTPSAutoPubAttrType::Uint8,  "", 1.0f, 0.0f, 64},
+            };
+            RTPSAutoPubCDRContext ctx{};
+            ctx.pFieldDescs = descs; ctx.fieldCount = 7;
+            ctx.pStruct = reinterpret_cast<const uint8_t*>(&s); ctx.structSize = sizeof(s);
+            ctx.frameId = "raft";
+
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::DepthImage, ctx, buf, sizeof(buf), written),
+                        "DepthImage: serialize ok");
+            uint32_t pos = a4(4 + 4 + 4 + 4 + 5);              // after the header
+            TEST_ASSERT(le32(buf + pos) == 4 && le32(buf + pos + 4) == 4, "DepthImage: 4x4 from the grid field");
+            pos += 8;
+            TEST_ASSERT(le32(buf + pos) == 6 && std::memcmp(buf + pos + 4, "32FC1", 6) == 0, "DepthImage: encoding 32FC1");
+            pos += 4 + 6;
+            TEST_ASSERT(buf[pos] == 0, "DepthImage: little-endian");
+            pos = a4(pos + 1);
+            TEST_ASSERT(le32(buf + pos) == 16, "DepthImage: step = 4 floats");
+            pos += 4;
+            TEST_ASSERT(le32(buf + pos) == 64, "DepthImage: 64 data bytes for 16 zones");
+            pos += 4;
+            float px[16]; std::memcpy(px, buf + pos, sizeof(px));
+            TEST_ASSERT(std::fabs(px[0] - 1.0f) < 1e-6f && std::fabs(px[5] - 1.05f) < 1e-6f && std::fabs(px[9] - 1.09f) < 1e-6f,
+                        "DepthImage: valid zones in metres");
+            TEST_ASSERT(std::isnan(px[1]) && std::isnan(px[3]) && std::isnan(px[15]), "DepthImage: invalid zones are NaN");
+            TEST_ASSERT(written == pos + 64, "DepthImage: message ends after the pixels");
+
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Range, ctx, buf, sizeof(buf), written),
+                        "Range multizone: serialize ok");
+            pos = 4 + 4 + 4 + 4 + 5;    // the uint8 radiation_type follows the frame_id string unpadded
+            pos = a4(pos + 1);
+            float r[3]; std::memcpy(r, buf + pos, sizeof(r));   // fov, min, max
+            TEST_ASSERT(r[2] == 4.0f, "Range multizone: max range 4 m");
+            float range; std::memcpy(&range, buf + pos + 12, 4);
+            TEST_ASSERT(std::fabs(range - 1.0f) < 1e-6f, "Range multizone: nearest valid zone (not the invalid 100 mm)");
+
+            // No valid zone at all -> +inf
+            for (int i = 0; i < 64; i++) s.status[i] = 255;
+            TEST_ASSERT(RTPSAutoPubCDRSerializer_serialize(
+                            RTPSAutoPubMsgKind::Range, ctx, buf, sizeof(buf), written),
+                        "Range multizone: serialize ok with no valid zone");
+            std::memcpy(&range, buf + pos + 12, 4);
+            TEST_ASSERT(std::isinf(range) && range > 0, "Range multizone: no valid zone -> +inf");
         }
 
         // ---- JointState: degrees -> rad, velocity/effort when present -----

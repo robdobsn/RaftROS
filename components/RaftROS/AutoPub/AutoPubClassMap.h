@@ -11,7 +11,8 @@
 //       → AutoPubClassMapping { primary, secondary, excluded }
 //
 // Precedence (first match wins):
-//   1. Device-type-name overrides (e.g. MCP9808 tagged LGHT → TEMP).
+//   1. Device-type-name overrides (e.g. MCP9808 tagged LGHT → TEMP; the ST
+//      multizone ToFs → Image depth grid + Range of the nearest zone).
 //   2. Output-only classes (PIX, LED) → excluded: nothing to publish.
 //   3. Composite rules — first match wins among:
 //        a. {ACC, GYRO} ⊆ clas           → Imu (single writer).
@@ -71,6 +72,7 @@ enum class AutoPubMsgKind : uint8_t
     BatteryState,
     JointState,
     Float64MultiArray,      ///< The labelled numeric fallback: one element per attribute
+    DepthImage,             ///< sensor_msgs/Image 32FC1 from a multizone ToF (distances in m)
     String,
 };
 
@@ -115,6 +117,8 @@ inline const char* AutoPubClassMap_typeName(AutoPubMsgKind kind)
             return "sensor_msgs::msg::dds_::JointState_";
         case AutoPubMsgKind::Float64MultiArray:
             return "std_msgs::msg::dds_::Float64MultiArray_";
+        case AutoPubMsgKind::DepthImage:
+            return "sensor_msgs::msg::dds_::Image_";
         case AutoPubMsgKind::String:
             return "std_msgs::msg::dds_::String_";
         case AutoPubMsgKind::Unknown:
@@ -188,6 +192,8 @@ inline const char* AutoPubClassMap_typeHash(AutoPubMsgKind kind)
             return "RIHS01_a13ee3a330e346c9d87b5aa18d24e11690752bd33a0350f11c5882bc9179260e";
         case AutoPubMsgKind::Float64MultiArray:
             return "RIHS01_1025ddc6b9552d191f89ef1a8d2f60f3d373e28b283d8891ddcc974e8c55397f";
+        case AutoPubMsgKind::DepthImage:
+            return "RIHS01_d31d41a9a4c4bc8eae9be757b0beed306564f7526c88ea6a4588fb9582527d47";
         case AutoPubMsgKind::String:
             return "RIHS01_df668c740482bbd48fb39d76a70dfd4bd59db1288021743503259e948f6b1a18";
         case AutoPubMsgKind::Unknown:
@@ -284,6 +290,19 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
             // currently carries clas=["LGHT"].  Force TEMP mapping regardless.
             out.primaryKind = AutoPubMsgKind::Temperature;
             out.primaryTopicSlug = "temperature";
+            return out;
+        }
+        if (std::strcmp(deviceTypeName, "VL53L5CX") == 0 ||
+            std::strcmp(deviceTypeName, "VL53L7CX") == 0 ||
+            std::strcmp(deviceTypeName, "VL53L8CX") == 0)
+        {
+            // ST multizone ToF: the frame is a 4x4 or 8x8 grid of distances,
+            // published as a depth image; the nearest valid zone as a Range
+            // keeps a scalar for tools that want one
+            out.primaryKind = AutoPubMsgKind::DepthImage;
+            out.primaryTopicSlug = "depth";
+            out.secondaryKind = AutoPubMsgKind::Range;
+            out.secondaryTopicSlug = "range";
             return out;
         }
         if (std::strcmp(deviceTypeName, "RoboticalLightSensor") == 0)
