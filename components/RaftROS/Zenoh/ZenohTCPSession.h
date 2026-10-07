@@ -135,11 +135,28 @@ public:
     const uint8_t* outputData() const { return _output.data() + _outputOffset; }
     size_t outputSize() const { return _outputLength - _outputOffset; }
 
+    /// @brief Queue a network message for the router.  Opens a reliable
+    /// frame for it, or - a frame can carry several network messages - appends
+    /// it to a frame already queued but not yet started on the wire, so the
+    /// endpoints of a composite device (an Image and a Range from one frame,
+    /// temperature and humidity from one sensor) go out in the same pass.
+    /// @return false if the session is not up, the frame is already being
+    /// sent, or the message would not fit the negotiated batch
     bool sendNetworkMessage(const uint8_t* message, size_t length, uint64_t nowMs)
     {
         service(nowMs);
-        if (_state != State::Established || outputSize() != 0 || !message || length == 0)
+        if (_state != State::Established || !message || length == 0)
             return false;
+        if (outputSize() != 0)
+        {
+            const bool frameQueued = _outputOffset == 0 && _outputLength > 2 && _output[2] == 0x25;
+            if (!frameQueued || _outputLength - 2 + length > _negotiatedBatch)
+                return false;
+            std::memcpy(_output.data() + _outputLength, message, length);
+            _outputLength += length;
+            finishOutput(nowMs);
+            return true;
+        }
         size_t sequenceSize = 1;
         for (uint32_t remainder = _txSequence >> 7; remainder; remainder >>= 7)
             ++sequenceSize;

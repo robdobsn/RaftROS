@@ -379,8 +379,17 @@ int main()
     const uint8_t framed[]{5, 0, 0x25, 0, 0x3e, 5, 0x1a};
     TEST_ASSERT(sender.outputSize() == sizeof(framed) && std::memcmp(sender.outputData(), framed, sizeof(framed)) == 0,
                 "reliable frame uses initial sequence and TCP batch prefix");
+    // A second message before the frame has started on the wire joins the
+    // same frame (one sequence number, one TCP batch); once part of the frame
+    // has been consumed nothing more can be added to it
+    const uint8_t framedTwo[]{8, 0, 0x25, 0, 0x3e, 5, 0x1a, 0x3e, 5, 0x1a};
+    TEST_ASSERT(sender.sendNetworkMessage(finalWire, sizeof(finalWire), 3) &&
+                sender.outputSize() == sizeof(framedTwo) &&
+                std::memcmp(sender.outputData(), framedTwo, sizeof(framedTwo)) == 0,
+                "a second message is appended to the queued frame");
+    sender.consumeOutput(2, 3);
     TEST_ASSERT(!sender.sendNetworkMessage(finalWire, sizeof(finalWire), 3) &&
-                std::memcmp(sender.outputData(), framed, sizeof(framed)) == 0, "busy send preserves queued bytes");
+                sender.outputSize() == sizeof(framedTwo) - 2, "a frame being sent takes no more messages");
     sender.consumeOutput(sender.outputSize(), 3);
     TEST_ASSERT(sender.sendNetworkMessage(finalWire, sizeof(finalWire), 4) && sender.outputData()[3] == 1,
                 "frame sequence advances only for accepted send");

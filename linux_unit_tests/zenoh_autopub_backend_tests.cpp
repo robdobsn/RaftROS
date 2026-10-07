@@ -252,12 +252,19 @@ int main()
 
         TEST_ASSERT(backend.publish(slot, payload, sizeof(payload), &sequence) == AutoPubPublishResult::Accepted &&
                     sequence == 1, "refusals did not consume sequence numbers");
-        // Output now holds the sample: the session cannot take another
+        // Output holds the sample but has not started on the wire: a second
+        // sample joins the same frame (a composite device's other endpoint)
+        const size_t oneQueued = session.outputSize();
+        TEST_ASSERT(backend.publish(slot, payload, sizeof(payload), &sequence) == AutoPubPublishResult::Accepted &&
+                    sequence == 2 && session.outputSize() > oneQueued,
+                    "a second sample is appended to the queued frame");
+        // Once the frame is going out, the session applies backpressure
+        session.consumeOutput(2, 10);
         TEST_ASSERT(backend.publish(slot, payload, sizeof(payload)) == AutoPubPublishResult::QueueFull,
-                    "a busy session applies backpressure rather than dropping the link");
+                    "a frame being sent applies backpressure rather than dropping the link");
         drain(session);
         TEST_ASSERT(backend.publish(slot, payload, sizeof(payload), &sequence) == AutoPubPublishResult::Accepted &&
-                    sequence == 2, "the backpressured sample did not consume a sequence number");
+                    sequence == 3, "the backpressured sample did not consume a sequence number");
         drain(session);
     }
 

@@ -181,7 +181,9 @@ public:
             return AutoPubPublishResult::Disconnected;
         // Not yet visible to subscribers (or being torn down): drop rather than
         // publish on a key nobody is matching.  Transient - service() clears it.
-        if (entry.state != Entry::State::Declared || _deps.session->outputSize() != 0)
+        // (Whether the session can take another message this pass is its
+        // decision: it appends to a frame it has not started sending.)
+        if (entry.state != Entry::State::Declared)
             return AutoPubPublishResult::QueueFull;
 
         uint8_t attachment[ZenohROSCodec::ATTACHMENT_SIZE];
