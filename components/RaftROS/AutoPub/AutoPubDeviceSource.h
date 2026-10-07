@@ -94,9 +94,11 @@ public:
     static constexpr uint32_t CDR_BUF_SIZE = 512;
 
     /// @brief Called when a device's endpoints are created or about to go.
-    /// `secondarySlot` is INVALID_SLOT unless the device is a composite.
+    /// `secondarySlot` and `tertiarySlot` are INVALID_SLOT unless the device
+    /// is a composite with that many endpoints.
     using EndpointHook = std::function<void(const AutoPubDeviceId& deviceId,
-                                            uint8_t primarySlot, uint8_t secondarySlot)>;
+                                            uint8_t primarySlot, uint8_t secondarySlot,
+                                            uint8_t tertiarySlot)>;
 
     ~AutoPubDeviceSource()
     {
@@ -197,11 +199,14 @@ private:
         /// @brief Cached at attach so the hot path skips the class-map lookup
         AutoPubMsgKind msgKind = AutoPubMsgKind::Unknown;
 
-        /// @brief Composite second endpoint (e.g. an AHT20 publishes
-        /// Temperature on the primary slot and RelativeHumidity here).  It
-        /// shares the decoded record but has its own publisher and topic.
+        /// @brief Composite extra endpoints (e.g. an AHT20 publishes
+        /// Temperature on the primary slot and RelativeHumidity on the
+        /// secondary; an SCD40 adds CO2 on the tertiary).  They share the
+        /// decoded record but have their own publisher and topic.
         uint8_t secondarySlot = INVALID_SLOT;
         AutoPubMsgKind secondaryMsgKind = AutoPubMsgKind::Unknown;
+        uint8_t tertiarySlot = INVALID_SLOT;
+        AutoPubMsgKind tertiaryMsgKind = AutoPubMsgKind::Unknown;
 
         /// @brief Data callbacks received (incremented under the pool lock;
         /// read on the loop task only after the handle is released)
@@ -256,7 +261,8 @@ private:
 
     /// @brief Serialisation happens on the loop task, one sample at a time, so
     /// every device shares these
-    uint8_t _cdrBufs[2][CDR_BUF_SIZE] = {};
+    static constexpr uint8_t MAX_ENDPOINTS_PER_DEVICE = 3;
+    uint8_t _cdrBufs[MAX_ENDPOINTS_PER_DEVICE][CDR_BUF_SIZE] = {};
 
     std::vector<QoSOverride> _aliasOverrides;
     std::vector<QoSOverride> _classOverrides;

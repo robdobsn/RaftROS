@@ -58,6 +58,7 @@ struct AutoPubAttrFieldDesc
     const char*          fmtStr;
     float                divisor;
     float                addend;
+    uint16_t             count;     ///< Elements in the field (>1 for an array attribute; 0 means 1)
 };
 
 /// @brief Serialisation context: everything needed to build one CDR message.
@@ -98,6 +99,16 @@ bool AutoPubCDRSerializer_serializeString(
 bool AutoPubCDRSerializer_readFieldDouble(
         const AutoPubCDRContext& ctx,
         const char* name,
+        double& out,
+        bool applyScale = true);
+
+/// @brief Read one element of a field (an array attribute has `count` of
+///        them, laid out consecutively) as a `double`, scaled as above.
+/// @return true if the element exists and was read.
+bool AutoPubCDRSerializer_readFieldElementDouble(
+        const AutoPubCDRContext& ctx,
+        const AutoPubAttrFieldDesc& desc,
+        uint16_t index,
         double& out,
         bool applyScale = true);
 

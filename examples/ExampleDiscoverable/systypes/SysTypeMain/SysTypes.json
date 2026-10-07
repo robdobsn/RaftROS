@@ -67,6 +67,7 @@
   },
   "RaftROS": {
     "enable": 1,
+    "active": 1,
     "domainId": 0,
     "nodeName": "raft_esp32",
     "nodeNamespace": "/",
