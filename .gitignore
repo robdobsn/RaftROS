@@ -9,6 +9,12 @@ logs/
 .venv
 node_modules
 *.o
-ros-humble-*/
+ros-humble-*
 docker/captures/
 third_party/
+
+# Local-only: tool state, agent settings, host test binary and its log
+.raftcli_history
+.claude/
+linux_unit_tests/raftros_linux
+linux_unit_tests/raftros.log

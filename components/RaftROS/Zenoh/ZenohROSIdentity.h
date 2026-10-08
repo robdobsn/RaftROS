@@ -5,6 +5,11 @@
 namespace RaftRuntime::Zenoh
 {
 
+// Derives rmw_zenoh-compatible endpoint GIDs: the 128-bit XXH3 hash of the
+// endpoint's liveliness token. The hash is a from-specification implementation
+// of XXH3 (Yann Collet's xxHash, https://github.com/Cyan4973/xxHash, BSD
+// 2-Clause); the prime and default-secret constants below are the fixed
+// inputs defined by that specification. No upstream code is included here.
 class ZenohROSIdentity
 {
 public:

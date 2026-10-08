@@ -10,6 +10,9 @@ build time), publishes every bus device that Raft's `DeviceManager` finds as
 a typed ROS 2 topic, and lets application code subscribe to topics, serve
 ROS 2 services and expose ROS 2 parameters.
 
+<!-- TODO after the blog post is published: add a link to it here, e.g.
+"The story of the project, with measurements, is in the blog post: <url>". -->
+
 **Start with the example:** [`examples/ExampleDiscoverable`](examples/ExampleDiscoverable/README.md)
 is a complete application that uses every feature, with the exact `ros2`
 commands to try each one. The rest of this page is about using RaftROS in
@@ -52,7 +55,7 @@ visible to the build and depend on it - as the example does:
 ```cmake
 # systypes/Common/features.cmake
 set(RAFT_COMPONENTS
-    RaftCore@main          # RaftCore 6e5bb96 or later (AttrFieldDesc with element count)
+    RaftCore@main          # RaftCore 78781c0 or later (see Dependencies)
     RaftSysMods@main
     RaftWebServer@main     # for /api/rosstat and settings
     RaftI2C@main           # if you have I2C devices
@@ -246,9 +249,13 @@ if discovery doesn't work.
 
 ## Demo: ExampleDiscoverable + DemoSimple + Foxglove
 
-The DemoSimple dashboard and the Foxglove commands below are written for the
-RTPS build (FastDDS); with the Zenoh build set
-`RMW_IMPLEMENTATION=rmw_zenoh_cpp` instead and run a router.
+The quickest route on a Linux host with Docker is `docker/distros/demo.sh
+<distro>`: it builds nothing on the host, starts the Zenoh router and
+`foxglove_bridge` in a container for Jazzy, Kilted or Lyrical, and with the
+`dashboard` argument runs DemoSimple too. The steps below are the same thing
+done by hand. They are written for the Zenoh build (the default); for the
+RTPS build use `RMW_IMPLEMENTATION=rmw_fastrtps_cpp`, no router, and read the
+[host setup notes](#host-setup-notes-read-first-if-discovery-isnt-working).
 
 [`examples/ExampleDiscoverable`](examples/ExampleDiscoverable/README.md) is the ESP32 firmware demo. When flashed to an
 ESP32 with WiFi configured, it appears as a native ROS 2 participant and
@@ -284,10 +291,11 @@ Attach one or more supported I2C devices. Typical demo devices include:
 
 ### 2. Run DemoSimple
 
-From the repository root on a ROS 2 host:
+From the repository root on a ROS 2 host, with a router running
+(`ros2 run rmw_zenoh_cpp rmw_zenohd`):
 
 ```bash
-examples/DemoSimple/run_dashboard.sh
+RMW_IMPLEMENTATION=rmw_zenoh_cpp examples/DemoSimple/run_dashboard.sh
 ```
 
 The dashboard should show rows appearing and disappearing as I2C devices are
@@ -306,8 +314,9 @@ examples/DemoSimple/run_dashboard.sh --all-raft-topics --include-chatter
 examples/DemoSimple/run_dashboard.sh --no-clear
 ```
 
-The wrapper sources `/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash`, selects Fast
-DDS over UDPv4, and uses a local log directory under `examples/DemoSimple/logs`.
+The wrapper sources `/opt/ros/${ROS_DISTRO:-jazzy}/setup.bash`, honours an
+explicit `RMW_IMPLEMENTATION` (and otherwise selects Fast DDS over UDPv4 for
+the RTPS build), and uses a local log directory under `examples/DemoSimple/logs`.
 If you already have a ROS environment sourced, you can run the Python script
 directly:
 
@@ -325,17 +334,25 @@ sudo apt update
 sudo apt install ros-${ROS_DISTRO:-jazzy}-foxglove-bridge
 ```
 
-Start the bridge:
+Start the bridge (Zenoh build; the router must already be running):
 
 ```bash
 source /opt/ros/${ROS_DISTRO:-jazzy}/setup.bash
-export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
-export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
-unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE
-unset ROS_LOCALHOST_ONLY
-
+export RMW_IMPLEMENTATION=rmw_zenoh_cpp
 ros2 launch foxglove_bridge foxglove_bridge_launch.xml
 ```
+
+For the RTPS build instead:
+
+```bash
+export RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+export FASTDDS_BUILTIN_TRANSPORTS=UDPv4
+unset FASTRTPS_DEFAULT_PROFILES_FILE FASTDDS_DEFAULT_PROFILES_FILE ROS_LOCALHOST_ONLY
+ros2 launch foxglove_bridge foxglove_bridge_launch.xml
+```
+
+A ready-made layout for the VL6180 demo is in
+`docker/distros/demo/raftros-foxglove-layout.json` (layout menu → Import).
 
 Then open Foxglove Studio and connect to:
 
@@ -505,6 +522,11 @@ sudo chown $USER ~/raft_rtps.pcap
 - `examples/ExampleDiscoverable/` - the reference application (above).
 - `examples/DemoSimple/` - host-side dashboard for hot-plugged device topics.
 - `tools/` - a Zenoh router stub and a Zenoh subscriber, for testing without ROS.
+- `docker/distros/` - a ROS 2 test container per distribution (Jazzy, Kilted,
+  Lyrical) with the functional, hot-plug and soak harness, and `demo.sh`.
+- `scripts/` - RTPS discovery and traffic diagnostics (tshark/pcap based),
+  from the RTPS bring-up.
+- `unit_tests/` - the on-target (ESP32) unit test application.
 - `linux_unit_tests/` - host test suites (`make` targets: `all`, `zenoh-test`,
   `zenoh-session-test`, `zenoh-autopub-test`), with captured-traffic fixtures.
 - `devdocs/` - start with [RaftROS-zenoh-milestone-results.md](devdocs/RaftROS-zenoh-milestone-results.md)
