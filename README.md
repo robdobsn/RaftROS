@@ -10,8 +10,8 @@ build time), publishes every bus device that Raft's `DeviceManager` finds as
 a typed ROS 2 topic, and lets application code subscribe to topics, serve
 ROS 2 services and expose ROS 2 parameters.
 
-<!-- TODO after the blog post is published: add a link to it here, e.g.
-"The story of the project, with measurements, is in the blog post: <url>". -->
+The story of the project, with the measurements, is in the blog post
+[Agent-free ROS 2 on an ESP32](https://robdobson.com/2026/10/agent-free-ros-2-on-an-esp32/).
 
 **Start with the example:** [`examples/ExampleDiscoverable`](examples/ExampleDiscoverable/README.md)
 is a complete application that uses every feature, with the exact `ros2`
