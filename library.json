@@ -1,6 +1,6 @@
 {
     "name": "RaftROS",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "description": "Native ROS 2 node functionality for the Raft ESP32 framework",
     "keywords": "esp32, esp32s3, framework, ROS, ROS2, DDS, RTPS, Zenoh",
     "repository": {
