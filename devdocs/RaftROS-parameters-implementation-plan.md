@@ -17,7 +17,7 @@ loop rules, plus a codec for `rcl_interfaces` and a small parameter store.
 | Which services | All six: `list_parameters`, `get_parameters`, `get_parameter_types`, `set_parameters`, `set_parameters_atomically`, `describe_parameters` | `ros2 param list/get/set/describe/dump` between them use all six; a node missing one looks broken to the tools. |
 | Types | `bool`, `int64`, `double`, `string`. Arrays and byte arrays are described (type reported) but never held; a set with one is refused with a reason. | Covers what a Raft SysMod configures; array handling would double the codec for no user. |
 | Which parameters | The SysMod's own (`chatterEnable`, `routerHost`) and any the application declares with `declareParameter(name, value, onSet)`. `use_sim_time` is declared `false`, read-only. | `use_sim_time` is on every ROS 2 node and the tools expect it; the rest is the actual use. |
-| Persistence | A set changes the running value; the declaring code's `onSet` callback may persist it. `routerHost` persists through the same overlay `/api/postsettings` writes, so `ros2 param set /raft_esp32 routerHost <ip>` survives a reboot. | Persistence is a policy of each parameter, not of the transport. |
+| Persistence | A set changes the running value; the declaring code's `onSet` callback may persist it. `routerHost` persists through the same overlay `/api/postsettings` writes, so `ros2 param set /<node> routerHost <ip>` survives a reboot. | Persistence is a policy of each parameter, not of the transport. |
 | `/parameter_events` | Not published. | Nothing in the CLI needs it; it would be a permanent publisher on every set for no reader. |
 | Bounds | 16 parameters; names up to 48 characters; string values up to 64; replies up to 1024 bytes (`REPLY_MAX`) so `ros2 param dump` on a full table fits in one reply. | Static tables, as everything else in the SysMod. |
 
@@ -120,9 +120,9 @@ the last reason twice. Unit suite 1123 passed (+59 over P0).
 services for its node at setup, maps `chatterEnable` and `routerHost`
 (with persistence), declares `use_sim_time`, and offers
 `declareParameter()` to the application. `rosstat` gains `params`.
-*Gate, on hardware:* `ros2 param list /raft_esp32` shows the parameters;
+*Gate, on hardware:* `ros2 param list /<node>` shows the parameters;
 `get`/`set`/`describe`/`dump` work for each type; a wrong-type set and a
-read-only set report their reasons; `ros2 param set /raft_esp32
+read-only set report their reasons; `ros2 param set /<node>
 chatterEnable false` silences `/chatter`; `routerHost` set survives a
 reboot; loop maxima unchanged; image and heap deltas recorded.
 **Met 2026-09-29** on the ESP32-S3 TFT Feather against `rmw_zenohd` 0.2.10: `ros2 param
@@ -153,7 +153,7 @@ parameters of its own with an `onSet` (e.g. the chatter period), the README
 gets a *Parameters* section, the results document a row.
 **Met 2026-09-29.** The SysMod adds `chatterPeriodMs` (validated
 100-60000); the example declares `rangeOffsetMm` and reads it where it is
-used - `/raft_esp32/range` answered "range 259.5 mm (offset 4.5)" after a
+used - `/<node>/range` answered "range 259.5 mm (offset 4.5)" after a
 set. README *Parameters* section; results row added.
 
 ## 4. Validation Workflow
@@ -166,7 +166,7 @@ read unattended for loop figures, a router restart for re-declaration.
 
 | | Required | How it is shown |
 | --- | --- | --- |
-| All six services in the graph | yes | `ros2 service list -t \| grep raft_esp32` |
+| All six services in the graph | yes | `ros2 service list -t \| grep <node>` |
 | `ros2 param list/get/set/describe/dump` | yes | each against the board |
 | Type safety | yes | wrong-type set refused with reason; read-only refused |
 | Atomic set | yes | one bad parameter fails the whole set, nothing changes |

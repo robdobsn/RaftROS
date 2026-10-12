@@ -1,0 +1,138 @@
+{
+  "CmdsAtStart": "",
+  "DevMan": {
+    "Buses": {
+      "buslist": [
+        {
+          "name": "I2CA",
+          "type": "I2C",
+          "sdaPin": 8,
+          "sclPin": 9,
+          "i2cFreq": 100000,
+          "i2cPort": 0
+        },
+        {
+          "name": "I2CB",
+          "type": "I2C",
+          "sdaPin": 16,
+          "sclPin": 15,
+          "i2cFreq": 100000,
+          "i2cPort": 1,
+          "pwr": {
+            "voltageLevels": [
+              "off",
+              "3V3"
+            ],
+            "slotGroups": [
+              {
+                "name": "Vertical STEMMA QT (LDO2)",
+                "startSlotNum": 0,
+                "numSlots": 1,
+                "defaultLevelIdx": 1,
+                "levelsExclOff": [
+                  {
+                    "vPins": [
+                      39
+                    ],
+                    "on": [
+                      1
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "Devices": []
+  },
+  "ESPOTAUpdate": {
+    "OTADirect": 1,
+    "enable": 1
+  },
+  "FileManager": {
+    "enable": 1
+  },
+  "LogManager": {
+    "enable": 0,
+    "logDests": [
+      {
+        "enable": false,
+        "port": 8080,
+        "type": "RaftRemote"
+      }
+    ]
+  },
+  "MQTTMan": {
+    "brokerHostname": "mqttbroker",
+    "brokerPort": 1883,
+    "clientID": "",
+    "enable": 0,
+    "topics": [
+      {
+        "inbound": 1,
+        "name": "examplein",
+        "path": "example/in",
+        "qos": 1
+      },
+      {
+        "inbound": 0,
+        "name": "exampleout",
+        "path": "example/out",
+        "qos": 1
+      }
+    ]
+  },
+  "MainSysMod": {
+    "exampleGroup": {
+      "exampleKey": "Welcome to Raft!"
+    }
+  },
+  "NetMan": {
+    "wifiAPEn": 1,
+    "wifiAPPW": "raftpassword",
+    "wifiAPSSID": "RaftAP",
+    "wifiSTAEn": 1
+  },
+  "Publish": {
+    "enable": 1
+  },
+  "RaftROS": {
+    "enable": 1,
+    "active": 1,
+    "domainId": 0,
+    "nodeNamespace": "/",
+    "leaseDurationSec": 120,
+    "spdpIntervalMs": 5000,
+    "qosProfiles": {
+      "classDefaults": {}
+    },
+    "link": "tcp",
+    "linkLogs": 0
+  },
+  "SerialConsole": {
+    "enable": 1
+  },
+  "SysManager": {
+    "DefaultName": "RaftROS",
+    "monitorPeriodMs": 10000,
+    "pauseWiFiforBLE": 1,
+    "reportList": [
+      "NetMan",
+      "SysMan"
+    ],
+    "slowSysModMs": 50
+  },
+  "SysTypeName": "RaftROSFeatherS3",
+  "WebServer": {
+    "enable": 1,
+    "websockets": [
+      {
+        "pcol": "RICSerial",
+        "pfix": "ws"
+      }
+    ]
+  },
+  "WebUI": ""
+}

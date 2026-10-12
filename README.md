@@ -193,10 +193,14 @@ double gain = pRos->parameter("gain")->doubleValue;
 On the RTPS build these compile to stubs that log a warning, so one
 application builds for both transports.
 
-**Read a device's latest value** without disturbing auto-publishing: peek it
-with `RaftBusDevicesIF::getLatestDecodedPollResponse`, or subscribe with
-`DeviceManager::registerForDeviceData` (RaftCore fans samples out to every
-subscriber).
+**Read a device's latest value** without disturbing auto-publishing:
+subscribe with `DeviceManager::registerForDeviceData` (RaftCore fans samples
+out to every subscriber) and decode each sample with the device type record's
+`pollResultDecodeFn`, reading fields by name from its `pollFieldDescs`.
+For an occasional read, `RaftBusDevicesIF::peekLatestDecodedPollResponse`
+returns the latest result without consuming it. `getLatestDecodedPollResponse`
+is not a peek: it returns a result only if one has arrived since its previous
+call (from any caller), so two readers of it starve each other.
 
 The example's [`MainSysMod.cpp`](examples/ExampleDiscoverable/components/MainSysMod/MainSysMod.cpp)
 does all of these.
@@ -420,13 +424,13 @@ build needs only a TCP connection to the router.
 
 ### RTPS CLI caveat (historical)
 
-> **Resolved:** on native Linux (2026-09-27) `ros2 node info /raft_esp32` and
+> **Resolved:** on native Linux (2026-09-27) `ros2 node info /<node>` and
 > `ros2 topic info -v` attribute the node correctly over both FastDDS and
 > CycloneDDS. The note below is kept for WSL setups that still show it.
 
 Applies to the RTPS build only. On the Windows 11 + WSL2 + ROS 2 Jazzy test setup of 2026-04, `ros2 topic info -v`
 may show the ESP32 publisher with `Node name: _NODE_NAME_UNKNOWN_`, and
-`ros2 node info /raft_esp32` may fail even while typed subscriptions receive
+`ros2 node info /<node>` may fail even while typed subscriptions receive
 valid samples. This is currently treated as a host/CLI graph-attribution issue,
 not a firmware data-path failure:
 

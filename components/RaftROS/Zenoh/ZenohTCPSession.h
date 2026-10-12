@@ -34,7 +34,9 @@ public:
     /// survives.
     using RequestCallback = bool (*)(void*, const ZenohNetworkMessage::RequestMessage&);
 
-    bool start(const std::array<uint8_t, 16>& identity, uint64_t nowMs)
+    /// @param maxBatch the batch size we offer; a link with a smaller MTU
+    /// (serial: 1500) offers that, so neither side builds a batch it cannot carry
+    bool start(const std::array<uint8_t, 16>& identity, uint64_t nowMs, uint16_t maxBatch = BATCH_CAPACITY)
     {
         if (_state == State::AwaitInitAck || _state == State::AwaitOpenAck || _state == State::Established)
             return false;
@@ -42,7 +44,9 @@ public:
         _outputLength = _outputOffset = 0;
         _state = State::Idle;
         _error = Error::None;
-        _negotiatedBatch = BATCH_CAPACITY;
+        if (maxBatch < 64 || maxBatch > BATCH_CAPACITY)
+            return fail(Error::UnsupportedNegotiation);
+        _negotiatedBatch = maxBatch;
         _sequenceBits = 32;
         _closeReason = 0;
         _remoteLeaseMs = _remoteInitialSequence = 0;
@@ -63,8 +67,8 @@ public:
         for (const auto byte : identity)
             appendByte(byte);
         appendByte(0x0a);
-        appendByte(static_cast<uint8_t>(BATCH_CAPACITY));
-        appendByte(static_cast<uint8_t>(BATCH_CAPACITY >> 8));
+        appendByte(static_cast<uint8_t>(maxBatch));
+        appendByte(static_cast<uint8_t>(maxBatch >> 8));
         finishOutput(nowMs);
         _state = State::AwaitInitAck;
         return true;
@@ -86,7 +90,8 @@ public:
                 return fail(Error::InvalidBatch);
             if (result == ZenohStreamFramer<BATCH_CAPACITY>::Result::Complete)
             {
-                if (_framer.size() > _negotiatedBatch || !processBatch(nowMs, onDiscovery, context, onSample, onRequest))
+                if (_framer.size() > _negotiatedBatch ||
+                    !processBatch(_framer.data(), _framer.size(), nowMs, onDiscovery, context, onSample, onRequest))
                 {
                     if (_state != State::Failed)
                         fail(Error::InvalidBatch);
@@ -98,6 +103,40 @@ public:
             }
         }
         return true;
+    }
+
+    /// @brief Datagram links (serial): one whole batch, with no TCP length
+    /// prefix, as the link delivered it.  Same callbacks and failure rules as
+    /// receive().
+    bool receiveBatch(const uint8_t* batch, size_t length, uint64_t nowMs,
+                      DiscoveryCallback onDiscovery = nullptr, void* context = nullptr,
+                      SampleCallback onSample = nullptr, RequestCallback onRequest = nullptr)
+    {
+        service(nowMs);
+        if (!active())
+            return false;
+        if (!batch || length == 0 || length > _negotiatedBatch)
+            return fail(Error::InvalidBatch);
+        if (!processBatch(batch, length, nowMs, onDiscovery, context, onSample, onRequest))
+        {
+            if (_state != State::Failed)
+                fail(Error::InvalidBatch);
+            return false;
+        }
+        _lastRxMs = nowMs;
+        return true;
+    }
+
+    /// @brief Datagram links: the queued batch without its TCP length prefix,
+    /// if one is queued and none of it has been consumed.  The caller sends it
+    /// as one frame and then consumes outputSize().
+    const uint8_t* pendingBatch(size_t& length) const
+    {
+        length = 0;
+        if (outputSize() == 0 || _outputOffset != 0)
+            return nullptr;
+        length = _outputLength - 2;
+        return _output.data() + 2;
     }
 
     void service(uint64_t nowMs)
@@ -328,7 +367,7 @@ private:
                 return fail(Error::MalformedMessage);
             batch = static_cast<uint16_t>(low | (static_cast<uint16_t>(high) << 8));
         }
-        if (batch < 64 || batch > BATCH_CAPACITY || (resolution & 0xf0) != 0 ||
+        if (batch < 64 || batch > _negotiatedBatch || (resolution & 0xf0) != 0 ||
             (resolution & 3) > 2 || ((resolution >> 2) & 3) > 2)
             return fail(Error::UnsupportedNegotiation);
         uint64_t cookieSize = 0;
@@ -381,10 +420,10 @@ private:
         return true;
     }
 
-    bool processBatch(uint64_t nowMs, DiscoveryCallback onDiscovery, void* context,
+    bool processBatch(const uint8_t* batch, size_t length, uint64_t nowMs, DiscoveryCallback onDiscovery, void* context,
                       SampleCallback onSample = nullptr, RequestCallback onRequest = nullptr)
     {
-        Reader reader(_framer.data(), _framer.size());
+        Reader reader(batch, length);
         while (reader.remaining() != 0)
         {
             uint8_t header = 0;

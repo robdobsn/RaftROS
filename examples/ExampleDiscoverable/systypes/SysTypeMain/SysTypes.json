@@ -8,7 +8,31 @@
           "type": "I2C",
           "sdaPin": 42,
           "sclPin": 41,
-          "i2cFreq": 100000
+          "i2cFreq": 100000,
+          "pwr": {
+            "voltageLevels": [
+              "off",
+              "3V3"
+            ],
+            "slotGroups": [
+              {
+                "name": "STEMMA QT",
+                "startSlotNum": 0,
+                "numSlots": 1,
+                "defaultLevelIdx": 1,
+                "levelsExclOff": [
+                  {
+                    "vPins": [
+                      21
+                    ],
+                    "on": [
+                      1
+                    ]
+                  }
+                ]
+              }
+            ]
+          }
         }
       ]
     },
@@ -69,7 +93,6 @@
     "enable": 1,
     "active": 1,
     "domainId": 0,
-    "nodeName": "raft_esp32",
     "nodeNamespace": "/",
     "leaseDurationSec": 120,
     "spdpIntervalMs": 5000,
@@ -81,6 +104,7 @@
     "enable": 1
   },
   "SysManager": {
+    "DefaultName": "RaftROS",
     "monitorPeriodMs": 10000,
     "pauseWiFiforBLE": 1,
     "reportList": [

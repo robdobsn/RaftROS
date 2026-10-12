@@ -7,8 +7,10 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "RaftROSZenoh.h"
+#include "RaftROSNodeName.h"
 #include "RaftJson.h"
 #include "RestAPIEndpointManager.h"
+#include "APISourceInfo.h"
 #include "RaftUtils.h"
 #include "CDREncoder.h"
 #include "esp_mac.h"
@@ -18,6 +20,8 @@
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "soc/soc_caps.h"
+#include "LoggerCore.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -27,8 +31,41 @@
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <algorithm>
+#include <new>
 
 static const char* MODULE_PREFIX = "RaftROS";
+
+// The serial link uses the chip's USB-Serial-JTAG port, so it needs a chip
+// that has one and support built in (CONFIG_RAFTROS_ZENOH_SERIAL_LINK).  When
+// the console is on that port too, the node takes the port over while the link
+// is chosen: SerialConsole is told to let go ("releasePort") and RaftCore's
+// RaftConsolePort silences every other writer, then both are given back when
+// the link is changed back to TCP.
+#if SOC_USB_SERIAL_JTAG_SUPPORTED && defined(CONFIG_RAFTROS_ZENOH_SERIAL_LINK)
+    #define RAFTROS_USB_LINK_SUPPORTED 1
+    #include "driver/usb_serial_jtag.h"
+    #if defined(CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG) || defined(CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG)
+        #define RAFTROS_USB_LINK_SHARES_CONSOLE 1
+        #if __has_include("RaftConsolePort.h")
+            #include "RaftConsolePort.h"
+            #define RAFTROS_CAN_CLAIM_CONSOLE 1
+        #else
+            #define RAFTROS_CAN_CLAIM_CONSOLE 0
+        #endif
+    #else
+        #define RAFTROS_USB_LINK_SHARES_CONSOLE 0
+        #define RAFTROS_CAN_CLAIM_CONSOLE 0
+    #endif
+    #define RAFTROS_USB_LINK_AVAILABLE (!RAFTROS_USB_LINK_SHARES_CONSOLE || RAFTROS_CAN_CLAIM_CONSOLE)
+#else
+    #define RAFTROS_USB_LINK_SUPPORTED 0
+    #define RAFTROS_USB_LINK_SHARES_CONSOLE 0
+    #define RAFTROS_CAN_CLAIM_CONSOLE 0
+    #define RAFTROS_USB_LINK_AVAILABLE 0
+#endif
+#if RAFTROS_USB_LINK_SHARES_CONSOLE
+static const char* CONSOLE_OWNER = "RaftROS";
+#endif
 
 // Verbose logging for bring-up.  Console writes block the loop task, so the
 // default build says what happened (connected, declared node, subscribed to a
@@ -66,7 +103,15 @@ void RaftROS::setup()
     // "create the SysMod").
     _active = configGetBool("active", configGetBool("enable", false));
     _domainId = configGetLong("domainId", 0);
-    _nodeName = configGetString("nodeName", "raft_esp32");
+    // "nodeName" if configured; otherwise the node is named after the device
+    // (Raft's friendly name - see RaftROSNodeName.h), so boards sharing an
+    // image are distinct nodes
+    _nodeName = configGetString("nodeName", "");
+    if (_nodeName.length() == 0)
+    {
+        bool friendlyNameSet = false;
+        _nodeName = RaftROSNodeName_sanitise(getFriendlyName(friendlyNameSet));
+    }
     _nodeNamespace = configGetString("nodeNamespace", "/");
     // The router address is layered: the Kconfig default (empty unless the
     // build sets one), overridden by "routerHost" in SysTypes, overridden by a
@@ -83,6 +128,20 @@ void RaftROS::setup()
 #endif
     if (_routerPort == 0 || _routerPort > 65535)
         _routerPort = 7447;
+    // The link: "tcp" unless configured otherwise.  A serial link this image
+    // cannot use falls back to TCP, so the node stays reachable over WiFi.
+    const String link = configGetString("link", "tcp");
+    if (!RaftROSLink_fromName(link.c_str(), _linkType))
+    {
+        LOG_W(MODULE_PREFIX, "setup link '%s' unknown - use tcp or usbjtag; using tcp", link.c_str());
+        _linkType = RaftROSLinkType::TCP;
+    }
+    if (isSerialLink() && serialLinkUnavailableReason())
+    {
+        LOG_E(MODULE_PREFIX, "setup link usbjtag not possible in this image (%s) - using tcp", serialLinkUnavailableReason());
+        _linkType = RaftROSLinkType::TCP;
+    }
+    _linkLogs = configGetBool("linkLogs", false);
 
     if (!_active)
     {
@@ -171,8 +230,8 @@ bool RaftROS::startNode()
             LOG_W(MODULE_PREFIX, "setup no DeviceManager - auto-publishing disabled");
         }
 
-        LOG_I(MODULE_PREFIX, "setup backend=zenoh router=%s:%u domain=%u node=%s%s session=%s",
-              _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_domainId,
+        LOG_I(MODULE_PREFIX, "setup backend=zenoh router=%s domain=%u node=%s%s session=%s",
+              routerLabel().c_str(), (unsigned)_domainId,
               _nodeNamespace.c_str(), _nodeName.c_str(), _sessionIdStr);
 
         // The node's parameters and the six services that expose them
@@ -197,6 +256,7 @@ void RaftROS::stopNode(const char* reason)
     _active = false;
     if (_connState != ConnState::DISCONNECTED)
         closeConnection(reason);
+    releaseUsbPort();
     LOG_I(MODULE_PREFIX, "node inactive (%s)", reason);
 }
 
@@ -253,6 +313,17 @@ void RaftROS::loop()
     {
         case ConnState::DISCONNECTED:
             warnRouterUnreachable();        // the remaining lines of a warning in progress, one per pass
+            if (isSerialLink())
+            {
+                // No address and no IP needed: the router is at the other end of the cable
+                if (Raft::isTimeout(nowMs, _lastConnectAttemptMs, _reconnectDelayMs))
+                {
+                    const int64_t startUs = esp_timer_get_time();
+                    startConnect();
+                    noteMax(_loopConnMaxUs, startUs);
+                }
+                break;
+            }
             if (!_routerAddrValid)
             {
                 // Active but nowhere to connect to: say so once, then wait for
@@ -288,6 +359,8 @@ void RaftROS::loop()
             applyPendingRouterHost();
             break;
     }
+    if (_linkLogs && isSerialLink())
+        drainLinkLogs();
 
     const uint32_t passUs = (uint32_t)(esp_timer_get_time() - passStartUs);
     if (passUs > _loopPassMaxUs)
@@ -322,6 +395,15 @@ uint32_t RaftROS::getLocalIP()
 void RaftROS::startConnect()
 {
     _lastConnectAttemptMs = millis();
+    if (isSerialLink())
+    {
+        if (startSerialLink())
+        {
+            _connectStartedMs = _lastConnectAttemptMs;
+            _connState = ConnState::CONNECTING;
+        }
+        return;
+    }
     const int64_t startUs = esp_timer_get_time();
     _sock = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     warnIfSlow("socket()", startUs);
@@ -361,6 +443,11 @@ void RaftROS::startConnect()
 /// @brief Poll the in-flight connect with a zero timeout - never a wait
 void RaftROS::stepConnect()
 {
+    if (isSerialLink())
+    {
+        stepSerialLink();
+        return;
+    }
     fd_set writeSet;
     FD_ZERO(&writeSet);
     FD_SET(_sock, &writeSet);
@@ -398,8 +485,7 @@ void RaftROS::stepConnect()
     _nodeTokenState = NodeTokenState::PENDING;
     _pendingInterestCount = 0;
     _connState = ConnState::HANDSHAKE;
-    LOG_I(MODULE_PREFIX, "connected to router %s:%u, opening session",
-          _routerHost.c_str(), (unsigned)_routerPort);
+    LOG_I(MODULE_PREFIX, "connected to router %s, opening session", routerLabel().c_str());
 }
 
 /// @brief One bounded pass over an open session: receive what has arrived,
@@ -479,6 +565,40 @@ void RaftROS::serviceSession(uint32_t nowMs)
 /// @brief Read whatever has arrived, once.  @return false if the connection died
 bool RaftROS::receiveFromRouter(uint32_t nowMs)
 {
+    if (isSerialLink())
+    {
+        // Each data frame is one whole batch: no stream framing to undo
+        const int64_t startUs = esp_timer_get_time();
+        auto& link = *_pSerialLink;     // allocated before any serial connect
+        const uint32_t bytesBefore = link.bytesIn();
+        const bool ok = link.service(nowMs, SERIAL_RX_BUDGET_BYTES, [this, nowMs](const uint8_t* batch, size_t length) {
+            return _session.receiveBatch(batch, length, nowMs, onDiscoveryThunk, this, onSampleThunk, onRequestThunk);
+        });
+        const uint32_t totalUs = (uint32_t)(esp_timer_get_time() - startUs);
+        if (totalUs > _loopRxPartsMaxUs)
+        {
+            _loopRxPartsMaxUs = totalUs;
+            _loopRxMaxRecvUs = 0;
+            _loopRxMaxParseUs = totalUs;
+            _loopRxMaxBytes = link.bytesIn() - bytesBefore;
+        }
+        if (ok)
+            return true;
+        switch (link.lossReason())
+        {
+            case RaftRuntime::Zenoh::ZenohSerialLink<UsbJtagPort>::LossReason::Rejected:
+                LOG_W(MODULE_PREFIX, "session rejected router data error=%d", (int)_session.error());
+                closeConnection("bad router data");
+                break;
+            case RaftRuntime::Zenoh::ZenohSerialLink<UsbJtagPort>::LossReason::Reset:
+                closeConnection("router reset the serial link");
+                break;
+            default:
+                closeConnection("serial read failed");
+                break;
+        }
+        return false;
+    }
     const int64_t recvStartUs = esp_timer_get_time();
     const int count = recv(_sock, _rxBuf, sizeof(_rxBuf), 0);
     const int64_t parseStartUs = esp_timer_get_time();
@@ -520,6 +640,16 @@ bool RaftROS::receiveFromRouter(uint32_t nowMs)
 /// write is normal and the remainder goes out on a later pass.
 bool RaftROS::flushToRouter()
 {
+    if (isSerialLink())
+    {
+        // One batch, one frame, all or nothing: a frame that does not fit the
+        // driver's TX ring now goes on a later pass
+        size_t length = 0;
+        const uint8_t* batch = _session.pendingBatch(length);
+        if (batch && _pSerialLink->sendBatch(batch, length))
+            _session.consumeOutput(_session.outputSize(), millis());
+        return true;
+    }
     const size_t pending = _session.outputSize();
     if (pending == 0)
         return true;
@@ -557,10 +687,13 @@ void RaftROS::closeConnection(const char* reason)
         _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
     else
     {
-        const uint32_t ceiling = strcmp(reason, "connect refused") == 0 ?
+        // A serial router is either listening on the port or about to be: retry promptly
+        const uint32_t ceiling = (strcmp(reason, "connect refused") == 0 || isSerialLink()) ?
             RECONNECT_DELAY_REFUSED_MAX_MS : RECONNECT_DELAY_MAX_MS;
         _reconnectDelayMs = _reconnectDelayMs * 2 > ceiling ? ceiling : _reconnectDelayMs * 2;
     }
+    if (_pSerialLink)
+        _pSerialLink->stop();
     if (_sock >= 0)
     {
         const int64_t closeUs = esp_timer_get_time();
@@ -574,12 +707,12 @@ void RaftROS::closeConnection(const char* reason)
         // time when no host is reading the USB-Serial-JTAG port
         if (_active)
         {
-            LOG_W(MODULE_PREFIX, "disconnected from %s:%u (%s%s%d), retrying in %ums", _routerHost.c_str(),
-                  (unsigned)_routerPort, reason, _closeDetail ? " code=" : "", _closeDetail, (unsigned)_reconnectDelayMs);
+            LOG_W(MODULE_PREFIX, "disconnected from %s (%s%s%d), retrying in %ums", routerLabel().c_str(),
+                  reason, _closeDetail ? " code=" : "", _closeDetail, (unsigned)_reconnectDelayMs);
         }
         else
         {
-            LOG_I(MODULE_PREFIX, "disconnected from %s:%u (%s)", _routerHost.c_str(), (unsigned)_routerPort, reason);
+            LOG_I(MODULE_PREFIX, "disconnected from %s (%s)", routerLabel().c_str(), reason);
         }
         _connState = ConnState::DISCONNECTED;
     }
@@ -602,6 +735,290 @@ void RaftROS::closeConnection(const char* reason)
         if (slot.state != ServiceSlot::State::FREE)
             slot.state = ServiceSlot::State::PENDING_KEYEXPR;
     _lastConnectAttemptMs = millis();
+}
+
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+// Serial link (USB-Serial-JTAG)
+/////////////////////////////////////////////////////////////////////////////////////////////////////////////////
+
+String RaftROS::routerLabel() const
+{
+    if (isSerialLink())
+        return "usb-serial-jtag";
+    char label[24];
+    snprintf(label, sizeof(label), "%s:%u", _routerHost.c_str(), (unsigned)_routerPort);
+    return label;
+}
+
+#if RAFTROS_USB_LINK_AVAILABLE
+int RaftROS::UsbJtagPort::read(uint8_t* buf, size_t len)
+{
+    return usb_serial_jtag_read_bytes(buf, len, 0);
+}
+
+bool RaftROS::UsbJtagPort::write(const uint8_t* buf, size_t len)
+{
+    // The driver's ring takes all of it or none of it
+    return usb_serial_jtag_write_bytes(buf, len, 0) == (int)len;
+}
+
+bool RaftROS::UsbJtagPort::txIdle()
+{
+    // Zero wait: OK only when the TX ring is empty and the host has taken the last packet
+    return usb_serial_jtag_wait_tx_done(0) == ESP_OK;
+}
+#else
+int RaftROS::UsbJtagPort::read(uint8_t*, size_t) { return -1; }
+bool RaftROS::UsbJtagPort::write(const uint8_t*, size_t) { return false; }
+bool RaftROS::UsbJtagPort::txIdle() { return false; }
+#endif
+
+namespace
+{
+/// Log lines waiting to go onto the serial link (linkLogs).  Filled from any
+/// task that logs, drained by the loop task between frames.
+class LinkLogMirror : public LoggerBase
+{
+public:
+    LinkLogMirror() : LoggerBase(RaftJson("{}")) {}
+    void LOGGING_FUNCTION_DECORATOR log(esp_log_level_t /*level*/, const char* /*tag*/, const char* msg) override
+    {
+        if (isPaused())
+            return;
+        const size_t length = strlen(msg);
+        portENTER_CRITICAL(&_lock);
+        if (length + 1 <= sizeof(_ring) - _used)
+        {
+            for (size_t index = 0; index < length; ++index)
+                push(msg[index]);
+            if (length == 0 || msg[length - 1] != '\n')
+                push('\n');
+        }
+        else
+            ++_dropped;
+        portEXIT_CRITICAL(&_lock);
+    }
+    /// @brief Copy out whole lines, up to capacity.  @return bytes copied
+    size_t peekLines(char* out, size_t capacity)
+    {
+        portENTER_CRITICAL(&_lock);
+        size_t count = 0, lastLineEnd = 0;
+        for (size_t index = 0; index < _used && count < capacity; ++index)
+        {
+            out[count] = _ring[(_tail + index) % sizeof(_ring)];
+            if (out[count++] == '\n')
+                lastLineEnd = count;
+        }
+        portEXIT_CRITICAL(&_lock);
+        // A line longer than the buffer goes in pieces rather than blocking the rest
+        return lastLineEnd ? lastLineEnd : (count == capacity ? count : 0);
+    }
+    void consume(size_t count)
+    {
+        portENTER_CRITICAL(&_lock);
+        _tail = (_tail + count) % sizeof(_ring);
+        _used -= count;
+        portEXIT_CRITICAL(&_lock);
+    }
+private:
+    void push(char c) { _ring[(_tail + _used++) % sizeof(_ring)] = c; }
+    char _ring[2048] = {};
+    size_t _tail = 0, _used = 0;
+    uint32_t _dropped = 0;
+    portMUX_TYPE _lock = portMUX_INITIALIZER_UNLOCKED;
+};
+LinkLogMirror* s_linkLogMirror = nullptr;
+}
+
+const char* RaftROS::serialLinkUnavailableReason()
+{
+#if RAFTROS_USB_LINK_AVAILABLE
+    return nullptr;
+#elif !SOC_USB_SERIAL_JTAG_SUPPORTED
+    return "this chip has no USB-Serial-JTAG port";
+#elif !defined(CONFIG_RAFTROS_ZENOH_SERIAL_LINK)
+    return "serial link support is not built in (CONFIG_RAFTROS_ZENOH_SERIAL_LINK)";
+#else
+    return "the console is on USB-Serial-JTAG and this RaftCore has no RaftConsolePort to "
+           "take the port over - update RaftCore";
+#endif
+}
+
+/// @brief Take the USB port from the console, if the console is on it:
+/// SerialConsole stops reading and writing it, and every other console
+/// writer is silenced.  Held for as long as the link is the serial one.
+/// @param why (out) the reason when the port cannot be taken
+bool RaftROS::claimUsbPort(const char*& why)
+{
+#if RAFTROS_CAN_CLAIM_CONSOLE
+    if (_usbPortClaimed)
+        return true;
+    SysManagerIF* pSysManager = getSysManager();
+    if (pSysManager && pSysManager->getSysMod("SerialConsole") &&
+        pSysManager->sendCmdJSON("SerialConsole", R"({"cmd":"releasePort"})") != RaftRetCode::RAFT_OK)
+    {
+        why = "SerialConsole cannot release the port (it needs the releasePort command - update RaftSysMods)";
+        return false;
+    }
+    // Last words on the console: once claimed, nothing else reaches the port
+    LOG_I(MODULE_PREFIX, "serial link: taking the USB port from the console - to get the console back, "
+          "with the router stopped, type ros/set?link=tcp in a terminal on the port");
+    RaftConsolePort::claim(CONSOLE_OWNER);
+    _usbPortClaimed = true;
+#endif
+    return true;
+}
+
+/// @brief Give the USB port back to the console
+void RaftROS::releaseUsbPort()
+{
+#if RAFTROS_CAN_CLAIM_CONSOLE
+    if (!_usbPortClaimed)
+        return;
+    RaftConsolePort::release(CONSOLE_OWNER);
+    SysManagerIF* pSysManager = getSysManager();
+    if (pSysManager && pSysManager->getSysMod("SerialConsole"))
+        pSysManager->sendCmdJSON("SerialConsole", R"({"cmd":"reclaimPort"})");
+    _usbPortClaimed = false;
+    LOG_I(MODULE_PREFIX, "serial link: USB port given back to the console");
+#endif
+}
+
+/// @brief A line of text typed at a terminal on the port while the link has
+/// it.  Only RaftROS's own configuration commands are acted on (frame bytes
+/// can look like text by chance): "ros/set?..." and "ros/clear", as the REST
+/// API takes them - so ros/set?link=tcp gives the console back.
+bool RaftROS::onConsoleLine(const char* line)
+{
+    if (!line || !(strncmp(line, "ros/set?", 8) == 0 || strcmp(line, "ros/clear") == 0))
+        return false;
+    RestAPIEndpointManager* pEndpoints = getRestAPIEndpointManager();
+    if (!pEndpoints)
+        return false;
+    String response;
+    pEndpoints->handleApiRequest(line, response, APISourceInfo(0));
+    return true;
+}
+
+/// @brief Install the USB-Serial-JTAG driver and allocate the link (both
+/// once), then start the link handshake
+/// @return true if the handshake started
+bool RaftROS::startSerialLink()
+{
+#if RAFTROS_USB_LINK_AVAILABLE
+    const char* why = nullptr;
+    if (!claimUsbPort(why))
+    {
+        if (!_serialUnavailableLogged)
+            LOG_E(MODULE_PREFIX, "link usbjtag not possible: %s - node cannot connect", why);
+        _serialUnavailableLogged = true;
+        return false;
+    }
+    if (!_usbDriverReady)
+    {
+        if (!usb_serial_jtag_is_driver_installed())
+        {
+            usb_serial_jtag_driver_config_t config = {};
+            config.tx_buffer_size = SERIAL_RING_BYTES;
+            config.rx_buffer_size = SERIAL_RING_BYTES;
+            const esp_err_t err = usb_serial_jtag_driver_install(&config);
+            if (err != ESP_OK)
+            {
+                if (!_serialUnavailableLogged)
+                    LOG_E(MODULE_PREFIX, "serial link: USB-Serial-JTAG driver install failed err=%d", (int)err);
+                _serialUnavailableLogged = true;
+                return false;
+            }
+        }
+        _usbDriverReady = true;
+        LOG_I(MODULE_PREFIX, "serial link on USB-Serial-JTAG%s - waiting for a router listening on the port",
+              _linkLogs ? " with log lines between frames (bridge tool only)" : "");
+    }
+    if (!_pSerialLink)
+    {
+        _pSerialLink.reset(new (std::nothrow) RaftRuntime::Zenoh::ZenohSerialLink<UsbJtagPort>(_usbPort));
+#if RAFTROS_USB_LINK_SHARES_CONSOLE
+        if (_pSerialLink)
+            _pSerialLink->setTextLineHandler([](void* context, const char* line) {
+                return static_cast<RaftROS*>(context)->onConsoleLine(line);
+            }, this);
+#endif
+    }
+    if (!_pSerialLink)
+    {
+        if (!_serialUnavailableLogged)
+            LOG_E(MODULE_PREFIX, "serial link: no memory for the link buffers");
+        _serialUnavailableLogged = true;
+        return false;
+    }
+    updateLinkLogMirror();
+    _pSerialLink->start(millis());
+    return true;
+#else
+    if (!_serialUnavailableLogged)
+        LOG_E(MODULE_PREFIX, "link usbjtag not possible: %s - node cannot connect", serialLinkUnavailableReason());
+    _serialUnavailableLogged = true;
+    return false;
+#endif
+}
+
+/// @brief Create, resume or pause the copy of log lines onto the link, to
+/// match linkLogs and the current link
+void RaftROS::updateLinkLogMirror()
+{
+    const bool wanted = _linkLogs && isSerialLink() && _usbDriverReady;
+    if (wanted && !s_linkLogMirror)
+    {
+        s_linkLogMirror = new (std::nothrow) LinkLogMirror();
+        if (s_linkLogMirror)
+            loggerCore.addLogger(s_linkLogMirror);
+    }
+    if (s_linkLogMirror)
+        s_linkLogMirror->setPaused(!wanted);
+}
+
+/// @brief Run the link handshake; once the router has answered, open the session
+void RaftROS::stepSerialLink()
+{
+    const uint32_t nowMs = millis();
+    // Data frames before our session exists belong to an old one: drop them
+    auto& link = *_pSerialLink;
+    if (!link.service(nowMs, SERIAL_RX_BUDGET_BYTES, [](const uint8_t*, size_t) { return true; }))
+    {
+        closeConnection("serial link lost");
+        return;
+    }
+    if (!link.up())
+    {
+        if (Raft::isTimeout(nowMs, _connectStartedMs, CONNECT_TIMEOUT_MS))
+            closeConnection("no answer on serial link");
+        return;
+    }
+    if (!_session.start(_identity, nowMs, RaftRuntime::Zenoh::ZenohSerialFrame::MAX_PAYLOAD))
+    {
+        closeConnection("session start refused");
+        return;
+    }
+    _nodeTokenState = NodeTokenState::PENDING;
+    _pendingInterestCount = 0;
+    _connState = ConnState::HANDSHAKE;
+    LOG_I(MODULE_PREFIX, "serial link up after %u init frame(s), opening session", (unsigned)link.initsSent());
+}
+
+/// @brief Put waiting log lines on the link as text followed by a delimiter,
+/// so the bridge tool sees them as a chunk that is not a frame.  Only whole
+/// frames are ever written, so text cannot land inside one.
+void RaftROS::drainLinkLogs()
+{
+    if (!s_linkLogMirror || !_usbDriverReady)
+        return;
+    char text[256];
+    const size_t length = s_linkLogMirror->peekLines(text, sizeof(text) - 1);
+    if (length == 0)
+        return;
+    text[length] = '\0';
+    if (_usbPort.write(reinterpret_cast<const uint8_t*>(text), length + 1))
+        s_linkLogMirror->consume(length);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -633,6 +1050,29 @@ void RaftROS::noteConnectFailure(const char* reason)
 /// three together measured 53 ms in one pass - over the 50 ms loop contract.
 void RaftROS::warnRouterUnreachable()
 {
+    if (isSerialLink() && _routerWarnLine >= 1 && _routerWarnLine <= 2)
+    {
+        if (_routerWarnLine == 1)
+        {
+            LOG_W(MODULE_PREFIX,
+                  "ROUTER UNREACHABLE: no answer on the USB serial link - %u attempts over %us, last: %s. Nothing reaches ROS 2 until this is fixed.",
+                  (unsigned)_connectFailures, (unsigned)((millis() - _firstFailureMs) / 1000), _lastFailureReason);
+        }
+        else
+        {
+            uint8_t mac[6] = {};
+            esp_read_mac(mac, ESP_MAC_WIFI_STA);
+            LOG_W(MODULE_PREFIX,
+                  "ROUTER UNREACHABLE: the router must listen on this board's port, e.g. listen endpoint "
+                  "\"serial//dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_%02X:%02X:%02X:%02X:%02X:%02X-if00#baudrate=921600\" "
+                  "in the rmw_zenohd config, with nothing else holding the port (or tools/zenoh_serial_link.py bridge).",
+                  mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            _routerWarnLine = 4;
+            return;
+        }
+        ++_routerWarnLine;
+        return;
+    }
     switch (_routerWarnLine)
     {
         case 1:
@@ -640,8 +1080,8 @@ void RaftROS::warnRouterUnreachable()
             const bool refused = strcmp(_lastFailureReason, "connect refused") == 0;
             const uint32_t forSecs = (millis() - _firstFailureMs) / 1000;
             LOG_W(MODULE_PREFIX,
-                  "ROUTER UNREACHABLE: %s:%u - %u attempts over %us, last: %s. %s Nothing reaches ROS 2 until this is fixed.",
-                  _routerHost.c_str(), (unsigned)_routerPort, (unsigned)_connectFailures, (unsigned)forSecs,
+                  "ROUTER UNREACHABLE: %s - %u attempts over %us, last: %s. %s Nothing reaches ROS 2 until this is fixed.",
+                  routerLabel().c_str(), (unsigned)_connectFailures, (unsigned)forSecs,
                   _lastFailureReason,
                   refused ? "The host answers but no router is listening there - start one with: ros2 run rmw_zenoh_cpp rmw_zenohd"
                           : "The host is not answering - is this the right address for this network?");
@@ -1104,8 +1544,11 @@ int RaftROS::addService(const char* name, const char* type, ServiceHandler handl
         return -1;
     }
     // ROS service names are absolute; accept a missing leading slash
+    // "~/x" is relative to this node; otherwise absolute (a missing leading
+    // slash is added)
+    const String expanded = RaftROSNodeName_expandService(name, _nodeNamespace, _nodeName);
     char rosName[AUTOPUB_SERVICE_NAME_MAX];
-    if (snprintf(rosName, sizeof(rosName), "%s%s", name[0] == '/' ? "" : "/", name) >= (int)sizeof(rosName))
+    if (snprintf(rosName, sizeof(rosName), "%s", expanded.c_str()) >= (int)sizeof(rosName))
         return -1;
 
     const uint8_t slot = _services.add(rosName, kind, std::move(handler));
@@ -1326,10 +1769,7 @@ void RaftROS::setupParameters()
             [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.describe(r, n, o, c); }},
     };
     // <ns>/<node>: the namespace already ends in '/' when it is the root
-    String node = _nodeNamespace;
-    if (!node.endsWith("/"))
-        node += "/";
-    node += _nodeName;
+    const String node = RaftROSNodeName_path(_nodeNamespace, _nodeName);
     for (const ParamService& svc : services)
     {
         const String name = node + "/" + svc.name;
@@ -1526,6 +1966,25 @@ void RaftROS::applyPendingConfig()
         if (_connState != ConnState::DISCONNECTED)
             closeConnection("router address changed");
     }
+    if (cfg.hasLink && cfg.link != _linkType)
+    {
+        // Close over the old link first; the loop then connects over the new one
+        if (_connState != ConnState::DISCONNECTED)
+            closeConnection("link changed");
+        if (cfg.link != RaftROSLinkType::USB_JTAG)
+            releaseUsbPort();
+        _linkType = cfg.link;
+        _connectFailures = 0;
+        _firstFailureMs = 0;
+        _routerWarnLine = 0;
+        _serialUnavailableLogged = false;
+        _reconnectDelayMs = RECONNECT_DELAY_MIN_MS;
+        _lastConnectAttemptMs = 0;
+    }
+    if (cfg.hasLinkLogs)
+        _linkLogs = cfg.linkLogs;
+    if (cfg.hasLink || cfg.hasLinkLogs)
+        updateLinkLogMirror();
     if (cfg.hasActive)
     {
         if (cfg.active && !_active)
@@ -1543,12 +2002,16 @@ void RaftROS::applyPendingConfig()
             changes += String(changes.length() > 1 ? "," : "") + "\"routerPort\":" + String(cfg.routerPort);
         if (cfg.hasActive)
             changes += String(changes.length() > 1 ? "," : "") + "\"active\":" + (cfg.active ? "1" : "0");
+        if (cfg.hasLink)
+            changes += String(changes.length() > 1 ? "," : "") + "\"link\":\"" + RaftROSLink_name(cfg.link) + "\"";
+        if (cfg.hasLinkLogs)
+            changes += String(changes.length() > 1 ? "," : "") + "\"linkLogs\":" + (cfg.linkLogs ? "1" : "0");
         changes += "}";
         if (changes.length() > 2)
             persistSettings(changes.c_str());
     }
-    LOG_I(MODULE_PREFIX, "config applied active=%d router=%s:%u%s", (int)_active, _routerHost.c_str(),
-          (unsigned)_routerPort, cfg.persist ? " (persisted)" : "");
+    LOG_I(MODULE_PREFIX, "config applied active=%d link=%s router=%s%s", (int)_active, RaftROSLink_name(_linkType),
+          routerLabel().c_str(), cfg.persist ? " (persisted)" : "");
 }
 
 /// @brief Switch to a router address set through the parameter service, once
@@ -1582,7 +2045,7 @@ void RaftROS::addRestAPIEndpoints(RestAPIEndpointManager& endpointManager)
                                 std::bind(&RaftROS::apiRos, this,
                                           std::placeholders::_1, std::placeholders::_2,
                                           std::placeholders::_3),
-                                "ros - status; ros/set?active=0|1&routerHost=<ipv4>&routerPort=<n>&persist=0|1 - configure (applied at once, persist=1 keeps it); ros/clear - remove persisted settings");
+                                "ros - status; ros/set?active=0|1&routerHost=<ipv4>&routerPort=<n>&link=tcp|usbjtag&linkLogs=0|1&persist=0|1 - configure (applied at once, persist=1 keeps it); ros/clear - remove persisted settings");
 }
 
 /// @brief /api/ros, /api/ros/set and /api/ros/clear.  Runs on whichever task
@@ -1631,6 +2094,21 @@ RaftRetCode RaftROS::apiRos(const String& reqStr, String& respStr, const APISour
                 cfg.hasRouterPort = true;
                 cfg.routerPort = (uint32_t)port;
             }
+            else if (nv.name.equalsIgnoreCase("link"))
+            {
+                if (!RaftROSLink_fromName(nv.value.c_str(), cfg.link))
+                    return Raft::setJsonErrorResult(reqStr.c_str(), respStr, "link must be tcp or usbjtag");
+                // Refuse a serial link this image cannot use, so a persisted
+                // setting never names one
+                if (cfg.link == RaftROSLinkType::USB_JTAG && serialLinkUnavailableReason())
+                    return Raft::setJsonErrorResult(reqStr.c_str(), respStr, serialLinkUnavailableReason());
+                cfg.hasLink = true;
+            }
+            else if (nv.name.equalsIgnoreCase("linkLogs"))
+            {
+                cfg.hasLinkLogs = true;
+                cfg.linkLogs = nv.value == "1" || nv.value.equalsIgnoreCase("true");
+            }
             else if (nv.name.equalsIgnoreCase("persist"))
             {
                 cfg.persist = nv.value == "1" || nv.value.equalsIgnoreCase("true");
@@ -1638,12 +2116,12 @@ RaftRetCode RaftROS::apiRos(const String& reqStr, String& respStr, const APISour
             else
             {
                 return Raft::setJsonErrorResult(reqStr.c_str(), respStr,
-                        "unknown key - use active, routerHost, routerPort, persist");
+                        "unknown key - use active, routerHost, routerPort, link, linkLogs, persist");
             }
         }
-        if (!cfg.hasActive && !cfg.hasRouterHost && !cfg.hasRouterPort)
+        if (!cfg.hasActive && !cfg.hasRouterHost && !cfg.hasRouterPort && !cfg.hasLink && !cfg.hasLinkLogs)
             return Raft::setJsonErrorResult(reqStr.c_str(), respStr,
-                    "nothing to set - use ros/set?active=0|1&routerHost=<ipv4>&routerPort=<n>&persist=0|1");
+                    "nothing to set - use ros/set?active=0|1&routerHost=<ipv4>&routerPort=<n>&link=tcp|usbjtag&linkLogs=0|1&persist=0|1");
     }
     else
     {
@@ -1660,16 +2138,16 @@ String RaftROS::getStatusJSON() const
     const char* stStr = "off";
     switch (_connState)
     {
-        case ConnState::DISCONNECTED: stStr = !_active ? "inactive" : !_routerAddrValid ? "unconfigured" : "disconnected"; break;
+        case ConnState::DISCONNECTED: stStr = !_active ? "inactive" : (!_routerAddrValid && !isSerialLink()) ? "unconfigured" : "disconnected"; break;
         case ConnState::CONNECTING:   stStr = "connecting"; break;
         case ConnState::HANDSHAKE:    stStr = "handshake"; break;
         case ConnState::READY:        stStr = "ready"; break;
     }
     const auto stats = _autoPubBackend.stats();
     const auto svcStats = _services.stats();
-    char buf[700];
-    snprintf(buf, sizeof(buf),
-             R"({"rslt":"ok","backend":"zenoh","en":%s,"active":%s,"routerConfigured":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s:%u",)"
+    char buf[1000];
+    const int len = snprintf(buf, sizeof(buf),
+             R"({"rslt":"ok","backend":"zenoh","en":%s,"active":%s,"routerConfigured":%s,"domId":%d,"node":"%s","ns":"%s","router":"%s",)"
              R"("conn":"%s","sessions":%u,"devices":%u,"pubs":%u,"pending":%u,"samples":%u,"redecl":%u,)"
              R"("subs":%u,"rxDropped":%u,"intRefused":%u,"stackFreeB":%u,)"
              R"("routerSource":"%s","routerReachable":%s,"connectFails":%u,"lastSessionAgoS":%d,)"
@@ -1678,11 +2156,11 @@ String RaftROS::getStatusJSON() const
              R"("svcRefused":%u,"svcUnknownKey":%u,"params":%u})",
              _active ? "true" : "false",
              _active ? "true" : "false",
-             _routerAddrValid ? "true" : "false",
+             (_routerAddrValid || isSerialLink()) ? "true" : "false",
              (int)_domainId,
              _nodeName.c_str(),
              _nodeNamespace.c_str(),
-             _routerHost.c_str(), (unsigned)_routerPort,
+             routerLabel().c_str(),
              stStr,
              (unsigned)_sessionCount,
              (unsigned)_autoPubSource.attachedCount(),
@@ -1714,7 +2192,71 @@ String RaftROS::getStatusJSON() const
              (unsigned)(svcStats.refusedBusy + svcStats.refusedBad + svcStats.refusedByHandler),
              (unsigned)_requestsUnknownKey,
              (unsigned)_params.count());
-    return buf;
+    String json = buf;
+    if (len > 0 && (size_t)len < sizeof(buf) && json.endsWith("}"))
+    {
+        json = json.substring(0, json.length() - 1);
+        appendSerialStats(json);
+        json += "}";
+    }
+    return json;
+}
+
+/// @brief Append ,"link":... and, once the serial link has been used, its
+/// counters: frames each way, frames that failed to decode, link handshakes
+/// (sent, held back while the last was still queued, completed), resets from
+/// the router and frames held back for TX room
+void RaftROS::appendSerialStats(String& json) const
+{
+    char buf[400];
+    const char* why = serialLinkUnavailableReason();
+    snprintf(buf, sizeof(buf), R"(,"link":"%s","linkLogs":%s,"batch":%u,"serialAvailable":%s,"serialUnavailableReason":"%s")",
+             RaftROSLink_name(_linkType), _linkLogs ? "true" : "false", (unsigned)_session.negotiatedBatch(),
+             why ? "false" : "true", why ? why : "");
+    json += buf;
+    if (!_pSerialLink)
+        return;
+    const auto& link = *_pSerialLink;
+    const auto& decoder = link.decoder();
+    snprintf(buf, sizeof(buf),
+             R"(,"serIn":%u,"serOut":%u,"serBytesIn":%u,"serBytesOut":%u,)"
+             R"("serCrcErr":%u,"serBadFrame":%u,"serInits":%u,"serInitsHeld":%u,"serLinkUps":%u,"serResets":%u,"serTxFull":%u)",
+             (unsigned)link.framesIn(), (unsigned)link.framesOut(),
+             (unsigned)link.bytesIn(), (unsigned)link.bytesOut(),
+             (unsigned)decoder.crcErrors(), (unsigned)(decoder.malformed() + decoder.oversize()),
+             (unsigned)link.initsSent(), (unsigned)link.initsHeld(), (unsigned)link.linkUps(),
+             (unsigned)link.resetsReceived(), (unsigned)link.txFull());
+    json += buf;
+}
+
+/// @brief Park a link change for the loop.  Runs on whichever task calls it
+/// (a REST handler, typically), so it only checks and hands over.
+bool RaftROS::requestLinkConfig(const RaftROSLinkConfig& config, String& error)
+{
+    if (!config.hasLink && !config.hasLinkLogs)
+    {
+        error = "nothing to change - give a link and/or linkLogs";
+        return false;
+    }
+    if (config.hasLink && config.link == RaftROSLinkType::USB_JTAG && serialLinkUnavailableReason())
+    {
+        error = serialLinkUnavailableReason();
+        return false;
+    }
+    if (_pendingConfigReady.load(std::memory_order_acquire))
+    {
+        error = "busy - a change is still being applied";
+        return false;
+    }
+    PendingConfig cfg;
+    cfg.hasLink = config.hasLink;
+    cfg.link = config.link;
+    cfg.hasLinkLogs = config.hasLinkLogs;
+    cfg.linkLogs = config.linkLogs;
+    cfg.persist = config.persist;
+    _pendingConfig = cfg;
+    _pendingConfigReady.store(true, std::memory_order_release);
+    return true;
 }
 
 RaftRetCode RaftROS::apiStatus(const String& /*reqStr*/, String& respStr, const APISourceInfo& /*sourceInfo*/)

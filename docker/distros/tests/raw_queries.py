@@ -1,9 +1,23 @@
-# Raw Zenoh queries at the device's /raft_esp32/devices Trigger service through the
+# Raw Zenoh queries at the device's <node>/devices Trigger service through the
 # local router: a proper request, an empty one, one over the device's 512 B request
 # limit and one over its 2 kB receive cap.  The caller checks the session survived.
-import time, zenoh
-KEY = "0/raft_esp32/devices/std_srvs::srv::dds_::Trigger_/RIHS01_eeff2cd6fa5ad9d27cdf4dec64818317839b62f212a91e6b5304b634b2062c5f"
+# Usage: raw_queries.py [node]   (default: the node that serves a .../devices Trigger)
+import sys, time, zenoh
+TRIGGER = "std_srvs::srv::dds_::Trigger_/RIHS01_eeff2cd6fa5ad9d27cdf4dec64818317839b62f212a91e6b5304b634b2062c5f"
 s = zenoh.open(zenoh.Config.from_json5('{"mode":"client","connect":{"endpoints":["tcp/127.0.0.1:7447"]}}'))
+node = sys.argv[1].strip("/") if len(sys.argv) > 1 else None
+if not node:
+    # A service server token (SS) names the service: %<node>%devices
+    for r in s.liveliness().get("@ros2_lv/0/**", timeout=3.0):
+        try:
+            k = str(r.ok.key_expr)
+        except Exception:
+            continue
+        if "/SS/" in k and "%devices/std_srvs::srv::dds_::Trigger_" in k:
+            node = k.split("/SS/")[1].split("/")[2].strip("%").split("%")[0]
+            break
+KEY = "0/%s/devices/%s" % (node, TRIGGER)
+print("RAW target %s" % KEY, flush=True)
 cases = [("proper 5 B", b"\x00\x01\x00\x00\x00"), ("empty 0 B", b""),
          ("oversized 900 B", b"\x00\x01\x00\x00" + bytes(896)), ("huge 3000 B", b"\x00\x01\x00\x00" + bytes(2996))]
 for name, payload in cases:

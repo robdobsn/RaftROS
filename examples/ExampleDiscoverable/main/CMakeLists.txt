@@ -11,5 +11,4 @@ idf_component_register(
         RaftI2C
         RaftROS
         MainSysMod
-        esp_driver_gpio
 )

@@ -29,6 +29,7 @@
 #pragma once
 
 #include "RaftROSBackendSelect.h"
+#include "RaftROSLink.h"
 #if !RAFTROS_BACKEND_ZENOH_PICO
     #error "RaftROSZenohPico.h is the zenoh-pico build's SysMod - include RaftROS.h, which selects the backend"
 #endif
@@ -128,6 +129,15 @@ public:
     }
     bool isChatterEnabled() const { return _chatterEnabled; }
     uint8_t attachedDeviceCount() const { return _autoPubSource.attachedCount(); }
+
+    // ---- Link to the router ----
+    // Only the Zenoh build has a choice of link; here a change is refused with
+    // the reason, so application code that switches links builds against any backend.
+    bool requestLinkConfig(const RaftROSLinkConfig& /*config*/, String& error)
+    {
+        error = "the zenoh-pico build has no link choice - its transport is tcp";
+        return false;
+    }
 
     static RaftSysMod* create(const char* pModuleName, RaftJsonIF& sysConfig)
     {

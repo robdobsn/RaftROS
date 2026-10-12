@@ -64,7 +64,7 @@ something. It runs as designed instead:
 It worked first time with the unmodified ROS layer. That is independent
 confirmation that the clean-room ROS mapping (tokens, keys, type hashes,
 attachments, CDR) is right, because only the session changed. Node, topics,
-10 services (including the deferred `/raft_esp32/range`), parameters
+10 services (including the deferred `/<node>/range`), parameters
 (list/get/set/describe/dump, refusals) and inbound `/chatter_in` all behaved
 as on the clean-room build.
 
@@ -79,7 +79,7 @@ and both builds must pay that equally. Logs went to Raft's `RaftRemote` TCP
 logger instead, and SysMan's statistics window was set to 660 s
 (`/api/sysman?interval=660`), so one heartbeat covers each whole run. The
 load (`~/ab_load.sh` on the ROS box) was 600 s of a `ros2 topic hz` subscriber
-on `/raft/range_1_29`, plus every ~5 s a deferred `/raft_esp32/range` call, a
+on `/raft/range_1_29`, plus every ~5 s a deferred `/<node>/range` call, a
 `param get` and a `param set`. The TCP logger allocates a 16 kB buffer once a
 client connects, on both builds, so the heap figures in the load table are
 16 kB lower than usual.

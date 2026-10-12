@@ -7,6 +7,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "RaftROSRTPS.h"
+#include "RaftROSNodeName.h"
 #include "runtime/dispatch/RTPSUserDispatch.h"
 #include "runtime/autopub/RTPSAutoPubTopicNaming.h"
 #include "runtime/autopub/RTPSAutoPubClassMap.h"
@@ -216,7 +217,15 @@ void RaftROS::setup()
     // Configure from JSON config (with defaults)
     _isEnabled = configGetBool("enable", false);
     _domainId = configGetLong("domainId", 0);
-    _nodeName = configGetString("nodeName", "raft_esp32");
+    // "nodeName" if configured; otherwise the node is named after the device
+    // (Raft's friendly name - see RaftROSNodeName.h), so boards sharing an
+    // image are distinct nodes
+    _nodeName = configGetString("nodeName", "");
+    if (_nodeName.length() == 0)
+    {
+        bool friendlyNameSet = false;
+        _nodeName = RaftROSNodeName_sanitise(getFriendlyName(friendlyNameSet));
+    }
     _nodeNamespace = configGetString("nodeNamespace", "/");
     _leaseDurationSec = configGetLong("leaseDurationSec", 120);
     _spdpIntervalMs = configGetLong("spdpIntervalMs", 30000);

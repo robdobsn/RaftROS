@@ -484,11 +484,11 @@ loop():            Service RTPS connection state machine:
   "RaftROS": {
     "enable": true,
     "domainId": 0,
-    "nodeName": "raft_esp32",
+    "nodeName": "my_robot",
     "topics": [
       {
         "name": "imu",
-        "path": "/raft_esp32/imu",
+        "path": "/my_robot/imu",
         "msgType": "sensor_msgs/msg/Imu",
         "qos": "best_effort",
         "inbound": false,
@@ -534,10 +534,10 @@ Auto-generated topics would follow a consistent naming scheme:
 
 Examples:
 ```
-/raft_esp32_abc123/i2c/LSM6DS/imu          → sensor_msgs/msg/Imu
-/raft_esp32_abc123/i2c/BMP280/temperature   → sensor_msgs/msg/Temperature
-/raft_esp32_abc123/i2c/BMP280/pressure      → sensor_msgs/msg/FluidPressure
-/raft_esp32_abc123/ble/BTHome_TH/temperature → sensor_msgs/msg/Temperature
+/<node>/i2c/LSM6DS/imu          → sensor_msgs/msg/Imu
+/<node>/i2c/BMP280/temperature   → sensor_msgs/msg/Temperature
+/<node>/i2c/BMP280/pressure      → sensor_msgs/msg/FluidPressure
+/<node>/ble/BTHome_TH/temperature → sensor_msgs/msg/Temperature
 ```
 
 #### 3.4.3 Service Generation from Device Actions
@@ -545,14 +545,14 @@ Examples:
 DeviceTypeRecord `actions` become ROS 2 services:
 
 ```
-/raft_esp32_abc123/i2c/PCA9685/set_servo    → custom_interfaces/srv/SetServo
-/raft_esp32_abc123/i2c/NeoPixel/set_color   → custom_interfaces/srv/SetColor
+/<node>/i2c/PCA9685/set_servo    → custom_interfaces/srv/SetServo
+/<node>/i2c/NeoPixel/set_color   → custom_interfaces/srv/SetColor
 ```
 
 For maximum compatibility without custom message packages, generic service types could be used:
 
 ```
-/raft_esp32_abc123/device_command  → rcl_interfaces/srv/SetParameters
+/<node>/device_command  → rcl_interfaces/srv/SetParameters
 ```
 
 #### 3.4.4 Dynamic Topic Lifecycle
@@ -653,7 +653,7 @@ This path leverages the existing StatePublisher infrastructure, adding RTPS as a
 
 RaftROS could expose an enhanced self-description capability beyond standard ROS:
 
-- **Node graph info:** Respond to standard `ros2 node info /raft_esp32_xyz` queries
+- **Node graph info:** Respond to standard `ros2 node info /<node>` queries
 - **Parameter server:** Expose device configuration as ROS 2 parameters
 - **Device metadata topic:** Publish a custom topic with complete DeviceTypeRecord information (device name, manufacturer, class, all attributes, available actions) so that ROS-side tools can auto-configure visualization or control interfaces
 - **Diagnostic messages:** Publish `diagnostic_msgs/msg/DiagnosticArray` with bus health, scan statistics, device error counts
@@ -666,7 +666,7 @@ RaftROS could expose an enhanced self-description capability beyond standard ROS
 
 **Goal:** ESP32 appears as a DDS participant visible to `ros2 node list` ✅ COMPLETE
 
-**Deliverable:** Running `ros2 node list` on a host PC (same WiFi network, domain 0) shows `/raft_esp32`.
+**Deliverable:** Running `ros2 node list` on a host PC (same WiFi network, domain 0) shows the node.
 
 **Example project:** `examples/ExampleDiscoverable` — a minimal Raft application that includes the RaftROS SysMod and demonstrates DDS participant discovery (see [§5.2](#52-examplediscoverable--the-phase-1-test-application) for full details).
 
@@ -706,7 +706,7 @@ ESP32 (RaftROS)                                     ROS 2 Host (ros2 node list)
      │     (CDR: participant GID, node name, namespace)      │
      │                                                      │
      │                ros2 node list shows:                  │
-     │                   /raft_esp32                         │
+     │                   /<node>                             │
 ```
 
 #### 5.1.2 SPDP Multicast Details
@@ -830,7 +830,7 @@ The GUID prefix should be unique. Strategy for ESP32:
 | 20 | ACKNACK handling — retransmit on remote NACKs | `RaftROS` | ✅ Done |
 | 21 | Periodic writer heartbeats (all 4 writers) | `RaftROS` | ✅ Done |
 | 22 | WiFi-ready gating (only join multicast after connected) | `RaftROS` | ✅ Done |
-| 23 | Integration test: `ros2 node list` shows `/raft_esp32` | ESP32 + ROS 2 host | ✅ Done |
+| 23 | Integration test: `ros2 node list` shows the node | ESP32 + ROS 2 host | ✅ Done |
 | 24 | Linux standalone test node (`raftros_standalone.cpp`) | `linux_unit_tests/` | ✅ Done |
 
 #### 5.1.8 Phase 1 Key Learnings
@@ -876,8 +876,8 @@ The daemon sends unicast SPDP replies to our metatraffic port (7410), not just t
 
 **On-device testing with ExampleDiscoverable:**
 1. Flash ExampleDiscoverable to ESP32, connect to same WiFi as ROS 2 host
-2. Run `ros2 node list` — verify `/raft_esp32` appears
-3. Run `ros2 topic list` — verify `/raft_esp32/heartbeat` appears
+2. Run `ros2 node list` — verify the node appears
+3. Run `ros2 topic list` — verify `/<node>/heartbeat` appears
 4. Use Wireshark with RTPS dissector to capture and validate SPDP/SEDP packets
 5. Test lease duration — verify the node disappears after the ESP32 is powered off and the lease expires
 6. Test reconnection — power-cycle the ESP32, verify it re-appears
@@ -957,13 +957,13 @@ Add a RaftROS configuration block alongside the existing SysMod configs:
   "RaftROS": {
     "enable": true,
     "domainId": 0,
-    "nodeName": "raft_esp32",
+    "nodeName": "my_robot",
     "spdpAnnounceIntervalMs": 30000,
     "leaseDurationS": 100,
     "topics": [
       {
         "name": "heartbeat",
-        "path": "/raft_esp32/heartbeat",
+        "path": "/my_robot/heartbeat",
         "msgType": "std_msgs/msg/String",
         "qos": "best_effort",
         "inbound": false
@@ -988,7 +988,7 @@ Add a RaftROS configuration block alongside the existing SysMod configs:
 3. On the ROS 2 host (same network):
    $ source /opt/ros/humble/setup.bash
    $ ros2 node list --no-daemon
-   /raft_esp32                          ← SUCCESS: ESP32 is discoverable
+   /<node>                              ← SUCCESS: ESP32 is discoverable
 
    Note: If using FastDDS on the same host as the ESP32 (e.g., WSL2),
    a UDPv4-only profile XML may be needed to disable SHM transport:
@@ -1143,7 +1143,7 @@ remain separate work.
 - Map device actions to services
 - Implement parameter server for device configuration
 
-**Deliverable:** `ros2 service call /raft_esp32/set_servo` controls a servo connected via I2C
+**Deliverable:** `ros2 service call /<node>/set_servo` controls a servo connected via I2C
 
 ### Phase 6: Advanced Features
 

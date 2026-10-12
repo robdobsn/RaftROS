@@ -110,6 +110,7 @@ idf_component_register(
     REQUIRES
       RaftCore
       esp_hw_support
+      esp_driver_usb_serial_jtag
       esp_netif
       esp_timer
       lwip

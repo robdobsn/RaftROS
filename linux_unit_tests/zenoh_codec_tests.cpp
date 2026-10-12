@@ -233,9 +233,9 @@ int main(int argc, char** argv)
                     key[0] == '\0', "unsupported or malformed wire type rejected");
     }
     // A service key carries a "::srv::" type; rmw_zenoh forms it like a topic key
-    TEST_ASSERT(ZenohROSCodec::formatTopicKey(key, sizeof(key), 0, "/raft_esp32/devices",
+    TEST_ASSERT(ZenohROSCodec::formatTopicKey(key, sizeof(key), 0, "/raft_node/devices",
                                               "std_srvs::srv::dds_::Trigger_", stringHash) &&
-                std::string_view(key) == "0/raft_esp32/devices/std_srvs::srv::dds_::Trigger_/" + std::string(stringHash),
+                std::string_view(key) == "0/raft_node/devices/std_srvs::srv::dds_::Trigger_/" + std::string(stringHash),
                 "service wire type forms a key");
     for (const std::string& hash : {
         std::string(), std::string(stringHash).substr(0, 70), std::string(stringHash) + "0",
@@ -275,9 +275,9 @@ int main(int argc, char** argv)
     TEST_ASSERT(ZenohROSCodec::formatNodeToken(key, sizeof(key), 0, sessionId, 0, "/", "/", "listener") &&
                 std::strcmp(key, listenerToken) == 0, "root and default namespaces encode identically");
     TEST_ASSERT(ZenohROSCodec::formatNodeToken(key, sizeof(key), 42, "1", UINT64_MAX,
-                "/fleet/private", "/robot1/sensors", "raft_esp32") &&
+                "/fleet/private", "/robot1/sensors", "raft_node") &&
                 std::strcmp(key, "@ros2_lv/42/1/18446744073709551615/18446744073709551615/NN/"
-                                 "%fleet%private/%robot1%sensors/raft_esp32") == 0,
+                                 "%fleet%private/%robot1%sensors/raft_node") == 0,
                 "node IDs repeated in full and namespaces mangled without key separators");
     const std::string_view invalidSessions[] = {
         "", "0", "000000", "A", "gg", "1/2", "a*", "0123456789abcdef0123456789abcdef0aa"
@@ -398,11 +398,11 @@ int main(int argc, char** argv)
                 std::strcmp(key, publisherToken) == 0,
                 "publisher token matches pinned design example");
 
-    node = {23, "1", 12, "/fleet/private", "/robot1", "raft_esp32"};
+    node = {23, "1", 12, "/fleet/private", "/robot1", "raft_node"};
     endpoint = {34, EndpointKind::Publisher, "/robot1/chatter", stringType, stringHash,
                 {Reliability::BestEffort, Durability::Volatile, 1}};
     const std::string expectedPublisher =
-        "@ros2_lv/23/1/12/34/MP/%fleet%private/%robot1/raft_esp32/%robot1%chatter/" +
+        "@ros2_lv/23/1/12/34/MP/%fleet%private/%robot1/raft_node/%robot1%chatter/" +
         std::string(stringType) + "/" + stringHash + "/2::,1" ":," ":," ":,,";
     TEST_ASSERT(ZenohROSCodec::formatEndpointToken(key, sizeof(key), node, endpoint) && key == expectedPublisher,
                 "publisher owns distinct node and entity IDs, nested names and sensor QoS");
@@ -467,7 +467,7 @@ int main(int argc, char** argv)
         TEST_ASSERT(!ZenohROSCodec::formatEndpointToken(key, sizeof(key), node, endpoint),
                     "endpoint validates node identity");
     }
-    node.nodeName = "raft_esp32";
+    node.nodeName = "raft_node";
     node.nodeNamespace = "/robot/*";
     TEST_ASSERT(!ZenohROSCodec::formatEndpointToken(key, sizeof(key), node, endpoint),
                 "endpoint namespace cannot inject wildcards");

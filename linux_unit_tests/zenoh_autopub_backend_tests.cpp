@@ -93,7 +93,7 @@ ZenohAutoPubBackendDeps makeDeps(ZenohTCPSession& session, uint8_t* sendBuf, uin
     deps.nodeId = 1;
     deps.enclave = "/";
     deps.nodeNamespace = "/";
-    deps.nodeName = "raft_esp32";
+    deps.nodeName = "raft_node";
     return deps;
 }
 
@@ -108,7 +108,7 @@ int main()
     std::printf("Test: backend refuses work before it is configured\n");
     {
         ZenohAutoPubBackend backend;
-        const auto desc = makeDesc("/raft_esp32/range", AutoPubMsgKind::Range);
+        const auto desc = makeDesc("/raft_node/range", AutoPubMsgKind::Range);
         TEST_ASSERT(backend.createPublisher(desc) == ZenohAutoPubBackend::INVALID_SLOT,
                     "createPublisher without setup is refused");
         TEST_ASSERT(backend.publish(0, sendBuf, 4) == AutoPubPublishResult::InvalidHandle,
@@ -122,11 +122,11 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        AutoPubEndpointDesc unknownKind = makeDesc("/raft_esp32/range", AutoPubMsgKind::Range);
+        AutoPubEndpointDesc unknownKind = makeDesc("/raft_node/range", AutoPubMsgKind::Range);
         unknownKind.msgKind = AutoPubMsgKind::Unknown;
         TEST_ASSERT(backend.createPublisher(unknownKind) == ZenohAutoPubBackend::INVALID_SLOT,
                     "a message kind with no ROS type hash cannot be declared");
-        AutoPubEndpointDesc badTopic = makeDesc("raft_esp32/range", AutoPubMsgKind::Range);
+        AutoPubEndpointDesc badTopic = makeDesc("raft_node/range", AutoPubMsgKind::Range);
         TEST_ASSERT(backend.createPublisher(badTopic) == ZenohAutoPubBackend::INVALID_SLOT,
                     "a topic that is not an absolute ROS path is refused");
         TEST_ASSERT(backend.createPublisher(AutoPubEndpointDesc{}) == ZenohAutoPubBackend::INVALID_SLOT,
@@ -141,14 +141,14 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         TEST_ASSERT(slot == 0, "first endpoint takes slot 0");
         TEST_ASSERT(backend.inUseCount() == 1 && backend.pendingCount() == 1 && !backend.isDeclared(slot),
                     "endpoint occupies a slot but is not yet declared");
         TEST_ASSERT(session.outputSize() == 0, "create sends nothing itself");
         const char* key = backend.topicKeyForSlot(slot);
         TEST_ASSERT(key && std::strcmp(key,
-            "23/raft_esp32/range/sensor_msgs::msg::dds_::Range_/"
+            "23/raft_node/range/sensor_msgs::msg::dds_::Range_/"
             "RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a") == 0,
             "topic key carries domain, mangled topic, wire type and ROS type hash");
         TEST_ASSERT(backend.publish(slot, sendBuf, 4) == AutoPubPublishResult::QueueFull,
@@ -157,7 +157,7 @@ int main()
         TEST_ASSERT(backend.service(10), "service sends the staged declaration");
         const auto declared = drain(session);
         TEST_ASSERT(containsText(declared, "@ros2_lv/23/"), "declaration carries a liveliness token");
-        TEST_ASSERT(containsText(declared, "/MP/%/%/raft_esp32/%raft_esp32%range/"),
+        TEST_ASSERT(containsText(declared, "/MP/%/%/raft_node/%raft_node%range/"),
                     "token names this node as a publisher on the mangled topic");
         TEST_ASSERT(containsText(declared, "RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a"),
                     "token carries the ROS type hash");
@@ -173,7 +173,7 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         backend.service(10);
         drain(session);
 
@@ -184,7 +184,7 @@ int main()
                     "declared endpoint accepts a sample");
         TEST_ASSERT(sequence == 1 && peers == 1, "first sample is sequence 1, sent to the router");
         const auto sent = drain(session);
-        TEST_ASSERT(containsText(sent, "23/raft_esp32/range/"), "sample is published on the topic key");
+        TEST_ASSERT(containsText(sent, "23/raft_node/range/"), "sample is published on the topic key");
         TEST_ASSERT(contains(sent, payload, sizeof(payload)), "sample carries the serialised payload");
         const auto* gid = backend.gidForSlot(slot);
         uint8_t expected[ZenohROSCodec::ATTACHMENT_SIZE];
@@ -205,7 +205,7 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         backend.service(10);
         drain(session);
 
@@ -234,7 +234,7 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         backend.service(10);
         drain(session);
         const uint8_t payload[6] = {0, 1, 0, 0, 0x2a, 0x00};
@@ -274,7 +274,7 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         backend.service(10);
         drain(session);
 
@@ -293,7 +293,7 @@ int main()
         TEST_ASSERT(backend.topicKeyForSlot(slot) == nullptr, "a released slot keeps no key");
 
         // A slot destroyed before its declaration went out needs no undeclare
-        const uint8_t second = backend.createPublisher(makeDesc("/raft_esp32/temperature", AutoPubMsgKind::Temperature));
+        const uint8_t second = backend.createPublisher(makeDesc("/raft_node/temperature", AutoPubMsgKind::Temperature));
         TEST_ASSERT(second == slot, "a released slot is reused");
         backend.destroyPublisher(second);
         TEST_ASSERT(backend.inUseCount() == 0 && !backend.service(12) && session.outputSize() == 0,
@@ -308,7 +308,7 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t slot = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t slot = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         const std::string firstToken = backend.topicKeyForSlot(slot) ?
             std::string(backend.tokenKeyForSlot(slot) ? backend.tokenKeyForSlot(slot) : "") : "";
         backend.service(10);
@@ -317,7 +317,7 @@ int main()
         backend.destroyPublisher(slot);
         backend.service(11);
         drain(session);
-        const uint8_t reused = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
+        const uint8_t reused = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
         backend.service(12);
         TEST_ASSERT(reused == slot && declaredToken != backend.tokenKeyForSlot(reused),
                     "a reused slot declares a new entity id, so it is not confused with the old endpoint");
@@ -331,8 +331,8 @@ int main()
         establish(session);
         ZenohAutoPubBackend backend;
         backend.setup(makeDeps(session, sendBuf, sizeof(sendBuf)));
-        const uint8_t range = backend.createPublisher(makeDesc("/raft_esp32/range", AutoPubMsgKind::Range));
-        const uint8_t temp = backend.createPublisher(makeDesc("/raft_esp32/temperature", AutoPubMsgKind::Temperature, 0x18));
+        const uint8_t range = backend.createPublisher(makeDesc("/raft_node/range", AutoPubMsgKind::Range));
+        const uint8_t temp = backend.createPublisher(makeDesc("/raft_node/temperature", AutoPubMsgKind::Temperature, 0x18));
         TEST_ASSERT(backend.service(10), "first endpoint declares");
         drain(session);
         TEST_ASSERT(backend.service(11), "second endpoint declares once the session can take it");
@@ -376,17 +376,17 @@ int main()
         for (uint8_t index = 0; index < backend.capacity(); ++index)
         {
             char topic[64];
-            std::snprintf(topic, sizeof(topic), "/raft_esp32/range_%u", static_cast<unsigned>(index));
+            std::snprintf(topic, sizeof(topic), "/raft_node/range_%u", static_cast<unsigned>(index));
             TEST_ASSERT(backend.createPublisher(makeDesc(topic, AutoPubMsgKind::Range,
                         static_cast<uint8_t>(0x30 + index))) == index, "each endpoint takes the next free slot");
         }
-        TEST_ASSERT(backend.createPublisher(makeDesc("/raft_esp32/extra", AutoPubMsgKind::Range, 0x50)) ==
+        TEST_ASSERT(backend.createPublisher(makeDesc("/raft_node/extra", AutoPubMsgKind::Range, 0x50)) ==
                     ZenohAutoPubBackend::INVALID_SLOT, "a full registry refuses further endpoints");
         for (uint8_t index = 0; index < backend.capacity(); ++index)
         {
             TEST_ASSERT(backend.service(100 + index), "service sends one staged declaration per call");
             char expected[64];
-            std::snprintf(expected, sizeof(expected), "raft_esp32%%range_%u/", static_cast<unsigned>(index));
+            std::snprintf(expected, sizeof(expected), "raft_node%%range_%u/", static_cast<unsigned>(index));
             TEST_ASSERT(containsText(drain(session), expected),
                         "declarations go out in slot order, one per call, none starved");
             TEST_ASSERT(backend.isDeclared(index), "each endpoint is declared in turn");
@@ -417,7 +417,7 @@ int main()
     {
         using RaftRuntime::Zenoh::ZenohInterestMatch;
         using Result = RaftRuntime::Zenoh::ZenohInterestMatchResult;
-        const char* token = "@ros2_lv/23/abc/1/2/MP/%/%/raft_esp32/%raft_esp32%range/type/hash/2::,5:,:,:,,";
+        const char* token = "@ros2_lv/23/abc/1/2/MP/%/%/raft_node/%raft_node%range/type/hash/2::,5:,:,:,,";
 
         TEST_ASSERT(ZenohInterestMatch("", token) == Result::Match,
                     "an empty key expression asks for everything we hold");

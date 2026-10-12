@@ -13,9 +13,10 @@ case "${1:-zenoh}" in
     cyclone) export RMW_IMPLEMENTATION=rmw_cyclonedds_cpp ;;
 esac
 MODE=${1:-zenoh}
-NODE=/raft_esp32
-RANGE=/raft/range_1_29
-RANGE_HASH=RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a
+# The node and one of its auto-published device topics.  Found from the graph
+# unless given: RAFTROS_NODE=/raftros_adbfb6  RAFTROS_TOPIC=/raft/imu_1_68
+NODE=${RAFTROS_NODE:-}
+SENSOR=${RAFTROS_TOPIC:-}
 PASS=0; FAIL=0
 T() { timeout -s KILL "$@"; }
 check() {   # check <name> <0|1> <detail>
@@ -29,37 +30,42 @@ retry() {   # retry <tries> <cmd...> : graph queries from a fresh process can ra
 
 echo "== $ROS_DISTRO / $RMW_IMPLEMENTATION / $(date -Is)"
 [ "$MODE" != zenoh ] && ros2 daemon stop > /dev/null 2>&1
+if [ -z "$NODE" ]; then
+    NODE=$(retry 5 T 20 ros2 node list --no-daemon | grep -v -e foxglove -e _ros2cli -e '^$' | head -1)
+fi
+echo "== node $NODE"
 
 out=$(retry 5 T 20 ros2 node list --no-daemon); check "node list" "$(has "$NODE" "$out")" "$(tr '\n' ' ' <<< "$out")"
 out=$(retry 5 T 20 ros2 node info --no-daemon $NODE)
-check "node info publishers" "$( [ "$(has /chatter: "$out")$(has "$RANGE:" "$out")" = 00 ] && echo 0 || echo 1)" "/chatter + $RANGE"
+[ -z "$SENSOR" ] && SENSOR=$(sed -n '/Publishers:/,/Service Servers:/p' <<< "$out" | grep -o '/raft/[A-Za-z0-9_]*' | head -1)
+check "node info publishers" "$( [ "$(has /chatter: "$out")$(has "${SENSOR:-/raft/}" "$out")" = 00 ] && echo 0 || echo 1)" "/chatter + ${SENSOR:-no device topic}"
 check "node info subscribers" "$( [ "$(has /chatter_in: "$out")$(has /chatter_in2: "$out")" = 00 ] && echo 0 || echo 1)" "/chatter_in + /chatter_in2"
 if [ "$MODE" = zenoh ]; then
-    nsvc=$(sed -n '/Service Servers:/,/Service Clients:/p' <<< "$out" | grep -c "/raft_esp32/")
+    nsvc=$(sed -n '/Service Servers:/,/Service Clients:/p' <<< "$out" | grep -c "$NODE/")
     check "node info services" "$( [ "$nsvc" -ge 10 ] && echo 0 || echo 1)" "$nsvc service servers"
 fi
-out=$(retry 5 T 20 ros2 topic info -v --no-daemon $RANGE)
-check "topic info node" "$(has "Node name: raft_esp32" "$out")" ""
-check "topic info type hash" "$(has "$RANGE_HASH" "$out")" "$(grep -o 'RIHS01_[0-9a-f]*' <<< "$out" | head -1)"
-check "topic info qos" "$( [ "$(has BEST_EFFORT "$out")$(has VOLATILE "$out")" = 00 ] && echo 0 || echo 1)" "BEST_EFFORT/VOLATILE"
-out=$(T 20 ros2 topic echo --once --qos-reliability best_effort $RANGE sensor_msgs/msg/Range 2>&1)
-check "echo range" "$(has "range:" "$out")" "$(grep -m1 '^range:' <<< "$out")"
+out=$(retry 5 T 20 ros2 topic info -v --no-daemon $SENSOR)
+check "topic info node" "$(has "Node name: ${NODE#/}" "$out")" ""
+check "topic info type hash" "$(has "RIHS01_" "$out")" "$(grep -o 'RIHS01_[0-9a-f]*' <<< "$out" | head -1)"
+check "topic info qos" "$(has "Reliability:" "$out")" "$(grep -m1 -o 'Reliability: [A-Z_]*' <<< "$out")"
+out=$(T 20 ros2 topic echo --once --qos-reliability best_effort $SENSOR 2>&1)
+check "echo device topic" "$(has "header:" "$out")" "$SENSOR"
 out=$(T 20 ros2 topic echo --once /chatter std_msgs/msg/String 2>&1)
-check "echo chatter" "$(has "Hello from raft_esp32" "$out")" "$(grep -m1 'data:' <<< "$out")"
+check "echo chatter" "$(has "Hello from ${NODE#/}" "$out")" "$(grep -m1 'data:' <<< "$out")"
 
 if [ "$MODE" = zenoh ]; then
-    out=$(T 25 ros2 service call /raft_esp32/devices std_srvs/srv/Trigger 2>&1)
+    out=$(T 25 ros2 service call $NODE/devices std_srvs/srv/Trigger 2>&1)
     before=$(grep -o 'chatter_in rx [0-9]*' <<< "$out" | grep -o '[0-9]*$')
     T 15 ros2 topic pub --once -w 0 /chatter_in std_msgs/msg/String "{data: 'distro test $ROS_DISTRO'}" > /dev/null 2>&1
     sleep 1
-    out=$(T 25 ros2 service call /raft_esp32/devices std_srvs/srv/Trigger 2>&1)
+    out=$(T 25 ros2 service call $NODE/devices std_srvs/srv/Trigger 2>&1)
     after=$(grep -o 'chatter_in rx [0-9]*' <<< "$out" | grep -o '[0-9]*$')
     check "inbound /chatter_in" "$( [ -n "$before" ] && [ -n "$after" ] && [ "$after" -gt "$before" ] && echo 0 || echo 1)" "rx $before -> $after"
-    out=$(T 25 ros2 service call /raft_esp32/ping std_srvs/srv/Empty 2>&1)
+    out=$(T 25 ros2 service call $NODE/ping std_srvs/srv/Empty 2>&1)
     check "service ping (Empty)" "$(has "Empty_Response" "$out")" ""
-    out=$(T 25 ros2 service call /raft_esp32/range std_srvs/srv/Trigger 2>&1)
-    check "service range (deferred Trigger)" "$(has "success=True" "$out")" "$(grep -o "message='[^']*'" <<< "$out")"
-    out=$(T 25 ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: true}" 2>&1)
+    out=$(T 25 ros2 service call $NODE/read std_srvs/srv/Trigger 2>&1)
+    check "service read (deferred Trigger)" "$(has "success=True" "$out")" "$(grep -o "message='[^']*'" <<< "$out")"
+    out=$(T 25 ros2 service call $NODE/chatter_enable std_srvs/srv/SetBool "{data: true}" 2>&1)
     check "service chatter_enable (SetBool)" "$(has "success=True" "$out")" ""
     out=$(T 25 ros2 param list $NODE 2>&1)
     check "param list" "$( [ "$(has chatterPeriodMs "$out")$(has routerHost "$out")$(has use_sim_time "$out")" = 000 ] && echo 0 || echo 1)" "$(tr -s ' \n' ' ' <<< "$out")"

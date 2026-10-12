@@ -28,7 +28,7 @@ carried before 2026-09-26. The services, parameters and second-soak figures
 | Reconnect after router/session loss | n/a | yes | tokens re-declared, sequence continues |
 | Services (server side; `std_srvs` Trigger, SetBool, Empty) | no (planned) | yes (2026-09-28) | `ros2 service list -t`, `ros2 service call`; 50/50 calls answered, worst loop pass unchanged; re-declared within 5 s of a router restart |
 | Parameters (`ros2 param list/get/set/describe/dump`) | no | yes (2026-09-29) | all six `rcl_interfaces` services; refusals with reasons; `routerHost` persisted; `chatterPeriodMs` changes `/chatter` rate live |
-| Deferred service replies (handler never blocks the loop) | no | yes (2026-09-28) | `/raft_esp32/range` answers from the first poll result after the call (39-100 ms later); request path 1 ms in the loop; unplugged sensor -> `ERR` at the timeout |
+| Deferred service replies (handler never blocks the loop) | no | yes (2026-09-28) | `/<node>/range` answers from the first poll result after the call (39-100 ms later); request path 1 ms in the loop; unplugged sensor -> `ERR` at the timeout |
 
 The application code is identical for both: the transport is a build-time
 choice (`CONFIG_RAFTROS_BACKEND_ZENOH`, the default, or `..._RTPS`), and the
@@ -103,8 +103,8 @@ budget against on this load is **~143 kB**, not the 177 kB steady figure; and
 
 The pushed code (RaftROS `7e0071a`, RaftCore `78781c0`) freshly flashed, and a
 ROS host driving it for 12 h: an `rclpy` subscriber counting `/raft/range_1_29`
-and `/chatter` per minute, and every minute a `/raft_esp32/devices`,
-`/raft_esp32/range` (deferred) and `/raft_esp32/ping` call, a parameter get and
+and `/chatter` per minute, and every minute a `/<node>/devices`,
+`/<node>/range` (deferred) and `/<node>/ping` call, a parameter get and
 a `chatterPeriodMs` set (alternating 900/1000 ms), with a full `ros2 param
 dump` every 10 minutes and `rosstat` read each time. No terminal attached.
 
@@ -164,7 +164,7 @@ and the `curl` line to change it. Both diagnoses were captured on hardware.
   section into NVS (read through the chained config), freezing it; it now
   merges the overlay alone.
 - (Example, introduced 2026-09-28 in S5, found and fixed 2026-09-29) The
-  deferred `/raft_esp32/range` service registered its own VL6180 data
+  deferred `/<node>/range` service registered its own VL6180 data
   callback. RaftCore keeps one data callback per bus address, so it silently
   replaced the auto-publisher's and `/raft/range_1_29` published nothing on
   either backend for a day; the checks exercised the service, not the topic.

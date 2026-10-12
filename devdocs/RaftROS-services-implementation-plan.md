@@ -186,8 +186,8 @@ from the session callback under the budget; replies are staged and sent over
 two passes; `rosstat` gains `services`, `requests`, `replies`, `errors`,
 `deferred`.
 *Gate, on hardware against `rmw_zenohd`:* `ros2 service list` shows the
-service with the right type; `ros2 node info /raft_esp32` lists it under
-*Service Servers*; `ros2 service call /raft_esp32/trigger std_srvs/srv/Trigger`
+service with the right type; `ros2 node info /<node>` lists it under
+*Service Servers*; `ros2 service call /<node>/trigger std_srvs/srv/Trigger`
 returns `success: True` with the message; a loop of 50 calls in a script
 completes with the loop's worst pass under 5 ms and the average unchanged;
 `loopBudget` warnings zero; reconnect re-declares the queryable.
@@ -204,17 +204,17 @@ A service's `::srv::` wire type needed the codec's type check widened.
 Image +5.2 kB over S2. Building the RTPS variant confirmed the example
 compiles on both transports (its `addService` warns and returns -1).
 
-**S4 - Example services.** In the example: `/raft_esp32/devices`
+**S4 - Example services.** In the example: `/<node>/devices`
 (`Trigger` -> JSON list of attached devices from DeviceManager, answered
-immediately from state) and `/raft_esp32/chatter_enable` (`SetBool`, toggles
+immediately from state) and `/<node>/chatter_enable` (`SetBool`, toggles
 the `/chatter` publisher - a visible effect in `ros2 topic echo`). README demo
 section with the exact commands; the release-pass logging rules apply
 (one line per service declared, warnings unconditional).
 *Gate:* both demonstrated from the ROS host with the standard tools; the
 milestone results document gains a *Services* row.
-**Met 2026-09-28**, folded into the S3 flash: `/raft_esp32/devices` answers
+**Met 2026-09-28**, folded into the S3 flash: `/<node>/devices` answers
 "1 device(s) attached, chatter on, chatter_in rx 0/0, heap free 173356 B";
-`/raft_esp32/chatter_enable false` stops `/chatter` (an `echo --once` gets
+`/<node>/chatter_enable false` stops `/chatter` (an `echo --once` gets
 nothing in 4 s) and `true` restarts it (next message within 8 s). README has
 the commands and the handler; results document has the row.
 
@@ -225,14 +225,14 @@ deferred path, proving a handler never blocks the loop.
 carries a fresh reading; a deferred call with the sensor unplugged is answered
 `ERR` at the timeout, not hung.
 **Met 2026-09-28**; the sensor-unplugged case **met 2026-09-29**: with the
-VL6180 out, the device withdrew `/raft/range_1_29`, `/raft_esp32/devices`
-reported 0 devices, and a `/raft_esp32/range` call was answered `ERR`
+VL6180 out, the device withdrew `/raft/range_1_29`, `/<node>/devices`
+reported 0 devices, and a `/<node>/range` call was answered `ERR`
 reason `timeout` 5.3 s after the CLI started (the 5 s deadline); session up,
 loop maximum unchanged. Plugged back in, it re-attached as a fresh endpoint
 and range calls answered 148-186 ms after the call. Note: `ros2 service
 call` logs an `ERR` reply and then keeps waiting - scripts need their own
 timeout.
-`/raft_esp32/range` (Trigger) in the example: the handler parks the request
+`/<node>/range` (Trigger) in the example: the handler parks the request
 and returns `Deferred`; a DeviceManager data callback on the bus task bumps a
 counter per VL6180 poll result; `MainSysMod::loop()` completes the request
 from the first result after the call, decoded with
@@ -250,7 +250,7 @@ assessment stands.
 
 **S7 (follow-on plan) - Parameters.** The six standard services on top of S2/S3,
 backed by the SysMod's config with `postsettings`-style persistence, so
-`ros2 param set /raft_esp32 routerHost ...` works.
+`ros2 param set /<node> routerHost ...` works.
 
 ## 4. Validation Workflow
 
@@ -283,9 +283,9 @@ backed by the SysMod's config with `postsettings`-style persistence, so
 
 **Status 2026-09-28** - every row shown on the ESP32-S3 TFT Feather against `rmw_zenohd`:
 graph and `node info` (S3); `Trigger`, `SetBool` and `Empty`
-(`/raft_esp32/ping`) all answered from `ros2 service call`; two concurrent
-`ros2` clients on `/raft_esp32/devices` each received their reply (both
-accepted and completed, none refused); S5's `/raft_esp32/range` for the
+(`/<node>/ping`) all answered from `ros2 service call`; two concurrent
+`ros2` clients on `/<node>/devices` each received their reply (both
+accepted and completed, none refused); S5's `/<node>/range` for the
 non-blocking handler; 50-call loop with the loop maxima unchanged; router
 restart re-declared and a call succeeded; raw zenoh-python queries at the
 Trigger key - empty payload `ERR 'bad request'`, 900 B answered, 3000 B

@@ -77,4 +77,18 @@ menu "RaftROS"
             TCP port the Zenoh router listens on.  Overridden by the
             "routerPort" setting in the SysMod's SysTypes configuration.
 
+    config RAFTROS_ZENOH_SERIAL_LINK
+        bool "Zenoh link over USB-Serial-JTAG"
+        default y
+        depends on RAFTROS_BACKEND_ZENOH
+        help
+            Lets the node reach its router over the z-serial link on the
+            chip's USB-Serial-JTAG port instead of TCP.  Built in, it is still
+            off until chosen: "link":"usbjtag" in the RaftROS SysTypes block,
+            or a change through RaftROS::requestLinkConfig (an application
+            API).  When the console is on the same port the node takes the
+            port over while the link is chosen (SerialConsole releasePort and
+            RaftCore's RaftConsolePort) and gives it back when TCP is chosen
+            again.  Turning this off removes the serial code.
+
 endmenu

@@ -336,7 +336,7 @@ in through the session's `onRequest` callback, are matched to a slot by key id
 and handed to `AutoPubServiceRegistry`; handlers run under a two-per-pass
 budget, and the reply and its `RESPONSE_FINAL` go out on consecutive passes
 ahead of interest replies and samples. The example serves
-`/raft_esp32/devices` (Trigger) and `/raft_esp32/chatter_enable` (SetBool);
+`/<node>/devices` (Trigger) and `/<node>/chatter_enable` (SetBool);
 the RTPS build compiles the same application code with an `addService` that
 warns and returns -1.
 
@@ -373,7 +373,7 @@ per boot in the first seconds and never again; CommsMan stalls 11 ms in the
 same window, so it is a whole-system stall (a flash sector erase freezes
 every task) rather than anything on the drain path. Not chased further.
 
-**S5, deferred replies (same day).** `/raft_esp32/range` proves a handler
+**S5, deferred replies (same day).** `/<node>/range` proves a handler
 that needs the bus never blocks the loop: it parks the request and returns
 `Deferred`; a data callback on the bus task counts VL6180 poll results; the
 loop completes the request from the first result after the call, decoded
@@ -421,13 +421,13 @@ else:
 
 ```
 RaftROS: setup auto-publish listener registered with DeviceManager
-RaftROS: setup backend=zenoh router=192.168.86.192:7447 domain=0 node=/raft_esp32 session=1723...
+RaftROS: setup backend=zenoh router=192.168.86.192:7447 domain=0 node=/<node> session=1723...
 MainSysMod: Registered /chatter_in string message handler (per-topic slot)
 MainSysMod: Registered /chatter_in2 string message handler (per-topic slot)
 RaftROS: autoPubAttach devID=1_29 typeIdx=6 slot=1 topic=/raft/range_1_29 type=sensor_msgs::msg::dds_::Range_ qos=fast_sensor
 RaftROS: connected to router 192.168.86.192:7447, opening session
 RaftROS: session established batch=4096 lease=60000ms
-RaftROS: declared node /raft_esp32
+RaftROS: declared node /<node>
 RaftROS: subscribed to /chatter_in (qos=fallback_string)
 RaftROS: subscribed to /chatter_in2 (qos=fallback_string)
 ```
@@ -466,7 +466,7 @@ graph watcher recording.
 | | Device | ROS 2 graph |
 | --- | --- | --- |
 | Unplug (12:31:11) | `online=3` (PENDING_DELETION), `autoPubDetach slot=1` after 11,888 samples; slot released (`pubs` 2 -> 1) | `/raft/range_1_29` gone from `ros2 topic list` in the same 2 s sample; stayed gone for 26 min |
-| Replug | re-attached at once: `devices:1`, `pubs:2`, `pending:0`; sequence restarted (499 two minutes in); every sample `pub=1` to one peer | topic back, publisher count 1, node `raft_esp32`, BEST_EFFORT/VOLATILE; `ros2 topic echo` gives `range: 0.255` |
+| Replug | re-attached at once: `devices:1`, `pubs:2`, `pending:0`; sequence restarted (499 two minutes in); every sample `pub=1` to one peer | topic back, publisher count 1, node `<node>`, BEST_EFFORT/VOLATILE; `ros2 topic echo` gives `range: 0.255` |
 | Throughout | session count stayed 1, no re-declare of other endpoints, no `loopBudget` or `ROUTER` warnings; loop 556 us average / 2.5 ms max | `/chatter` and both subscriptions untouched |
 
 So an endpoint's whole life over Zenoh - declare, publish, withdraw on loss,
@@ -620,9 +620,9 @@ tools, the Zenoh build now does too:
 
 ```
 $ ros2 node list
-/raft_esp32
+/<node>
 
-$ ros2 node info /raft_esp32
+$ ros2 node info /<node>
   Subscribers:
     /chatter_in: std_msgs/msg/String
     /chatter_in2: std_msgs/msg/String
@@ -632,7 +632,7 @@ $ ros2 node info /raft_esp32
 
 $ ros2 topic info -v /raft/range_1_29
 Publisher count: 1
-Node name: raft_esp32            Node namespace: /
+Node name: <node>            Node namespace: /
 Topic type hash: RIHS01_b42b62562e93cbfe9d42b82fe5994dfa3d63d7d5c90a317981703f7388adff3a
   Reliability: BEST_EFFORT       Durability: VOLATILE
 
@@ -640,7 +640,7 @@ $ ros2 topic echo --once /raft/range_1_29
 range: 0.014999999664723873      variance: 0.0
 
 $ ros2 topic echo --once /chatter
-data: Hello from raft_esp32 [28]
+data: Hello from <node> [28]
 
 $ ros2 topic pub --once /chatter_in  std_msgs/msg/String "{data: 'hello from ros2 zenoh 1'}"
 $ ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'second slot over zenoh'}"
@@ -753,7 +753,7 @@ claim it:
 | Item | Yesterday | Today, 10 fresh participant starts |
 | --- | --- | --- |
 | CycloneDDS "malformed packet" | 2 reports in one run | **0** |
-| FastDDS `ros2 topic info -v` | `_NODE_NAME_UNKNOWN_` (O6) | `Node name: raft_esp32` |
+| FastDDS `ros2 topic info -v` | `_NODE_NAME_UNKNOWN_` (O6) | `Node name: <node>` |
 | Node, publisher count, type hash | partial under FastDDS | correct under both RMWs |
 
 Conditions covered: 5 participant starts per RMW, the first seconds after boot
@@ -811,7 +811,7 @@ Hardware (ESP32-S3 Feather, VL6180, real Zenoh router and ROS 2 Jazzy):
 | Check | Zenoh | RTPS |
 | --- | --- | --- |
 | Device topic | `range=0.0160 m`, ~4 Hz, 194 samples in 45 s | `ros2 topic echo` gives `range: 0.016` |
-| `/chatter` | `"Hello from raft_esp32 [35]"`, 40 in 45 s | as before |
+| `/chatter` | `"Hello from <node> [35]"`, 40 in 45 s | as before |
 | Subscription | all 6 published strings received, GID split as RTPS presents it | `ros2 topic pub /chatter_in` received |
 | Graph tokens | node, publisher and subscription tokens all visible and queryable | SEDP as before |
 | Example code | unchanged between the two builds | unchanged |
@@ -1008,7 +1008,7 @@ claiming strict-parser cleanliness.
 ### O6 RESOLVED for CycloneDDS — malformed SEDP subscriptions (2026-09-25)
 
 > **Update 2026-09-26:** FastDDS now resolves the node too
-> (`Node name: raft_esp32`, correct publisher count and type hash), so the
+> (`Node name: <node>`, correct publisher count and type hash), so the
 > FastDDS half of O6 no longer reproduces either. See "Liveliness Sequence 0,
 > and Two Open RTPS Items That No Longer Reproduce" for the evidence and for
 > what was ruled out as the cause.
@@ -1035,10 +1035,10 @@ real `PID_DEADLINE` + length, one byte early).
 **Result with CycloneDDS** (ESP32-S3 + VL6180, native Jazzy host):
 
 ```
-ros2 node list                        -> /raft_esp32
-ros2 node info /raft_esp32            -> publishers /chatter, /raft/range_1_29
+ros2 node list                        -> /<node>
+ros2 node info /<node>            -> publishers /chatter, /raft/range_1_29
                                          subscribers /chatter_in, /chatter_in2
-ros2 topic info -v /raft/range_1_29   -> Node name: raft_esp32, namespace /
+ros2 topic info -v /raft/range_1_29   -> Node name: <node>, namespace /
 ```
 
 **Still open (FastDDS only):** FastDDS continues to report
@@ -1080,7 +1080,7 @@ its own rdi DATA to our announced reader, so the failure is symmetric.
 **Ruled out (each tested, not assumed):**
 
 - Payload layout - the `ParticipantEntitiesInfo` CDR is correct (16-byte GID =
-  prefix + `000001c1`, one node entry, namespace `/`, name `raft_esp32`).
+  prefix + `000001c1`, one node entry, namespace `/`, name `<node>`).
 - Packets not arriving - the exact bytes were mirrored to a plain UDP port on
   the host and received in full.
 - Wrong port/locator - the host's rdi reader advertises no per-endpoint
@@ -1210,7 +1210,7 @@ Validated on the current Windows 11 + WSL2 + ROS 2 Jazzy + FastDDS host:
 
 On the current WSL2/Jazzy/FastDDS test setup, some `ros2` CLI graph commands
 still attribute RaftROS publishers to `Node name: _NODE_NAME_UNKNOWN_`, and
-`ros2 node info /raft_esp32` can fail even while data subscribers work.
+`ros2 node info /<node>` can fail even while data subscribers work.
 
 Current classification:
 
@@ -1241,7 +1241,7 @@ Mitigations:
   `ros2 node info` as diagnostic tools only on WSL/Jazzy. If they disagree with
   `rclpy`, trust the `rclpy` data-path result.
 - For native Linux, first repeat `DemoSimple`, then `ros2 topic info -v`, then
-  `ros2 node info /raft_esp32`. If native Linux also shows
+  `ros2 node info /<node>`. If native Linux also shows
   `_NODE_NAME_UNKNOWN_`, continue Task D firmware-side investigation below.
 
 ## ⚠️ ros2 CLI Usage Prerequisites — READ THIS FIRST
@@ -1319,7 +1319,7 @@ firmware is fine and the issue is daemon/CLI plumbing.
 ### What does NOT work / known gaps
 
 - **`ros2 topic info -v` shows ESP publisher with `_NODE_NAME_UNKNOWN_`
-  / `ros2 node info /raft_esp32` returns "Unable to find node".**
+  / `ros2 node info /<node>` returns "Unable to find node".**
   Cosmetic / graph-introspection only in the current WSL/Jazzy environment:
   rclpy, `DemoSimple`, and Foxglove Bridge data paths subscribe fine.
   Wire-level `ros_discovery_info` payload is now structurally correct
@@ -1783,7 +1783,7 @@ Only `Range` regressed.
 
 | # | Observation | Explanation / theory | Severity |
 |---|-------------|----------------------|----------|
-| O1 | `ros2 node info /raft_esp32` → "Unable to find node" | ParticipantMessageData / node-name mapping incomplete — node listed by `node list` but not looked up by name. Probably missing `ros_discovery_info` GID list entries for the newly-attached autopub writer (we don't re-publish `ros_discovery_info` after attach). | Cosmetic |
+| O1 | `ros2 node info /<node>` → "Unable to find node" | ParticipantMessageData / node-name mapping incomplete — node listed by `node list` but not looked up by name. Probably missing `ros_discovery_info` GID list entries for the newly-attached autopub writer (we don't re-publish `ros_discovery_info` after attach). | Cosmetic |
 | O2 | `ros2 topic list --no-daemon` often shows **3 "discovered" participants** for every CLI invocation | Each `ros2 topic list` spawns a short-lived DDS participant that appears + disappears within its `--spin-time`. The daemon also has one. Not a bug. | Cosmetic |
 | O3 | First ACKNACK after match produces `total count change:1 total count: 1` | BEST_EFFORT writers still maintain a sequence number; the subscriber reports one "missed" sample on match because it joined mid-stream. This is normal for BEST_EFFORT and is not the deserialize failure. | Normal |
 | O4 | `ros2 topic echo --raw` only prints with explicit `--qos-reliability best_effort` | The CLI `echo` doesn't auto-relax QoS for explicit message-type subscriptions. `hz` does because it uses "best-available" QoS. | Known / documented |
@@ -1829,12 +1829,12 @@ Only `Range` regressed.
      `RELIABILITY=RELIABLE`, `DURABILITY=TRANSIENT_LOCAL`).
    - Payload deserializes successfully via
      `rclpy.serialization.deserialize_message(data, ParticipantEntitiesInfo)` —
-     gid, ns="/", name="raft_esp32", reader_gid_seq=2, writer_gid_seq=2 all
+     gid, ns="/", name="<node>", reader_gid_seq=2, writer_gid_seq=2 all
      decoded correctly. So the CDR is provably valid.
    - `ros2 topic info /raft/range_1_29 -v` correctly lists the ESP
      publisher's GID — proving SEDP-publication match works end-to-end.
    - But host-side rmw still shows `Node name: _NODE_NAME_UNKNOWN_` and
-     `ros2 node info /raft_esp32` returns "Unable to find node".
+     `ros2 node info /<node>` returns "Unable to find node".
 
    **Wire trace finding (the smoking gun):** Multiple host-side readers
    (4 distinct ACKNACK count streams) each match our writer at RTPS layer
@@ -1884,7 +1884,7 @@ Only `Range` regressed.
    python3 scripts/range_reference_pub.py &
    sleep 3 && ros2 daemon start && sleep 5
    ros2 topic info /raft/range_1_29 -v   # ESP shown but NODE_NAME_UNKNOWN
-   ros2 node info /raft_esp32            # Unable to find node
+   ros2 node info /<node>            # Unable to find node
    ```
 2. ~~**Re-publish `ros_discovery_info` on auto-pub attach.**~~ **DONE
    2026-04-26, then REVERTED 2026-04-25 as part of Task D Attempt #1.**
@@ -1938,7 +1938,7 @@ Only `Range` regressed.
 Make an ESP32-S3 (running Raft firmware) appear as a native ROS 2 node — without micro-ROS or any agent process — using a clean-room RTPS 2.2 implementation as a Raft SysMod.
 
 **Phase 1 (Discovery), Phase 2 (Topic Publishing), and Phase 3 (Topic Subscribing with per-topic routing) are COMPLETE.**
-- `ros2 node list` shows `/raft_esp32`.
+- `ros2 node list` shows `/<node>`.
 - `ros2 topic list` shows `/chatter` (published) and the subscribed topics (`/chatter_in`, `/chatter_in2`, …).
 - `ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints a sample per second.
 - `ros2 topic pub --once /chatter_in2 std_msgs/msg/String "{data: 'hello slot2'}"` routes to the correct per-slot handler on-device.
@@ -1985,8 +1985,8 @@ Immediate objective was to publish real ROS 2 topic data from the ESP32 with rel
 
 ### Verification
 
-- On PC: `env -u PYTHONPATH PYTHONNOUSERSITE=1 ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints `data: Hello from raft_esp32 [N]` once per second indefinitely.
-- On PC: `ros2 topic info /chatter --no-daemon -v` shows one Publisher with QoS RELIABLE + VOLATILE, node `raft_esp32`.
+- On PC: `env -u PYTHONPATH PYTHONNOUSERSITE=1 ros2 topic echo /chatter std_msgs/msg/String --no-daemon` prints `data: Hello from <node> [N]` once per second indefinitely.
+- On PC: `ros2 topic info /chatter --no-daemon -v` shows one Publisher with QoS RELIABLE + VOLATILE, node `<node>`.
 - On ESP32: ACKNACK log shows `readerEID=00000504 writerEID=00010103 (chatter) base=N numBits=0` with `N` advancing — no retransmit storm.
 - Linux unit tests and standalone linux publisher remain green (**85 passed, 0 failed**) after the ESP fixes.
 
@@ -2007,7 +2007,7 @@ Immediate objective was to publish real ROS 2 topic data from the ESP32 with rel
 
 ## Phase 1: Discovery — COMPLETE ✅
 
-`ros2 node list` shows `/raft_esp32` on both ESP32 and the linux standalone test node.
+`ros2 node list` shows `/<node>` on both ESP32 and the linux standalone test node.
 
 ### What Works
 
@@ -2016,7 +2016,7 @@ Immediate objective was to publish real ROS 2 topic data from the ESP32 with rel
 - **SEDP Publication:** Announces `ros_discovery_info` DataWriter with topic name, type name, reliability (RELIABLE), durability (TRANSIENT_LOCAL), `PID_UNICAST_LOCATOR`, and `PID_PARTICIPANT_GUID`. Includes HEARTBEAT submessage.
 - **SEDP Subscription:** Announces `ros_discovery_info` DataReader with matching QoS, locator, and participant GUID.
 - **Participant Message Data (Liveliness):** Sent on discovery and periodically via heartbeats. Sequence number increments each send.
-- **ros_discovery_info:** CDR-encoded `ParticipantEntitiesInfo` (participant GID, node namespace `/`, node name `raft_esp32`) sent to user data port.
+- **ros_discovery_info:** CDR-encoded `ParticipantEntitiesInfo` (participant GID, node namespace `/`, node name `<node>`) sent to user data port.
 - **HEARTBEAT/ACKNACK:** ESP32 responds to daemon HEARTBEATs with ACKNACKs. Handles incoming ACKNACKs and retransmits SEDP publication, SEDP subscription, and ros_discovery_info data as requested.
 - **Periodic Writer Heartbeats:** Sends all four DATA+HB messages (SEDP pub, SEDP sub, liveliness, rosDisc) to each discovered remote participant.
 

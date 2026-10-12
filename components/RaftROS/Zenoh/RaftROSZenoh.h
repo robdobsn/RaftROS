@@ -40,9 +40,12 @@
 #include "ZenohInterestMatch.h"
 #include "ZenohROSCodec.h"
 #include "ZenohTCPSession.h"
+#include "ZenohSerialLink.h"
+#include "RaftROSLink.h"
 #include <array>
 #include <atomic>
 #include <functional>
+#include <memory>
 
 class APISourceInfo;
 
@@ -57,6 +60,22 @@ public:
     void loop() override;
     void addRestAPIEndpoints(RestAPIEndpointManager& endpointManager) override;
     String getStatusJSON() const override;
+
+    // ---- Link to the router ----
+    // TCP over WiFi, or the z-serial link on the chip's USB-Serial-JTAG port.
+    // The link starts as "link" in the RaftROS SysTypes block (or the
+    // persisted settings) says - default tcp - and is changed while running
+    // with /api/ros/set?link=tcp|usbjtag, or from application code with
+    // requestLinkConfig.  Either way the change is checked, applied on the next
+    // loop pass (a live session is closed and the node reconnects over the new
+    // link) and, with persist, written to the settings overlay for later boots.
+    /// @return false, with the reason in error, if the change cannot be made -
+    /// e.g. this image cannot use the serial link (serialLinkUnavailableReason)
+    bool requestLinkConfig(const RaftROSLinkConfig& config, String& error);
+    /// @brief Why this image cannot use the serial link (the chip has no
+    /// USB-Serial-JTAG port, support is configured out, or the console is on
+    /// that port and RaftCore cannot hand it over), or nullptr if it can
+    static const char* serialLinkUnavailableReason();
 
     /// @brief Called when a std_msgs/String arrives on a subscribed topic.
     /// Signature matches the RTPS build so applications are portable:
@@ -97,7 +116,7 @@ public:
     using ServiceOutcome = RaftRuntime::AutoPub::AutoPubServiceOutcome;
 
     /// @brief Serve a ROS 2 service.
-    /// @param name ROS service name, e.g. "/raft_esp32/devices"
+    /// @param name ROS service name: "~/devices" (relative to this node) or absolute, e.g. "/robot/devices"
     /// @param type wire type name, e.g. "std_srvs::srv::dds_::Trigger_"
     ///        (only the std_srvs types are known: Trigger, SetBool, Empty)
     /// @return slot, or -1 if the table is full or the type is unknown
@@ -196,6 +215,42 @@ private:
     };
     ConnState _connState = ConnState::DISCONNECTED;
     int _sock = -1;
+
+    // ---- Link to the router (implementation) ----
+    // The serial link needs the USB port to itself - the router drops the link
+    // on the first byte that is not a frame - so with the console on the same
+    // port the node takes it over while the link is chosen (claimUsbPort).
+    // Its buffers (~4.5 kB) are allocated the first time the serial link is
+    // used, so a TCP-only node does not pay for them.
+    RaftROSLinkType _linkType = RaftROSLinkType::TCP;
+    bool isSerialLink() const { return _linkType != RaftROSLinkType::TCP; }
+    String routerLabel() const;
+    struct UsbJtagPort
+    {
+        int read(uint8_t* buf, size_t len);
+        bool write(const uint8_t* buf, size_t len);
+        bool txIdle();
+    };
+    UsbJtagPort _usbPort;
+    std::unique_ptr<RaftRuntime::Zenoh::ZenohSerialLink<UsbJtagPort>> _pSerialLink;
+    bool _usbDriverReady = false;
+    bool _serialUnavailableLogged = false;
+    static const uint32_t SERIAL_RX_BUDGET_BYTES = 4096;    ///< read per pass: a frame or two at most
+    static const uint32_t SERIAL_RING_BYTES = 4096;         ///< driver RX and TX rings, two frames each
+    bool startSerialLink();
+    void stepSerialLink();
+    bool _usbPortClaimed = false;           ///< console's USB port taken over (RaftConsolePort)
+    bool claimUsbPort(const char*& why);
+    void releaseUsbPort();
+    bool onConsoleLine(const char* line);
+
+    // Bring-up aid: copy log lines onto the serial link between frames, for
+    // tools/zenoh_serial_link.py bridge to print.  A real router drops the
+    // link on them, so this is off unless "linkLogs" is set.
+    bool _linkLogs = false;
+    void drainLinkLogs();
+    void updateLinkLogMirror();
+    void appendSerialStats(String& json) const;
 
     /// @brief Is the router there?  A device that cannot reach it publishes
     /// nothing to ROS 2 and would otherwise just retry quietly with a growing
@@ -359,6 +414,10 @@ private:
         char routerHost[16] = {};
         bool hasRouterPort = false;
         uint32_t routerPort = 0;
+        bool hasLink = false;
+        RaftROSLinkType link = RaftROSLinkType::TCP;
+        bool hasLinkLogs = false;
+        bool linkLogs = false;
         bool persist = false;       ///< Also write the change to the settings overlay (NVS)
         bool clear = false;         ///< Remove the persisted RaftROS settings instead
     };

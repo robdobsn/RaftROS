@@ -75,7 +75,7 @@ DEST_DIR=./RaftCore
 # GIT_TAG=v1.0  # Optional: Specify a tag if needed
 
 # Ensure raft_core is executed every time by making it .PHONY
-.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-autopub-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline autopub-pool-stress
+.PHONY: raft_core clean all standalone zenoh-test zenoh-session-test zenoh-autopub-test zenoh-serial-test zenoh-session-probe zenoh-wire-test zenoh-storage-test resource-baseline autopub-pool-stress
 
 all: $(OUTPUT)
 
@@ -108,6 +108,17 @@ $(ZENOH_AUTOPUB_TEST_OUT): zenoh_autopub_backend_tests.cpp ../components/RaftROS
 
 zenoh-autopub-test: $(ZENOH_AUTOPUB_TEST_OUT)
 	./$(ZENOH_AUTOPUB_TEST_OUT)
+
+ZENOH_SERIAL_TEST_OUT = $(BUILD_DIR)/zenoh/zenoh_serial_tests
+
+$(ZENOH_SERIAL_TEST_OUT): zenoh_serial_tests.cpp ../components/RaftROS/Zenoh/ZenohSerialFramer.h ../components/RaftROS/Zenoh/ZenohSerialLink.h ../components/RaftROS/Zenoh/ZenohTCPSession.h
+	@mkdir -p $(dir $@)
+	$(CC) $(ZENOH_TEST_CFLAGS) -I../components/RaftROS $< -o $@
+
+# Unit tests; `$(ZENOH_SERIAL_TEST_OUT) --serial <tty> [secs]` holds a real
+# session with a router listening on serial (e.g. one end of a socat pty pair)
+zenoh-serial-test: $(ZENOH_SERIAL_TEST_OUT)
+	./$(ZENOH_SERIAL_TEST_OUT)
 
 ZENOH_SESSION_PROBE_OUT = $(BUILD_DIR)/zenoh/zenoh_session_probe
 ZENOH_PROBE_LDFLAGS ?=

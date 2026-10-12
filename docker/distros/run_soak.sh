@@ -10,8 +10,8 @@ docker rm -f $C > /dev/null 2>&1
 docker run -d --init --name $C --network host -v $OUT:/out -v $(dirname $(readlink -f $0))/tests:/opt/raftros-tests:ro raftros-ros:$D > /dev/null
 docker exec -d $C bash -c "source /opt/ros/$D/setup.bash; exec ros2 run rmw_zenoh_cpp rmw_zenohd >> /out/zenohd.log 2>&1"
 until ss -ltn | grep -q ':7447 '; do sleep 0.2; done
-curl -s --max-time 5 http://192.168.86.230/api/reset > /dev/null; sleep 5
-until curl -s --max-time 2 http://192.168.86.230/api/rosstat | grep -q '"conn":"ready"'; do sleep 1; done; sleep 20
+curl -s --max-time 5 http://${RAFTROS_DEVICE_IP:-192.168.86.230}/api/reset > /dev/null; sleep 5
+until curl -s --max-time 2 http://${RAFTROS_DEVICE_IP:-192.168.86.230}/api/rosstat | grep -q '"conn":"ready"'; do sleep 1; done; sleep 20
 echo "soak $D ${H} h start $(date -Is)" > $OUT/soak.txt
 docker exec -d $C bash -c "source /opt/ros/$D/setup.bash; export RMW_IMPLEMENTATION=rmw_zenoh_cpp; python3 /opt/raftros-tests/counter.py $SECS /out/counts.jsonl"
 docker exec $C /opt/raftros-tests/traffic.sh $SECS 60 /out/traffic.jsonl > /dev/null

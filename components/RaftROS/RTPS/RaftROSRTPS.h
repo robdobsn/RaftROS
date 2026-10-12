@@ -12,6 +12,7 @@
 #pragma once
 
 #include "RaftROSBackendSelect.h"
+#include "RaftROSLink.h"
 #if !RAFTROS_BACKEND_RTPS
     #error "RaftROSRTPS.h is the RTPS build's SysMod - include RaftROS.h, which selects the backend"
 #endif
@@ -127,6 +128,15 @@ public:
     void setChatterEnabled(bool enabled) { _chatterEnabled = enabled; }
     bool isChatterEnabled() const { return _chatterEnabled; }
     uint8_t attachedDeviceCount() const { return _autoPubSource.attachedCount(); }
+
+    // ---- Link to the router ----
+    // Only the Zenoh build has a choice of link; here a change is refused with
+    // the reason, so application code that switches links builds against any backend.
+    bool requestLinkConfig(const RaftROSLinkConfig& /*config*/, String& error)
+    {
+        error = "the RTPS build has no link choice - its transport is udp";
+        return false;
+    }
 
     int addStringSubscription(const char* topic, const char* type, StringMessageHandler handler = {})
     {

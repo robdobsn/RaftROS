@@ -13,9 +13,13 @@ Tested on an Adafruit ESP32-S3 TFT Feather with a VL6180 range sensor on I2C, ag
 
 Once it is on WiFi:
 
-- Appears as ROS 2 node `/raft_esp32` on domain 0.
+- Appears as a ROS 2 node on domain 0, named after the device: with no
+  `nodeName` configured, RaftROS uses Raft's friendly name - the one set with
+  `/api/friendlyname`, or until then the SysType's `DefaultName` (`RaftROS`
+  here) with the last six hex digits of the MAC - made ROS-legal, e.g.
+  `/raftros_adbfb6`. Two boards running the same image are two nodes.
 - Publishes `std_msgs/msg/String` on `/chatter` (1 Hz by default, RELIABLE +
-  VOLATILE) with a payload like `Hello from raft_esp32 [N]`.
+  VOLATILE) with a payload like `Hello from raftros_adbfb6 [N]`.
 - Subscribes to `/chatter_in` and `/chatter_in2` and logs what arrives.
 - **Auto-publishes every bus device** `DeviceManager` finds as a typed ROS 2
   topic `/raft/<slug>_<bus>_<addrHex>` - a VL6180 at I2C 0x29 on bus 1 appears
@@ -23,6 +27,8 @@ Once it is on WiFi:
   topic; plugging back in announces it again.
 - On the Zenoh build (the default), also serves four ROS 2 **services** and
   the ROS 2 **parameter** services - see "Services" and "Parameters" below.
+  None of the application code names a device: every service and parameter
+  works with whatever `DeviceManager` has identified.
 
 ## Choosing the transport
 
@@ -74,9 +80,31 @@ repository. The first time, set the WiFi credentials from the serial console:
 w/<SSID>/<password>
 ```
 
-The board in `SysTypes.json` has its I2C bus on SDA 42 / SCL 41 (the Feather's
-STEMMA QT connector) and `main.cpp` power-cycles the connector on GPIO 21;
-change both for another board.
+The board is described entirely in `SysTypes.json`, in the bus entry under
+`DevMan`: the I2C pins (SDA 42 / SCL 41, the Feather's STEMMA QT connector)
+and, in its `pwr` block, the GPIO that switches the connector's power
+(GPIO 21, `TFT_I2C_POWER`). RaftI2C's bus power controller owns that pin: it
+holds the connector off briefly at boot so devices start from a clean reset,
+then powers it, and can power-cycle it later - there is no board code in
+`main.cpp`.
+
+```jsonc
+"pwr": {
+  "voltageLevels": ["off", "3V3"],
+  "slotGroups": [{ "name": "STEMMA QT", "startSlotNum": 0, "numSlots": 1, "defaultLevelIdx": 1,
+                   "levelsExclOff": [{ "vPins": [21], "on": [1] }] }]
+}
+```
+
+Slot 0 is the bus itself (with no multiplexer there is only that slot). A
+`vPins` entry is a pin on an I/O expander when one owns it, otherwise a plain
+GPIO; omit the `pwr` block for a connector that is always powered. Driving a
+plain GPIO this way needs RaftI2C's `BusPowerController` to hand pins no
+expander owns to `RaftBusSystem::virtualPinsSet` (which falls back to GPIO) -
+a 2026-10-11 change made in `raftdevlibs/RaftI2C`; until it is in RaftI2C
+`main`, a build that fetches RaftI2C rather than using `raftdevlibs` logs
+`FAILED to set pins` and leaves the connector unpowered. Change the pins for
+another board, or add a SysType for it - `SysTypeFeatherS3` is an example.
 
 ## Try it (Zenoh build)
 
@@ -86,12 +114,12 @@ On the ROS 2 host (Jazzy, `sudo apt install ros-jazzy-rmw-zenoh-cpp`):
 ros2 run rmw_zenoh_cpp rmw_zenohd            # the router; keep it running
                                              #  (detach it from any ssh session)
 export RMW_IMPLEMENTATION=rmw_zenoh_cpp      # in every shell that runs ros2
-ros2 node list                               # /raft_esp32
+ros2 node list                               # /raftros_<mac6>
 ros2 topic echo /chatter                     # one message a second
 ros2 topic echo /raft/range_1_29             # Range samples (with a VL6180 attached)
 ros2 topic pub --once /chatter_in std_msgs/msg/String "{data: 'hello'}"
-ros2 service call /raft_esp32/devices std_srvs/srv/Trigger
-ros2 param dump /raft_esp32
+ros2 service call /<node>/devices std_srvs/srv/Trigger
+ros2 param dump /<node>
 ```
 
 The device must be told where the router is - see the next section; if it
@@ -138,6 +166,113 @@ address is a build default that was set for another network, and gives the
 `"routerSource":"default"|"config"`, `"routerReachable"`, `"connectFails"`,
 `"lastSessionAgoS"`.
 
+## Zenoh over the USB cable (optional serial link)
+
+The same node, with no WiFi: the Zenoh session runs over the z-serial link on
+the ESP32-S3's USB-Serial-JTAG port, and `rmw_zenohd` listens on that port
+(`/dev/ttyACMn`) as well as on TCP. One cable carries flashing and ROS.
+Tested on an Unexpected Maker FeatherS3 with an APDS-9960 and an MPU6050 on
+its QWIIC connectors, against ROS 2 Lyrical.
+
+The serial link is off unless chosen. Two things decide whether it can be:
+
+- **The image.** The chip needs a USB-Serial-JTAG port (ESP32-S3, C3, C6...)
+  and serial support built in (`CONFIG_RAFTROS_ZENOH_SERIAL_LINK`, on by
+  default). The console stays on the USB port as usual: the link needs the
+  port to itself - the router drops it on the first byte that is not a frame -
+  so while the link is chosen RaftROS takes the port over. SerialConsole lets
+  go of it (its `releasePort` command) and RaftCore's `RaftConsolePort`
+  silences every other writer: Raft's log output, ESP-IDF's log output,
+  `stdout`/`stderr` and the ROM `printf` channel. Choosing TCP again gives it
+  all back. The console works normally until then - set up WiFi with
+  `w/<SSID>/<password>`, and switch to the link from the console itself.
+- **The configuration.** `link` is a RaftROS setting like `routerHost`: the
+  value in the `RaftROS` block of SysTypes (`"tcp"`, the default, or
+  `"usbjtag"`) is used at boot unless a persisted setting overrides it, and
+  `/api/ros/set` changes it while running (`persist=1` keeps the change for
+  later boots):
+
+  ```bash
+  curl 'http://<device-ip>/api/ros'                                # status: link, serialAvailable, counters
+  curl 'http://<device-ip>/api/ros/set?link=usbjtag&persist=1'     # to the serial link, kept across reboots
+  curl 'http://<device-ip>/api/ros/set?link=tcp&persist=1'         # back to TCP
+  curl 'http://<device-ip>/api/ros/clear'                          # forget persisted RaftROS settings
+  ```
+
+  The same commands work typed at the console (`ros/set?link=usbjtag&persist=1`).
+  Once the link has the port, the console is silent and does not read the
+  port; to get it back, stop the router, open a terminal on the port and type
+  `ros/set?link=tcp` (or `ros/clear`) - while it holds the port the link
+  watches for those two commands among the incoming bytes. Opening the port
+  with `raft monitor`, `screen` or the router does not reset the board;
+  tools that pulse DTR/RTS (esptool) do.
+
+  Application code can make the same change with `RaftROS::requestLinkConfig`.
+
+  The change is applied on the next loop pass: a live session is closed and
+  the node reconnects over the new link. An image that cannot use the serial
+  link refuses with the reason. A board with no WiFi credentials can be
+  reached on its access point (`RaftAP`, password `raftpassword`, device at
+  `192.168.4.1`).
+
+What `SysTypeFeatherS3` sets for the board:
+
+- Two I2C buses, SDA 8 / SCL 9 on controller 0 and SDA 16 / SCL 15 on
+  controller 1 (`i2cPort`). The second bus's `pwr` block switches GPIO 39,
+  the enable of LDO2, which powers the vertical QWIIC connector; the first is
+  on LDO1, always on. On the board tested both connectors were on the first
+  bus.
+- `DevTypes.json` adds APDS9960 (`/raft/illuminance_1_39`,
+  `/raft/proximity_1_39`) and MPU6050 (`/raft/imu_1_68`) records.
+
+Build with the whole repository mounted, since the example takes RaftROS from
+four levels up (`raft build` in Docker mounts only this folder):
+
+```bash
+cd <RaftROS>
+docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v $PWD:$PWD \
+    -w $PWD/examples/ExampleDiscoverable raftbuilder:latest \
+    bash -c 'git config --global --add safe.directory "*"; idf.py -B build/SysTypeFeatherS3 build'
+cd examples/ExampleDiscoverable/build/SysTypeFeatherS3
+esptool --chip esp32s3 -p /dev/ttyACM1 write-flash "@flash_args"
+```
+
+Then start the router with the board's port (use the stable
+`/dev/serial/by-id` name; the board re-enumerates when it resets), and nothing
+else may hold the port:
+
+```bash
+RAFTROS_SERIAL=/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_<MAC>-if00 \
+    docker/distros/demo.sh lyrical
+docker/distros/ros2z node list          # /raftros_<mac6>
+docker/distros/ros2z topic hz /raft/imu_1_68
+```
+
+Without the container, the same endpoint goes in a copy of
+`rmw_zenoh_cpp/config/DEFAULT_RMW_ZENOH_ROUTER_CONFIG.json5`:
+
+```json5
+listen: { endpoints: ["tcp/[::]:7447", "serial//dev/serial/by-id/usb-Espressif_..._<MAC>-if00#baudrate=921600"] }
+```
+
+and `ZENOH_ROUTER_CONFIG_URI=<that file> ros2 run rmw_zenoh_cpp rmw_zenohd`.
+
+**Bring-up with logs.** With `"linkLogs": 1` (SysTypes, or
+`/api/ros/set?linkLogs=1`) the firmware also writes its log
+lines onto the link between frames. A real router would drop the link on
+them, so use the bridge instead, which relays frames to a TCP router and
+prints everything else:
+
+```bash
+python3 tools/zenoh_serial_link.py bridge --serial /dev/serial/by-id/... --router 127.0.0.1:7447
+```
+
+`/api/rosstat` (over WiFi, when the board has credentials) adds the link's
+counters: `serIn`/`serOut` frames, `serCrcErr`, `serBadFrame`, `serInits`,
+`serInitsHeld`, `serLinkUps`, `serResets`, `serTxFull`. The investigation and
+measurements are in
+[RaftROS-zenoh-serial-investigation-plan.md](../../devdocs/RaftROS-zenoh-serial-investigation-plan.md).
+
 ## Try it (RTPS build)
 
 On a ROS 2 host on the same subnet (no router needed):
@@ -145,7 +280,7 @@ On a ROS 2 host on the same subnet (no router needed):
 ```bash
 export RMW_IMPLEMENTATION=rmw_fastrtps_cpp   # or rmw_cyclonedds_cpp
 unset ROS_LOCALHOST_ONLY                     # Jazzy: a leftover value restricts discovery
-ros2 node list --no-daemon                   # /raft_esp32
+ros2 node list --no-daemon                   # /raftros_<mac6>
 ros2 topic echo /chatter std_msgs/msg/String --no-daemon
 ros2 topic echo /raft/range_1_29 sensor_msgs/msg/Range --no-daemon --qos-reliability best_effort
 ```
@@ -157,29 +292,30 @@ firewall rule - see "Host Setup Notes" in the [top-level README](../../README.md
 
 ## Services (Zenoh build)
 
-The example serves four ROS 2 services:
+The example serves four ROS 2 services, declared relative to the node
+(`"~/devices"` becomes `/<node>/devices`), so they follow its name:
 
 | Service | Type | Does |
 | --- | --- | --- |
-| `/raft_esp32/devices` | `std_srvs/srv/Trigger` | Reports attached devices, chatter state, heap |
-| `/raft_esp32/chatter_enable` | `std_srvs/srv/SetBool` | Starts / stops `/chatter` |
-| `/raft_esp32/range` | `std_srvs/srv/Trigger` | A fresh VL6180 reading - a *deferred* reply (below) |
-| `/raft_esp32/ping` | `std_srvs/srv/Empty` | Nothing - a round-trip check |
+| `~/devices` | `std_srvs/srv/Trigger` | Reports attached devices, chatter state, heap |
+| `~/read` | `std_srvs/srv/Trigger` | A fresh reading from every attached device - a *deferred* reply (below) |
+| `~/chatter_enable` | `std_srvs/srv/SetBool` | Starts / stops `/chatter` |
+| `~/ping` | `std_srvs/srv/Empty` | Nothing - a round-trip check |
 
 ```bash
 ros2 service list -t                         # expect the four, plus the parameter services
-ros2 service call /raft_esp32/devices std_srvs/srv/Trigger
-#   success=True, message='1 device(s) attached, chatter on, chatter_in rx 0/0, heap free 173356 B'
-ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: false}"
+ros2 service call /<node>/devices std_srvs/srv/Trigger
+#   success=True, message='2 device(s) attached, chatter on, chatter_in rx 0/0, heap free 123968 B'
+ros2 service call /<node>/chatter_enable std_srvs/srv/SetBool "{data: false}"
 ros2 topic echo --once /chatter              # nothing arrives until ...
-ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: true}"
+ros2 service call /<node>/chatter_enable std_srvs/srv/SetBool "{data: true}"
 ```
 
 A handler runs on the main loop and answers from state it already holds
 (`MainSysMod.cpp`):
 
 ```cpp
-pRaftROS->addService("/raft_esp32/chatter_enable", "std_srvs::srv::dds_::SetBool_",
+pRaftROS->addService("~/chatter_enable", "std_srvs::srv::dds_::SetBool_",
     [pRaftROS](const RaftROS::ServiceRequest& request, RaftROS::ServiceReply& reply)
     {
         pRaftROS->setChatterEnabled(request.fields.data);
@@ -192,29 +328,36 @@ pRaftROS->addService("/raft_esp32/chatter_enable", "std_srvs::srv::dds_::SetBool
 A handler that needs the bus cannot wait for it - bus transactions happen on
 the bus task, and a handler runs on the main loop. It returns `Deferred` and
 the request is completed from a later loop pass with
-`completeService(token, reply)`. The third service shows this:
+`completeService(token, reply)`. `~/read` shows this, for any devices:
 
 ```bash
-ros2 service call /raft_esp32/range std_srvs/srv/Trigger
-#   success=True, message='range 255.0 mm valid=1, read 82 ms after the call'
+ros2 service call /<node>/read std_srvs/srv/Trigger
+#   success=True, message='APDS9960 1_39: als=3740 red=1055 green=1162 blue=1342 prox=0;
+#                          MPU6050 1_68: ax=0.6033 ay=0.3812 az=0.5671 temp=28.42 gx=-2.87 gy=0 gz=-0.6718'
 ```
 
-The handler parks the request; `MainSysMod::loop()` completes it from the
-first VL6180 poll result newer than the call, peeking the latest decoded
-result with `getLatestDecodedPollResponse` and comparing its `timeMs`. The
-reading is taken after the call, not served from a cache.
+The handler notes how many samples each attached device has delivered and
+parks the request; `MainSysMod::loop()` completes it once every device has
+delivered another, so each reading is taken after the call, not served from a
+cache. If a device has not delivered one by the `readTimeoutMs` parameter
+(2 s by default), the reply lists it as `no new reading` and has
+`success=False`. A second call while one is parked is refused.
 
-A second call while one is parked is refused; with the sensor unplugged no
-poll result comes and RaftROS answers the client with an error at the
-timeout (5 s) rather than leaving it hanging. (`ros2 service call` logs that
-error and then keeps waiting - give scripts their own timeout.)
-
-Peeking is the better pattern for "the latest reading when I need it": it
-costs nothing when nobody asks. An application can also subscribe to a
-device's data with `DeviceManager::registerForDeviceData`; RaftCore fans each
+Nothing in it is specific to a device. `MainSysMod` follows `DeviceManager`'s
+status callbacks to keep a table of identified devices and subscribes to each
+one's data with `DeviceManager::registerForDeviceData`; RaftCore fans each
 sample out to every subscriber, so this does not disturb auto-publishing
 (RaftCore `78781c0` or later - before that a second registration silently
-replaced the auto-publisher's and stopped the topic).
+replaced the auto-publisher's and stopped the topic). A sample is decoded
+with the device type record's own decoder (`pollResultDecodeFn`) and listed
+from its field table (`pollFieldDescs`: name, type, divisor, addend), scaled
+as RaftROS scales the device's topic. Plug in a sensor Raft can identify and
+it appears in the reply, as it appears as a topic.
+
+(`peekLatestDecodedPollResponse` returns the latest result without consuming
+it, but the service wants a sample taken after the request.
+`getLatestDecodedPollResponse` is not a peek: it reports only a result that is
+new since its last call, so a second reader sees nothing.)
 
 Serveable types are `std_srvs` `Trigger`, `SetBool` and `Empty` (plus the
 parameter services, which RaftROS adds itself); twelve service slots, six of
@@ -244,7 +387,7 @@ session. Both stand-ins print the device's node and per-endpoint tokens
 their key:
 
 ```
-SAMPLE #1 "Hello from raft_esp32 [35]"
+SAMPLE #1 "Hello from raftros_adbfb6 [35]"
     0/chatter/std_msgs::msg::dds_::String_/RIHS01_df668c74...
 SAMPLE #1 range=0.0170 m
     0/raft/range_1_29/sensor_msgs::msg::dds_::Range_/RIHS01_b42b6256...
@@ -297,17 +440,17 @@ The Zenoh build is a full ROS 2 parameter server: the six `rcl_interfaces`
 services are declared for the node, so the standard tools work.
 
 ```bash
-ros2 param list /raft_esp32
-ros2 param dump /raft_esp32
+ros2 param list /<node>
+ros2 param dump /<node>
 #   chatterEnable: true
 #   chatterPeriodMs: 1000
-#   rangeOffsetMm: 0.0
+#   readTimeoutMs: 2000
 #   routerHost: 192.168.86.192
 #   use_sim_time: false
-ros2 param set /raft_esp32 chatterPeriodMs 250    # /chatter now at 4 Hz
-ros2 param set /raft_esp32 chatterEnable false
-ros2 param describe /raft_esp32 routerHost
-ros2 param set /raft_esp32 routerHost 192.168.86.50
+ros2 param set /<node> chatterPeriodMs 250    # /chatter now at 4 Hz
+ros2 param set /<node> chatterEnable false
+ros2 param describe /<node> routerHost
+ros2 param set /<node> routerHost 192.168.86.50
 ```
 
 | Parameter | Type | Effect |
@@ -315,13 +458,14 @@ ros2 param set /raft_esp32 routerHost 192.168.86.50
 | `chatterEnable` | bool | Starts and stops `/chatter` at once |
 | `chatterPeriodMs` | int | Period of `/chatter`, 100-60000 ms |
 | `routerHost` | string | Zenoh router IPv4 address. **Persisted** in the same settings overlay `/api/postsettings` writes; the node reconnects to it once the reply has gone out |
-| `rangeOffsetMm` | double | The example's own: added to `/raft_esp32/range` readings |
+| `readTimeoutMs` | int | The example's own: how long `~/read` waits for every device, 100-4500 ms |
 | `use_sim_time` | bool | Read-only `false` (every ROS 2 node has it) |
 
 A refused set reports why, in the words a stock ROS 2 node uses
 (`Wrong parameter type, expected 'Type.INTEGER' got 'Type.STRING'`,
 `Trying to set a read-only parameter: use_sim_time.`) or the parameter
-owner's own (`chatterPeriodMs must be 100-60000`). Only `chatterEnable` and
+owner's own (`chatterPeriodMs must be 100-60000`, `readTimeoutMs must be
+100-4500 ...`). Only `chatterEnable` and
 `chatterPeriodMs` of the SysMod's settings are live as parameters;
 `active`, `routerHost` and `routerPort` are live through `/api/ros/set`, and
 the rest take effect through `/api/postsettings` and a reboot as before.
@@ -330,9 +474,19 @@ An application declares its own parameters on the SysMod and either reads
 them where they are used or takes a callback that can refuse a value:
 
 ```cpp
-pRaftROS->declareParameter("rangeOffsetMm", 0.0, "Added to every /raft_esp32/range reading, in mm");
+pRaftROS->declareParameter("readTimeoutMs", (int64_t)2000,
+    "How long ~/read waits for a fresh reading from every device, in ms", false,
+    [](const RaftROS::ParamValue& value, const char*& reason)
+    {
+        if (value.integerValue < 100 || value.integerValue > 4500)
+        {
+            reason = "readTimeoutMs must be 100-4500 (RaftROS times a deferred request out at 5 s)";
+            return false;
+        }
+        return true;
+    });
 ...
-const RaftROS::ParamValue* pOffset = pRaftROS->parameter("rangeOffsetMm");
+const RaftROS::ParamValue* pTimeout = pRaftROS->parameter("readTimeoutMs");
 ```
 
 Scalars only (bool, int64, double, string up to 63 characters); 16
@@ -350,7 +504,7 @@ time with `POST /api/postsettings/reboot` (persisted in NVS).
 | `enable` | the `alwaysEnable` argument of `registerSysMod` | Whether SysManager creates the SysMod at all (with it off there is no node and no `/api/ros`) |
 | `active` | `enable`'s value, else 0 | Whether the node runs: connects to the router, publishes, serves. Changed live with `/api/ros/set?active=0\|1` |
 | `domainId` | 0 | ROS 2 domain |
-| `nodeName` / `nodeNamespace` | `raft_esp32` / `/` | The node's name |
+| `nodeName` / `nodeNamespace` | the device's friendly name, made ROS-legal (`raftros_<mac6>` with this example's `SysManager.DefaultName`) / `/` | The node's name; change the default with `/api/friendlyname` or set `nodeName` |
 | `chatterEnable` | true | Publish `/chatter` |
 | `qosProfiles` | built-ins | Per-topic and per-class QoS (below) |
 | `routerHost` / `routerPort` | Kconfig (`CONFIG_RAFTROS_ZENOH_ROUTER_HOST`, empty as shipped) / 7447 | Zenoh router, IPv4 only; also set live with `/api/ros/set` |

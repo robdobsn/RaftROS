@@ -2913,7 +2913,7 @@ int main()
             // then mutate the source to prove storage is owned.
             char topicSrc[64];
             char typeSrc[64];
-            std::strcpy(topicSrc, "rt/raft_esp32/imu_1_6a");
+            std::strcpy(topicSrc, "rt/raft_node/imu_1_6a");
             std::strcpy(typeSrc,  "sensor_msgs::msg::dds_::Imu_");
 
             uint8_t eid[4] = {0};
@@ -2929,13 +2929,13 @@ int main()
 
             const auto* e = life.get(0);
             TEST_ASSERT(e != nullptr, "get(0) non-null");
-            TEST_ASSERT(e && std::strcmp(e->topic, "rt/raft_esp32/imu_1_6a") == 0,
+            TEST_ASSERT(e && std::strcmp(e->topic, "rt/raft_node/imu_1_6a") == 0,
                         "attach: owned topic survives source clobber");
             TEST_ASSERT(e && std::strcmp(e->type, "sensor_msgs::msg::dds_::Imu_") == 0,
                         "attach: owned type survives source clobber");
             TEST_ASSERT(e && e->key.busNum == 1 && e->key.address == 0x6A,
                         "attach: key stored");
-            TEST_ASSERT(std::strcmp(life.topicForSlot(0), "rt/raft_esp32/imu_1_6a") == 0,
+            TEST_ASSERT(std::strcmp(life.topicForSlot(0), "rt/raft_node/imu_1_6a") == 0,
                         "topicForSlot accessor");
             TEST_ASSERT(std::strcmp(life.typeForSlot(0),  "sensor_msgs::msg::dds_::Imu_") == 0,
                         "typeForSlot accessor");

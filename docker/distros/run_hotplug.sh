@@ -9,7 +9,7 @@ if ! docker ps --format '{{.Names}}' | grep -q "^$C$"; then
 fi
 ss -ltn | grep -q ':7447 ' || docker exec -d $C bash -c "source /opt/ros/$D/setup.bash; exec ros2 run rmw_zenoh_cpp rmw_zenohd >> /out/zenohd.log 2>&1"
 until ss -ltn | grep -q ':7447 '; do sleep 0.2; done
-until curl -s --max-time 2 http://192.168.86.230/api/rosstat | grep -q '"conn":"ready"'; do sleep 0.5; done
+until curl -s --max-time 2 http://${RAFTROS_DEVICE_IP:-192.168.86.230}/api/rosstat | grep -q '"conn":"ready"'; do sleep 0.5; done
 sleep 5
 echo "== hot-plug watch $D for ${SECS} s - unplug the sensor, wait ~30 s, plug it back" | tee $OUT/hotplug.log
 docker exec $C /opt/zenoh-venv/bin/python /opt/raftros-tests/hotplug_watch.py $SECS | tee -a $OUT/hotplug.log

@@ -1,9 +1,11 @@
 # RaftROS Zenoh over Serial: Investigation Plan
 
 **Date:** 2026-10-09
-**Status:** Investigation. Nothing implemented yet; the facts in
-[What is established](#what-is-established) were verified against the sources
-listed at the end on this date.
+**Status:** Working on hardware (2026-10-09). The native Zenoh backend runs
+over the z-serial link on an ESP32-S3's USB-Serial-JTAG port to a stock
+`rmw_zenohd` (ROS 2 Lyrical, apt) listening on that port - no bridge, no
+second cable. See [Results](#results-2026-10-09); the plan below is kept as
+written, with notes where the results changed it.
 **Scope:** Run the RaftROS Zenoh backend (Raft's own session, with zenoh-pico
 as a proving tool) over a serial link to the `rmw_zenohd` router instead of
 WiFi/TCP. The test bench is an ESP32-S3 Feather with an I2C device, cabled
@@ -18,6 +20,192 @@ Related: [overview](RaftROS-overview.md),
 [Zenoh implementation plan](RaftROS-zenoh-implementation-plan.md),
 [zenoh-pico comparison](RaftROS-zenoh-pico-comparison.md),
 [development status](RaftROS-development-status.md).
+
+## Results (2026-10-09)
+
+**Bench as built:** Unexpected Maker FeatherS3 (ESP32-S3, 16 MB flash, 8 MB
+PSRAM) with an APDS-9960 and an MPU6050 on its QWIIC connectors, one USB
+cable to the Linux box (`base8ubuntu`), ROS 2 Lyrical in the
+`raftros-lyrical` container. With no USB-UART adapter to hand, the link is
+the S3's **USB-Serial-JTAG** port (planned as a Step 5 follow-on); since
+2026-10-11 the console stays on that port and RaftROS takes it over only
+while the link is chosen (see "The console and the link share the port"). Firmware: `examples/ExampleDiscoverable`, SysType
+`SysTypeFeatherS3` (renamed from `SysTypeFeatherS3Serial` on 2026-10-10, when
+the link became a run-time choice).
+
+| Check | Result |
+| --- | --- |
+| Step 0: router has serial | `ros-lyrical-rmw-zenoh-cpp` 0.10.6: `libzenohc.so` contains `zenoh-link-serial`; a `serial//...` listen endpoint starts, beside `tcp/[::]:7447` |
+| pty proof (no board) | `tools/zenoh_serial_link.py relay` + the TCP session probe, and `zenoh_serial_tests --serial` (the C++ link and session) both hold a session with `rmw_zenohd` over a socat pty; `ros2 topic echo` decodes a Range sent over it |
+| Negotiated batch | 1500 (the device now offers 1500 on a serial link) |
+| Graph | the node (named after the device since 2026-10-11); `/raft/imu_1_68` (`sensor_msgs/Imu`), `/raft/illuminance_1_39` (`Illuminance`), `/raft/proximity_1_39` (`Range`), `/chatter`, `/chatter_in[2]` |
+| Rates | IMU 18.7 Hz (20 Hz poll), APDS-9960 9.6 Hz (10 Hz poll), `/chatter` 1.0 Hz, 4.0 Hz after `param set chatterPeriodMs 250` |
+| Services, parameters | Trigger, SetBool, Empty and `param dump/set` all answer over serial; three `/chatter_in` messages arrive (`chatter_in rx 3/0`) |
+| Router restart | node back within ~1 s of the router listening again |
+| Board reset with router down, router started later | node in the graph 1.6 s after the router starts |
+| Image | 1.30 MB, 26% of the app partition free; heap free ~126 kB |
+| 10-minute soak | Trigger call every 5 s: 115/115 answered, heap free 126,700 B at start and end, IMU still 18.8 Hz at the end |
+| Link chosen at run time (2026-10-10) | an image booted on `"link":"tcp"` moved to serial after a link change through the REST dispatcher (then `/api/roslink/set?link=usbjtag` in MainSysMod; since 2026-10-11 the same keys are on RaftROS's own `/api/ros/set`); with `persist=1` a re-flashed image came up on serial; a USB-console image (`SysTypeMain`) refuses with the reason |
+
+Not yet done: board reset while the router holds the port (the router opens
+it exclusively, so it needs the reset button or a cable pull), the 12-hour soak,
+loop-timing figures from `/api/rosstat` (this board has no WiFi credentials,
+so the API is unreachable; SysMan's own report showed RaftROS at ~1 ms
+typical), and baud/throughput limits (USB-Serial-JTAG ignores baud).
+
+### What the hardware changed in the plan
+
+- **The router tears the link down on any bad frame.** z-serial's
+  `read_msg` returns an error for a COBS, length or CRC failure, and
+  `zenoh-link-serial` closes the link on a read error. It tolerates junk only
+  while waiting for the handshake. So the drop-and-resync sequence policy
+  proposed below is moot on the router side, and the device keeps its strict
+  `SequenceMismatch` (symmetrical: a corrupted frame costs a session either
+  way, recovered in about a second). Over USB the link is CRC-checked by USB
+  itself, so corruption is not expected.
+- **Nothing else may write to the port.** For the same reason, while the
+  link is on, nothing else may touch the port. At first that meant moving the
+  console to UART0 at build time; since 2026-10-11 it is done at run time -
+  see "The console and the link share the port" below. The ROM bootloader
+  still prints to USB at reset; the router is then waiting for a handshake
+  and ignores it.
+- **Stale I frames.** Until the host opens the port, frames queue in the
+  device's USB TX ring. Retrying I every 250 ms filled it, and when a
+  listener opened the port it got a burst of I frames and answered
+  alternately I|A and R (z-serial does the same), so the link flapped for
+  several seconds. The device now sends another I only once the last has left
+  (`usb_serial_jtag_wait_tx_done(0)`).
+- **Batch size.** Through a TCP bridge the router negotiated 4096, larger
+  than a serial frame; `ZenohTCPSession::start` now takes the batch to offer
+  and the serial link offers 1500.
+- **Step 2 (zenoh-pico proof) skipped.** Its ESP-IDF serial backend drives a
+  UART, not USB-Serial-JTAG, so it would have needed more than the pin patch;
+  the Python relay and the host-built C++ link proved the router side instead.
+- **Board reset and USB re-enumeration.** `release_on_close` defaults to
+  true, so the listener reopens the path on every accept, and it keeps
+  retrying while the device is absent. A `/dev/serial/by-id/...` path keeps
+  the name stable; colons in it are fine in the locator.
+
+### The console and the link share the port (2026-10-11)
+
+The link no longer needs a console-on-UART build. Everything that writes to
+or reads from USB-Serial-JTAG in a normal Raft image, found by searching
+RaftCore, RaftI2C, RaftSysMods, RaftWebServer and RaftROS:
+
+| Writer / reader | Route |
+| --- | --- |
+| Raft `LOG_x` | `LoggerCore` - direct USB-Serial-JTAG writes once the driver is installed, `printf` before |
+| ESP-IDF `ESP_LOGx` (WiFi, MQTT, LogManager, DNSResolver, WebServer...) | SerialConsole's `esp_log_set_vprintf` hook, writing to the driver |
+| Console replies, RICSerial protocol | `SerialConsole::putStr` / `sendMsg` |
+| Console input (would eat the router's frames) | `SerialConsole::getChar` |
+| Anything else on `stdout`/`stderr` | VFS -> driver |
+| ROM `printf` (`esp_rom_printf`, `ESP_EARLY_LOG`, `ESP_DRAM_LOG`, often from ISRs) | straight to the USB hardware |
+
+No other `printf`, `puts`, `std::cout`, `ets_printf` or `esp_rom_printf` is in
+the Raft libraries except `tinyexpr`'s unused `te_print` and RaftROS's
+RTPS-only hex dump. Panic output happens at reset, when the link goes anyway.
+
+So, when the link is chosen (at boot from settings, from the API, or typed
+at the console):
+
+1. **RaftSysMods `SerialConsole`** gets `{"cmd":"releasePort"}` through
+   `SysManager::sendCmdJSON`: it stops reading the port and stops writing
+   (`putStr`, `sendMsg`) until `{"cmd":"reclaimPort"}`. The driver stays
+   installed and RaftROS uses it.
+2. **RaftCore `RaftConsolePort::claim()`** silences the rest: `LoggerCore`
+   stops writing to the console (other loggers - LogManager's network
+   loggers - still get every line), the ESP-IDF log hook is replaced (the
+   previous one is saved), `stdout` (one FILE shared by every task) is
+   `freopen`ed to `/dev/null`, and ROM printf channel 1 goes to a no-op.
+   `release()` restores each in turn, ROM output as ESP-IDF's startup sets
+   it for the console.
+3. The link then starts its handshake. Text already queued for the console
+   reaches the router while it is waiting for an I frame, which it ignores.
+
+Choosing TCP (or deactivating the node) reverses this. With the port claimed
+the link also watches the incoming bytes for a typed line `ros/set?...` or
+`ros/clear` and passes it to the REST API, so the console can be had back
+from a terminal with the router stopped; on a taken line it resyncs its
+decoder so a frame that follows is not lost.
+
+RaftROS refuses the link, saying why, if this RaftCore has no
+`RaftConsolePort` (`__has_include`) or SerialConsole does not accept
+`releasePort`, so older libraries still build and behave as before. An image
+whose console is on UART needs none of this and claims nothing.
+
+Tested on the FeatherS3 (console on USB, `SysTypeFeatherS3`):
+
+| Check | Result |
+| --- | --- |
+| Boot with `link=usbjtag` persisted | console output to 1.37 s, the "taking the USB port" line, then only I frames - 48 frames, 0 bytes of anything else in 13 s, across a SysMan report |
+| 3 minutes of parameter sets, `~/read` and SetBool calls with the board logging | 423/423 calls answered, no serial errors in the router log, IMU 18.6 Hz |
+| `ros/set?link=tcp` typed with the router stopped | "USB port given back to the console", SysMan reports and the endpoint list on the console again |
+| `ros/set?link=usbjtag` typed at a live console (no reset, uptime 28 s) | reply printed, then the claim, 21 frames and 0 stray bytes; router sees the node, `~/read` answers, IMU 18.6 Hz |
+| `ros/set?link=tcp&persist=1`, reset | console stays live, no claim |
+| WiFi, TCP router (normal operation, console on `raft m --agent-stream`) | node, services, `/chatter`, IMU 18.6 Hz; console shows the session; `loopMaxUs` 4019 |
+| `/api/ros/set?link=usbjtag` over HTTP | ready on serial in ~2 s; 285/285 calls in 2 min, IMU 18.5 Hz, batch 1500, `serCrcErr` 0, `loopMaxUs` 4476, heap 122.9 kB |
+| `/api/ros/set?link=tcp` over HTTP | back on TCP in ~7 s; `~/read` answers; console live again (endpoint list, `ros` reply, SysMan reports); router restart recovered |
+
+### Pieces
+
+- `components/RaftROS/Zenoh/ZenohSerialFramer.h` - CRC, COBS, frame encode,
+  byte-fed decoder with counters (host-tested against z-serial's vectors and
+  a corruption fuzz).
+- `components/RaftROS/Zenoh/ZenohSerialLink.h` - the I / I|A / R handshake
+  and one-batch-per-frame I/O over any non-blocking byte port.
+- `ZenohTCPSession` - `receiveBatch()` and `pendingBatch()` for datagram
+  links; `start()` takes the batch size to offer.
+- `RaftROSZenoh` - `"link": "tcp" | "usbjtag"` in the `RaftROS` SysTypes
+  block (default tcp), changeable at run time with
+  `/api/ros/set?link=tcp|usbjtag&linkLogs=0|1&persist=0|1` (or
+  `RaftROS::requestLinkConfig` from application code) and persisted on
+  request; `/api/ros` reports `link`, `serialAvailable` and the reason when it
+  is not; `CONFIG_RAFTROS_ZENOH_SERIAL_LINK`
+  builds the support in (default y), and the link's ~4.5 kB of buffers are
+  allocated only when it is first used; serial counters in `/api/rosstat` (`serIn`, `serOut`, `serCrcErr`,
+  `serBadFrame`, `serInits`, `serInitsHeld`, `serLinkUps`, `serResets`,
+  `serTxFull`); serial-specific `ROUTER UNREACHABLE` lines that name the
+  `/dev/serial/by-id` path to listen on. `"linkLogs": 1` copies log lines onto
+  the link between frames for `tools/zenoh_serial_link.py bridge` to print -
+  bring-up only, since a real router drops the link on them.
+- `tools/zenoh_serial_link.py` - `selftest`, `bridge` (serial to a TCP
+  router, printing the device's log lines), `relay` (a TCP client over serial
+  to a serial router), `tap`.
+- `linux_unit_tests/zenoh_serial_tests.cpp` (`make zenoh-serial-test`).
+- `docker/distros/demo.sh` - `RAFTROS_SERIAL=<port>` gives the container the
+  host's `/dev` (ttyACM/ttyUSB only) and adds the serial listen endpoint.
+
+### Found on the way (not serial)
+
+- **Connector power belongs to RaftI2C (fixed 2026-10-11).** The example
+  powered its STEMMA QT / QWIIC connector from `main.cpp` (a GPIO toggled
+  before the buses started). RaftI2C's `BusPowerController` - the bus `pwr`
+  block the Axiom uses - does this properly (off at boot, on, power-cycle on
+  demand) but only drove PCA9535 expander pins: it called `BusIOExpanders`
+  directly, which refuses a pin no expander owns. It now hands such pins to
+  `RaftBusSystem::virtualPinsSet`, which offers them to every bus and then
+  drives them as plain GPIOs, so a GPIO-switched connector is configuration.
+  Verified on the FeatherS3 with GPIO 39: off at 37 ms and 466 ms, on at
+  968 ms, output register reads 1. The change is in `raftdevlibs/RaftI2C`
+  and needs to reach RaftI2C `main`.
+
+- **Double scaling in auto-publish (fixed in RaftCore's `DecodeGenerator.py`).**
+  The standard generated decoder applies an attribute's `d` and `a` while
+  decoding, but the field table carried them too, and RaftROS,
+  `DeviceManager::getBusDeviceNamedValue` and the Axiom DataLogger apply the
+  table's values - so every plain record with a `d` (SHT40, AHT20, TMP117,
+  LPS25, ...) was scaled twice. The table now holds what is still to apply:
+  1/0 for a standard decode, `d`/`a` for a custom decode (whose code stores
+  raw values, as raftjs already assumed). The example's MPU6050 is now a
+  standard record; APDS9960 stays custom as an example of one.
+- **A custom decode without `next;` reported no records (fixed):** the
+  generator appends `next;` when the program has none. SCD40 still decodes
+  wrongly - its code reads single bytes of a 9-byte response and scales
+  values that the table scales again - which is a record bug, left as is.
+- `ExampleDiscoverable` cannot be built by `raft build` in Docker: its
+  `EXTRA_COMPONENT_DIRS` points four levels up, outside the mounted folder,
+  which resolves to `/` in the container. Building with the whole repository
+  mounted works (see the example README).
 
 ## Why this is the right layer
 
@@ -164,8 +352,9 @@ Data frames then carry header `0`.
 ## Test bench on the Linux box
 
 - **Board:** Adafruit ESP32-S3 TFT Feather with the VL6180 range sensor on
-  STEMMA QT (I2C SDA 42 / SCL 41, GPIO 21 powers the connector; the example's
-  `main.cpp` already does this). Its UART header pins are TX = GPIO1,
+  STEMMA QT (I2C SDA 42 / SCL 41, GPIO 21 powers the connector; since
+  2026-10-11 the bus's `pwr` block in SysTypes switches it, through RaftI2C's
+  bus power controller). Its UART header pins are TX = GPIO1,
   RX = GPIO2 (confirm against the Adafruit pinout page before wiring).
 - **Cabling:** two USB cables. The Feather's native USB stays the console
   and flashing port (`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`, as now). A
@@ -237,7 +426,7 @@ Cheapest end-to-end proof that the hardware, baud and router config are right.
    instead of `routerHost` when present, e.g.
    `"routerSerial": "1.2#baudrate=921600"` giving `serial/1.2#baudrate=921600`.
 4. Build with `CONFIG_RAFTROS_BACKEND_ZENOH_PICO=y`, flash, and expect
-   `ros2 node list` to show `raft_esp32`, `/chatter` to echo, and the VL6180
+   `ros2 node list` to show the node, `/chatter` to echo, and the VL6180
    range topic to publish. Record `/api/rosstat` loop timings and heap.
 
 If this works the host side is proven and everything after is firmware.
@@ -290,7 +479,7 @@ Same checklist as the Zenoh milestone, over serial:
 - `/chatter` echo and publish to `/chatter_in`, both directions.
 - VL6180 range topic rate and latency; hot-plug (unplug the sensor, topic
   withdrawn, re-plug, re-announced).
-- Services (`/raft_esp32/devices`, `/raft_esp32/chatter_enable`) and
+- Services (`/<node>/devices`, `/<node>/chatter_enable`) and
   parameters (`ros2 param list/get/set/dump`).
 - Recovery: board reset, router restart, cable pulled and replaced. Each
   must come back with one session and the counters explaining what happened.

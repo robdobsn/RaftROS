@@ -12,9 +12,8 @@
 #include "DeviceManager.h"
 #include "DeviceTypeRecords.h"
 #include "RaftBusSystem.h"
-#include "DevicePollRecords_generated.h"
-
-static constexpr const char* RANGE_DEVICE_TYPE = "VL6180";
+#include "DeviceTypeRecord.h"
+#include <algorithm>
 
 MainSysMod::MainSysMod(const char *pModuleName, RaftJsonIF& sysConfig)
     : RaftSysMod(pModuleName, sysConfig)
@@ -79,8 +78,9 @@ void MainSysMod::setup()
 
             // Services (Zenoh build).  A handler runs on the main loop and
             // answers at once from state it already holds - nothing here waits.
-            //   ros2 service call /raft_esp32/devices std_srvs/srv/Trigger
-            pRaftROS->addService("/raft_esp32/devices", "std_srvs::srv::dds_::Trigger_",
+            // "~/" names are relative to the node, whatever it is called.
+            //   ros2 service call /<node>/devices std_srvs/srv/Trigger
+            pRaftROS->addService("~/devices", "std_srvs::srv::dds_::Trigger_",
                 [this, pRaftROS](const RaftROS::ServiceRequest&, RaftROS::ServiceReply& reply)
                 {
                     snprintf(_serviceMsg, sizeof(_serviceMsg),
@@ -93,36 +93,55 @@ void MainSysMod::setup()
                     reply.fields.message = _serviceMsg;
                     return RaftROS::ServiceOutcome::Replied;
                 });
-            //   ros2 service call /raft_esp32/range std_srvs/srv/Trigger
-            // Deferred: answered by loop() from the next poll result; if none
-            // comes (sensor unplugged) the SysMod answers an error at the timeout
-            pRaftROS->addService("/raft_esp32/range", "std_srvs::srv::dds_::Trigger_",
+            //   ros2 service call /<node>/read std_srvs/srv/Trigger
+            // Deferred: answered by loop() once every attached device has a
+            // reading newer than the call (see serviceReadRequest)
+            pRaftROS->addService("~/read", "std_srvs::srv::dds_::Trigger_",
                 [this](const RaftROS::ServiceRequest& request, RaftROS::ServiceReply& reply)
                 {
-                    if (_rangeRequestPending)
+                    if (_readRequestPending)
                     {
-                        reply.reason = "a range read is already in progress";
+                        reply.reason = "a read is already in progress";
                         return RaftROS::ServiceOutcome::Refused;
                     }
-                    _rangeToken = request.token;
-                    poll_VL6180 latest = {};
-                    _rangePollTimeAtRequest = peekRange(latest) ? latest.timeMs : 0;
-                    _rangeRequestMs = millis();
-                    _rangeRequestPending = true;
+                    if (attachedCount() == 0)
+                    {
+                        reply.fields.success = true;
+                        reply.fields.message = "no devices attached";
+                        return RaftROS::ServiceOutcome::Replied;
+                    }
+                    {
+                        std::lock_guard<std::mutex> lock(_dataMutex);
+                        for (AttachedDevice& device : _attachedDevices)
+                            device.samplesAtRequest = device.samples;
+                    }
+                    _readToken = request.token;
+                    _readRequestMs = millis();
+                    _readRequestPending = true;
                     return RaftROS::ServiceOutcome::Deferred;
                 });
-            // A parameter of the application's own: read where it is used
-            // (serviceRangeRequest), so no callback is needed
-            //   ros2 param set /raft_esp32 rangeOffsetMm 4.5
-            pRaftROS->declareParameter("rangeOffsetMm", 0.0, "Added to every /raft_esp32/range reading, in mm");
-            //   ros2 service call /raft_esp32/ping std_srvs/srv/Empty
-            pRaftROS->addService("/raft_esp32/ping", "std_srvs::srv::dds_::Empty_",
+            // A parameter of the application's own, with a callback that
+            // refuses values out of range; read where it is used
+            //   ros2 param set /<node> readTimeoutMs 1000
+            pRaftROS->declareParameter("readTimeoutMs", (int64_t)READ_TIMEOUT_DEFAULT_MS,
+                "How long ~/read waits for a fresh reading from every device, in ms", false,
+                [](const RaftROS::ParamValue& value, const char*& reason)
+                {
+                    if (value.integerValue < 100 || value.integerValue > 4500)
+                    {
+                        reason = "readTimeoutMs must be 100-4500 (RaftROS times a deferred request out at 5 s)";
+                        return false;
+                    }
+                    return true;
+                });
+            //   ros2 service call /<node>/ping std_srvs/srv/Empty
+            pRaftROS->addService("~/ping", "std_srvs::srv::dds_::Empty_",
                 [](const RaftROS::ServiceRequest&, RaftROS::ServiceReply&)
                 {
                     return RaftROS::ServiceOutcome::Replied;
                 });
-            //   ros2 service call /raft_esp32/chatter_enable std_srvs/srv/SetBool "{data: false}"
-            pRaftROS->addService("/raft_esp32/chatter_enable", "std_srvs::srv::dds_::SetBool_",
+            //   ros2 service call /<node>/chatter_enable std_srvs/srv/SetBool "{data: false}"
+            pRaftROS->addService("~/chatter_enable", "std_srvs::srv::dds_::SetBool_",
                 [pRaftROS](const RaftROS::ServiceRequest& request, RaftROS::ServiceReply& reply)
                 {
                     pRaftROS->setChatterEnabled(request.fields.data);
@@ -136,78 +155,219 @@ void MainSysMod::setup()
             LOG_W(MODULE_PREFIX, "RaftROS SysMod not found - cannot register handler");
         }
 
-        // The range service's view of the sensor: which device it is (status
-        // callbacks - a list, so this does not displace anyone else's)
+        // The devices ~/read reports: every identified device, of any type
+        // (status callbacks are a list, so this does not displace anyone else's)
         DeviceManager* pDevMan = getSysManager()->getDeviceManager();
         if (pDevMan)
         {
             pDevMan->registerForDeviceStatusChange(
                 [this](RaftDevice& device, const BusAddrStatus& addrStatus)
                 {
-                    DeviceTypeRecord devTypeRec;
-                    if (!deviceTypeRecords.getDeviceInfo(addrStatus.deviceTypeIndex, devTypeRec) ||
-                        !devTypeRec.deviceType || strcmp(devTypeRec.deviceType, RANGE_DEVICE_TYPE) != 0)
-                        return;
-                    if (addrStatus.onlineState == DeviceOnlineState::ONLINE)
-                    {
-                        _rangeDeviceID = device.getDeviceID();
-                        _rangeAttached = true;
-                    }
-                    else if (addrStatus.isChange)
-                        _rangeAttached = false;
+                    onDeviceStatusChange(device, addrStatus);
                 });
         }
     }
 }
 
-/// @brief The latest decoded VL6180 poll, without consuming it
-bool MainSysMod::peekRange(poll_VL6180& poll)
+/// @brief Keep the table of identified devices current, and subscribe to
+/// each one's data.  Runs on the loop task.
+void MainSysMod::onDeviceStatusChange(RaftDevice& device, const BusAddrStatus& addrStatus)
 {
-    RaftBus* pBus = _rangeAttached ? raftBusSystem.getBusByNumber(_rangeDeviceID.getBusNum()) : nullptr;
-    RaftBusDevicesIF* pDevicesIF = pBus ? pBus->getBusDevicesIF() : nullptr;
-    return pDevicesIF && pDevicesIF->getLatestDecodedPollResponse(_rangeDeviceID.getAddress(),
-                                                                  &poll, sizeof(poll), _rangeDecodeState);
+    DeviceManager* pDevMan = getSysManager() ? getSysManager()->getDeviceManager() : nullptr;
+    if (!pDevMan)
+        return;
+    const RaftDeviceID deviceID = device.getDeviceID();
+    AttachedDevice* pKnown = nullptr;
+    AttachedDevice* pFree = nullptr;
+    for (AttachedDevice& slot : _attachedDevices)
+    {
+        if (slot.used && slot.deviceID == deviceID)
+            pKnown = &slot;
+        else if (!slot.used && !pFree)
+            pFree = &slot;
+    }
+    if (addrStatus.onlineState == DeviceOnlineState::ONLINE &&
+        addrStatus.deviceTypeIndex != DEVICE_TYPE_INDEX_INVALID)
+    {
+        if (pKnown || !pFree)
+            return;
+        {
+            std::lock_guard<std::mutex> lock(_dataMutex);
+            pFree->used = true;
+            pFree->key = _nextDeviceKey++;
+            pFree->deviceID = deviceID;
+            pFree->deviceTypeIndex = addrStatus.deviceTypeIndex;
+            pFree->samples = pFree->samplesAtRequest = 0;
+            pFree->latest.clear();
+            pFree->decodeState = RaftBusDeviceDecodeState();
+        }
+        pDevMan->registerForDeviceData(deviceID,
+            [this](uint16_t /*deviceTypeIdx*/, std::vector<uint8_t> data, const void* pCallbackInfo)
+            {
+                onDeviceData(std::move(data), pCallbackInfo);
+            },
+            0, reinterpret_cast<const void*>(pFree->key));
+    }
+    else if (pKnown && addrStatus.isChange)
+    {
+        pDevMan->registerForDeviceData(deviceID, nullptr, 0, reinterpret_cast<const void*>(pKnown->key), true);
+        std::lock_guard<std::mutex> lock(_dataMutex);
+        pKnown->used = false;
+        pKnown->latest.clear();
+    }
 }
 
-/// @brief Complete a parked /raft_esp32/range request once a poll result has
-/// arrived since it was made.  Loop task only - completeService requires it.
-void MainSysMod::serviceRangeRequest()
+/// @brief A device's poll data.  Runs on the bus task: keep the latest and
+/// count it, nothing more.  A callback for a device that has gone finds no
+/// slot with its key and is dropped.
+void MainSysMod::onDeviceData(std::vector<uint8_t>&& data, const void* pCallbackInfo)
 {
-    if (!_rangeRequestPending)
+    const uintptr_t key = reinterpret_cast<uintptr_t>(pCallbackInfo);
+    std::lock_guard<std::mutex> lock(_dataMutex);
+    for (AttachedDevice& slot : _attachedDevices)
+    {
+        if (slot.used && slot.key == key)
+        {
+            slot.latest = std::move(data);
+            ++slot.samples;
+            return;
+        }
+    }
+}
+
+uint8_t MainSysMod::attachedCount() const
+{
+    uint8_t count = 0;
+    for (const AttachedDevice& slot : _attachedDevices)
+        count += slot.used ? 1 : 0;
+    return count;
+}
+
+/// @brief Append "<type> <bus>_<addr>: name=value ..." for a device's latest
+/// sample, decoded with its type's decoder and listed from its field table.
+/// Values are scaled by the table's divisor and addend, as RaftROS does for
+/// the device's topic, so the two agree.  Loop task.
+void MainSysMod::appendReading(AttachedDevice& device, bool fresh, String& out)
+{
+    DeviceTypeRecord devTypeRec;
+    if (!deviceTypeRecords.getDeviceInfo(device.deviceTypeIndex, devTypeRec))
         return;
-    RaftSysMod* pRos = getSysManager() ? getSysManager()->getSysMod("RaftROS") : nullptr;
-    RaftROS* pRaftROS = static_cast<RaftROS*>(pRos);
+    out += String(out.length() ? "; " : "") + (devTypeRec.deviceType ? devTypeRec.deviceType : "?") +
+           " " + device.deviceID.toString() + ":";
+    std::vector<uint8_t> data;
+    if (fresh)
+    {
+        std::lock_guard<std::mutex> lock(_dataMutex);
+        data = device.latest;
+    }
+    if (!fresh || data.empty() || !devTypeRec.pollResultDecodeFn || !devTypeRec.pollFieldDescs ||
+        devTypeRec.pollStructSize == 0)
+    {
+        out += " no new reading";
+        return;
+    }
+    // A sample may hold several records (a FIFO read); the last is the newest
+    const uint32_t maxRecords = std::max<uint32_t>(1, std::min<uint32_t>(16, 4096 / devTypeRec.pollStructSize));
+    if (_decodeBuf.size() < maxRecords * devTypeRec.pollStructSize)
+        _decodeBuf.resize(maxRecords * devTypeRec.pollStructSize);
+    const uint32_t numRecords = devTypeRec.pollResultDecodeFn(data.data(), data.size(), _decodeBuf.data(),
+                                    _decodeBuf.size(), maxRecords, device.decodeState);
+    if (numRecords == 0)
+    {
+        out += " undecodable sample";
+        return;
+    }
+    const uint8_t* pRecord = _decodeBuf.data() + (numRecords - 1) * devTypeRec.pollStructSize;
+    for (uint16_t index = 0; index < devTypeRec.pollFieldCount; ++index)
+    {
+        const AttrFieldDesc& field = devTypeRec.pollFieldDescs[index];
+        const uint8_t* pField = pRecord + field.offset;
+        double value = 0;
+        switch (field.type)
+        {
+            case AttrType::Float:  { float v;    memcpy(&v, pField, sizeof(v)); value = v; break; }
+            case AttrType::Int32:  { int32_t v;  memcpy(&v, pField, sizeof(v)); value = v; break; }
+            case AttrType::Uint32: { uint32_t v; memcpy(&v, pField, sizeof(v)); value = v; break; }
+            case AttrType::Int16:  { int16_t v;  memcpy(&v, pField, sizeof(v)); value = v; break; }
+            case AttrType::Uint16: { uint16_t v; memcpy(&v, pField, sizeof(v)); value = v; break; }
+            case AttrType::Int8:   value = (int8_t)*pField; break;
+            case AttrType::Uint8:
+            case AttrType::Bool:   value = *pField; break;
+        }
+        if (field.divisor != 0.0f && field.divisor != 1.0f)
+            value /= field.divisor;
+        value += field.addend;
+        char text[48];
+        // An array attribute (a multizone frame, say) shows its first element and its size
+        if (field.count > 1)
+            snprintf(text, sizeof(text), " %s[%u]=%.4g..", field.name, (unsigned)field.count, value);
+        else
+            snprintf(text, sizeof(text), " %s=%.4g", field.name, value);
+        out += text;
+    }
+}
+
+/// @brief Complete a parked ~/read once every attached device has delivered
+/// a sample since the call, or at readTimeoutMs with what has arrived.  Loop
+/// task only - completeService requires it.
+void MainSysMod::serviceReadRequest()
+{
+    if (!_readRequestPending)
+        return;
+    RaftROS* pRaftROS = getRaftROS();
     if (!pRaftROS)
     {
-        _rangeRequestPending = false;
+        _readRequestPending = false;
         return;
     }
-    poll_VL6180 poll = {};
-    if (!peekRange(poll) || poll.timeMs == _rangePollTimeAtRequest)
+    bool allFresh = true;
     {
-        // Nothing newer from the bus yet.  RaftROS answers the client with an
-        // error at the timeout; drop our side once that has passed.
-        if (Raft::isTimeout(millis(), _rangeRequestMs, 10000))
-            _rangeRequestPending = false;
-        return;
+        std::lock_guard<std::mutex> lock(_dataMutex);
+        for (const AttachedDevice& device : _attachedDevices)
+            if (device.used && device.samples == device.samplesAtRequest)
+                allFresh = false;
     }
+    const RaftROS::ParamValue* pTimeout = pRaftROS->parameter("readTimeoutMs");
+    const uint32_t timeoutMs = pTimeout ? (uint32_t)pTimeout->integerValue : (uint32_t)READ_TIMEOUT_DEFAULT_MS;
+    if (!allFresh && !Raft::isTimeout(millis(), _readRequestMs, timeoutMs))
+        return;
+
+    _readReply = "";
+    bool allReported = true;
+    for (AttachedDevice& device : _attachedDevices)
+    {
+        if (!device.used)
+            continue;
+        bool fresh = false;
+        {
+            std::lock_guard<std::mutex> lock(_dataMutex);
+            fresh = device.samples != device.samplesAtRequest;
+        }
+        allReported = allReported && fresh;
+        appendReading(device, fresh, _readReply);
+    }
+    if (_readReply.length() == 0)
+        _readReply = "no devices attached";
+    static const unsigned MAX_REPLY_CHARS = 450;
+    if (_readReply.length() > MAX_REPLY_CHARS)
+        _readReply = _readReply.substring(0, MAX_REPLY_CHARS - 2) + "..";
     RaftROS::ServiceReply reply;
-    {
-        // The rangeOffsetMm parameter (ros2 param set /raft_esp32 rangeOffsetMm 4.5)
-        const RaftROS::ParamValue* pOffset = pRaftROS->parameter("rangeOffsetMm");
-        const double offsetMm = pOffset ? pOffset->doubleValue : 0.0;
-        snprintf(_rangeMsg, sizeof(_rangeMsg), "range %.1f mm (offset %.1f) valid=%d, read %u ms after the call",
-                 (double)poll.dist + offsetMm, offsetMm, (int)poll.valid, (unsigned)(millis() - _rangeRequestMs));
-        reply.fields.success = true;
-    }
-    reply.fields.message = _rangeMsg;
-    pRaftROS->completeService(_rangeToken, reply);   // false if it already timed out
-    _rangeRequestPending = false;
+    reply.fields.success = allReported;
+    reply.fields.message = _readReply.c_str();
+    pRaftROS->completeService(_readToken, reply);   // false if it already timed out
+    _readRequestPending = false;
+}
+
+/// @brief The RaftROS SysMod, or nullptr if it is not running
+RaftROS* MainSysMod::getRaftROS()
+{
+    RaftSysMod* pRos = getSysManager() ? getSysManager()->getSysMod("RaftROS") : nullptr;
+    return static_cast<RaftROS*>(pRos);
 }
 
 void MainSysMod::loop()
 {
-    serviceRangeRequest();
+    serviceReadRequest();
 
     // Check for loop rate
     if (Raft::isTimeout(millis(), _lastLoopMs, 1000))

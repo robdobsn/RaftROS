@@ -5,7 +5,7 @@
 // Phase 4, Slice 4.2.  Composes an `RTPSDynamicWriterRegistry` with parallel **owned**
 // topic / type string storage.  The registry alone stores `const char*` non-owning
 // pointers (§5.1 of the design doc); but the wrapper builds topic/type strings
-// dynamically per device (e.g. `rt/raft_esp32/imu_1_6a`) and needs somewhere to
+// dynamically per device (e.g. `rt/raft/imu_1_6a`) and needs somewhere to
 // keep them alive for the slot's lifetime.  This helper provides that storage and
 // presents a minimal attach / detach API mirroring the `DeviceManager`
 // `registerForDeviceStatusChange` event flow.

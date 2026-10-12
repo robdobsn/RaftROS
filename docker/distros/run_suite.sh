@@ -6,7 +6,7 @@
 # ~/distro-tests/<distro>/.  Only one distribution's router may run at a time.
 set -u
 D=$1; LOAD=${2:-600}
-DEV=192.168.86.230
+DEV=${RAFTROS_DEVICE_IP:-192.168.86.230}
 OUT=$HOME/distro-tests/$D; mkdir -p $OUT; LOG=$OUT/suite.log; : > $LOG
 C=raftros-$D
 say() { echo "$(date +%T) $*" | tee -a $LOG; }
@@ -42,9 +42,10 @@ grep FAIL $OUT/functional.txt | tee -a $LOG
 
 say "-- raw queries"; docker exec $C /opt/zenoh-venv/bin/python /opt/raftros-tests/raw_queries.py 2>&1 | tee -a $LOG; stat "raw queries"
 say "-- 3000-byte string to /chatter_in"; x "timeout -s KILL 15 ros2 topic pub --once -w 0 /chatter_in std_msgs/msg/String \"{data: '\$(printf 'x%.0s' \$(seq 3000))'}\" > /dev/null 2>&1; echo exit \$?" | tee -a $LOG; stat "3 kB string"
-say "-- 8 concurrent range calls"
-x "for i in 1 2 3 4 5 6 7 8; do (timeout -s KILL 20 ros2 service call /raft_esp32/range std_srvs/srv/Trigger 2>&1 | grep -o 'success=True\|z_reply_is_ok returned False' | head -1 | sed \"s/^/call \$i: /\") & done; wait" | sort | tee -a $LOG; stat "burst"
-x "timeout -s KILL 20 ros2 service call /raft_esp32/ping std_srvs/srv/Empty 2>&1 | grep -o Empty_Response" | sed 's/^/after burst: /' | tee -a $LOG
+NODE=${RAFTROS_NODE:-$(x "timeout -s KILL 20 ros2 node list --no-daemon" | grep -v -e foxglove -e _ros2cli -e '^$' | head -1)}
+say "-- 8 concurrent read calls ($NODE/read)"
+x "for i in 1 2 3 4 5 6 7 8; do (timeout -s KILL 20 ros2 service call $NODE/read std_srvs/srv/Trigger 2>&1 | grep -o 'success=True\|z_reply_is_ok returned False' | head -1 | sed \"s/^/call \$i: /\") & done; wait" | sort | tee -a $LOG; stat "burst"
+x "timeout -s KILL 20 ros2 service call $NODE/ping std_srvs/srv/Empty 2>&1 | grep -o Empty_Response" | sed 's/^/after burst: /' | tee -a $LOG
 
 say "-- graph visibility (40 liveliness queries)"; docker exec $C /opt/zenoh-venv/bin/python /opt/raftros-tests/liveliness.py 40 | tee -a $LOG
 
@@ -56,7 +57,7 @@ done
 sleep 5; stat "after router restarts"
 
 say "-- routerHost set through the parameter service"
-x "timeout -s KILL 20 ros2 param set /raft_esp32 routerHost $(hostname -I | awk '{print $1}')" | tee -a $LOG
+x "timeout -s KILL 20 ros2 param set $NODE routerHost $(hostname -I | awk '{print $1}')" | tee -a $LOG
 sleep 1; say "   ready again after $(ready_wait) s"; stat "after routerHost set"
 
 say "-- boot with no router (60 s)"; router_stop

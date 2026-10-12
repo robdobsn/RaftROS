@@ -7,6 +7,7 @@
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
 
 #include "RaftROSZenohPico.h"
+#include "RaftROSNodeName.h"
 #include "RaftJson.h"
 #include "RestAPIEndpointManager.h"
 #include "RaftUtils.h"
@@ -564,7 +565,15 @@ void RaftROS::setup()
 {
     _isEnabled = configGetBool("enable", false);
     _domainId = configGetLong("domainId", 0);
-    _nodeName = configGetString("nodeName", "raft_esp32");
+    // "nodeName" if configured; otherwise the node is named after the device
+    // (Raft's friendly name - see RaftROSNodeName.h), so boards sharing an
+    // image are distinct nodes
+    _nodeName = configGetString("nodeName", "");
+    if (_nodeName.length() == 0)
+    {
+        bool friendlyNameSet = false;
+        _nodeName = RaftROSNodeName_sanitise(getFriendlyName(friendlyNameSet));
+    }
     _nodeNamespace = configGetString("nodeNamespace", "/");
     _routerFromConfig = configGetString("routerHost", "").length() > 0;
 #ifdef CONFIG_RAFTROS_ZENOH_ROUTER_HOST
@@ -1112,8 +1121,11 @@ int RaftROS::addService(const char* name, const char* type, ServiceHandler handl
         LOG_W(MODULE_PREFIX, "addService '%s': type '%s' is not one this build can serve", name, type);
         return -1;
     }
+    // "~/x" is relative to this node; otherwise absolute (a missing leading
+    // slash is added)
+    const String expanded = RaftROSNodeName_expandService(name, _nodeNamespace, _nodeName);
     char rosName[AUTOPUB_SERVICE_NAME_MAX];
-    if (snprintf(rosName, sizeof(rosName), "%s%s", name[0] == '/' ? "" : "/", name) >= (int)sizeof(rosName))
+    if (snprintf(rosName, sizeof(rosName), "%s", expanded.c_str()) >= (int)sizeof(rosName))
         return -1;
     const uint8_t slot = _services.add(rosName, kind, std::move(handler));
     if (slot == decltype(_services)::INVALID_SLOT)
@@ -1190,10 +1202,7 @@ void RaftROS::setupParameters()
         {"describe_parameters", "rcl_interfaces::srv::dds_::DescribeParameters_",
             [&store](const uint8_t* r, uint32_t n, uint8_t* o, uint32_t c) { return store.describe(r, n, o, c); }},
     };
-    String node = _nodeNamespace;
-    if (!node.endsWith("/"))
-        node += "/";
-    node += _nodeName;
+    const String node = RaftROSNodeName_path(_nodeNamespace, _nodeName);
     for (const ParamService& svc : services)
     {
         const String name = node + "/" + svc.name;

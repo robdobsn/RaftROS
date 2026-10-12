@@ -20,7 +20,7 @@ void RTPSParticipant::init(uint32_t domainId, const char* nodeName,
                             uint32_t participantId, const uint8_t* guidPrefix)
 {
     _domainId = domainId;
-    _nodeName = nodeName ? nodeName : "raft_esp32";
+    _nodeName = nodeName ? nodeName : "raftros";
     _participantId = participantId;
 
     if (guidPrefix)

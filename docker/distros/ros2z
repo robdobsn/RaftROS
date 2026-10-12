@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run a ros2 command against the board over Zenoh, inside the running RaftROS container.
-#   ros2z node list    ros2z node info /raft_esp32    ros2z param dump /raft_esp32
+#   ros2z node list    ros2z node info /<node>    ros2z param dump /<node>
 C=$(docker ps --format '{{.Names}}' | grep '^raftros-' | head -1)
 [ -z "$C" ] && { echo "No raftros-<distro> container running - start one with demo.sh <distro>"; exit 1; }
 D=${C#raftros-}

@@ -4,7 +4,7 @@
 # The board must be running the RTPS firmware (CONFIG_RAFTROS_BACKEND_RTPS=y).
 # No router: discovery is DDS multicast on the host's LAN (container uses host networking).
 set -u
-D=$1; DEV=192.168.86.230
+D=$1; DEV=${RAFTROS_DEVICE_IP:-192.168.86.230}
 OUT=$HOME/distro-tests/$D; mkdir -p $OUT; LOG=$OUT/rtps.log; : > $LOG
 C=raftros-$D
 for other in $(docker ps --format '{{.Names}}' | grep '^raftros-'); do docker stop -t 2 $other > /dev/null; done
