@@ -199,9 +199,10 @@ Tested on the FeatherS3 (console on USB, `SysTypeFeatherS3`):
   raw values, as raftjs already assumed). The example's MPU6050 is now a
   standard record; APDS9960 stays custom as an example of one.
 - **A custom decode without `next;` reported no records (fixed):** the
-  generator appends `next;` when the program has none. SCD40 still decodes
-  wrongly - its code reads single bytes of a 9-byte response and scales
-  values that the table scales again - which is a record bug, left as is.
+  generator appends `next;` when the program has none. The SCD40 record's
+  custom code read single bytes of its 9-byte response and scaled values the
+  table scaled again; it is now a standard record (words at 0, 3 and 6), in
+  RaftCore's and the Axiom's device tables.
 - `ExampleDiscoverable` cannot be built by `raft build` in Docker: its
   `EXTRA_COMPONENT_DIRS` points four levels up, outside the mounted folder,
   which resolves to `/` in the container. Building with the whole repository
