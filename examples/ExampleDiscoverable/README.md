@@ -231,7 +231,7 @@ four levels up (`raft build` in Docker mounts only this folder):
 ```bash
 cd <RaftROS>
 docker run --rm -u $(id -u):$(id -g) -e HOME=/tmp -v $PWD:$PWD \
-    -w $PWD/examples/ExampleDiscoverable raftbuilder:latest \
+    -w $PWD/examples/ExampleDiscoverable raftbuilder:idf-6.1 \
     bash -c 'git config --global --add safe.directory "*"; idf.py -B build/SysTypeFeatherS3 build'
 cd examples/ExampleDiscoverable/build/SysTypeFeatherS3
 esptool --chip esp32s3 -p /dev/ttyACM1 write-flash "@flash_args"

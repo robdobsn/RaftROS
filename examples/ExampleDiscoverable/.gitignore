@@ -7,3 +7,4 @@ compile_commands.json
 *.pyc
 node_modules
 .raftcli_history
+eim_config.toml
