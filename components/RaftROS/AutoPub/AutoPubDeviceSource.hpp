@@ -63,7 +63,7 @@ void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceStatusChange(
     // scanner sees an ACK at the address; identification (and therefore a valid
     // deviceTypeIndex) happens asynchronously in a follow-up status change with
     // isNewlyIdentified=true but no online-state change.  Auto-publish needs
-    // the typeIdx, so we cannot commit on isChange alone.
+    // the deviceTypeIndex, so we cannot commit on isChange alone.
     if (!addrStatus.isChange && !addrStatus.isNewlyIdentified)
         return;
 
@@ -385,7 +385,7 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     {
         pDevMan->registerForDeviceData(
             devID,
-            [this](uint16_t /*deviceTypeIdx*/, std::vector<uint8_t> data, const void* pCallbackInfo) {
+            [this](uint16_t /*deviceTypeIndex*/, std::vector<uint8_t> data, const void* pCallbackInfo) {
                 this->onDeviceData(std::move(data), pCallbackInfo);
             },
             /*minTimeBetweenReportsMs=*/0,
