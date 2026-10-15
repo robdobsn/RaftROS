@@ -1,0 +1,13 @@
+# Settings common to all SysTypes (merged before each SysType's sdkconfig.defaults)
+
+# lwIP sockets - the web server uses one per connection (up to numConnSlots, 12 by default) and others are needed
+# for listeners, mDNS, SNTP, NetBIOS, DNS and the application. With too few, new connections are reset
+CONFIG_LWIP_MAX_SOCKETS=24
+
+# lwIP accept queue per listening socket - connections arriving faster than they are accepted are reset when it is
+# full (default 6, which a burst of browser or client connections can exceed)
+CONFIG_LWIP_TCP_ACCEPTMBOX_SIZE=16
+
+# Active TCP connections (including those closing, e.g. in TIME_WAIT after a response) - when there are none left
+# new connections are reset (default 16)
+CONFIG_LWIP_MAX_ACTIVE_TCP=32

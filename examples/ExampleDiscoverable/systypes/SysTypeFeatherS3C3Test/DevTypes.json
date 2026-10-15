@@ -1,0 +1,410 @@
+{
+    "devTypes": {
+        "C3Unprefixed": {
+            "_notes": "C3 TEST ONLY: unprefixed WRONG check value (WHO_AM_I reads 0x68). Should never match; matches if the C3 bug is present.",
+            "addresses": "0x68",
+            "deviceType": "C3Unprefixed",
+            "detectionValues": "0x75=FF",
+            "initValues": "0x6b01&0x1a03&0x1909&0x1b08&0x1c08",
+            "pollInfo": {
+                "c": "0x3b=r14",
+                "i": 50,
+                "s": 1
+            },
+            "scanPriority": "high",
+            "devInfoJson": {
+                "name": "Accelerometer & Gyroscope",
+                "desc": "6-Axis IMU",
+                "manu": "InvenSense",
+                "type": "C3Unprefixed",
+                "clas": [
+                    "ACC",
+                    "GYRO"
+                ],
+                "resp": {
+                    "b": 14,
+                    "a": [
+                        {
+                            "n": "ax",
+                            "t": ">h",
+                            "u": "g",
+                            "r": [
+                                -4.0,
+                                4.0
+                            ],
+                            "d": 8192,
+                            "f": ".3f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "ay",
+                            "t": ">h",
+                            "u": "g",
+                            "r": [
+                                -4.0,
+                                4.0
+                            ],
+                            "d": 8192,
+                            "f": ".3f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "az",
+                            "t": ">h",
+                            "u": "g",
+                            "r": [
+                                -4.0,
+                                4.0
+                            ],
+                            "d": 8192,
+                            "f": ".3f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "temp",
+                            "t": ">h",
+                            "u": "&deg;C",
+                            "r": [
+                                -40,
+                                85
+                            ],
+                            "d": 340,
+                            "a": 36.53,
+                            "f": ".1f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "gx",
+                            "t": ">h",
+                            "u": "&deg;/s",
+                            "r": [
+                                -500,
+                                500
+                            ],
+                            "d": 65.5,
+                            "f": ".2f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "gy",
+                            "t": ">h",
+                            "u": "&deg;/s",
+                            "r": [
+                                -500,
+                                500
+                            ],
+                            "d": 65.5,
+                            "f": ".2f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "gz",
+                            "t": ">h",
+                            "u": "&deg;/s",
+                            "r": [
+                                -500,
+                                500
+                            ],
+                            "d": 65.5,
+                            "f": ".2f",
+                            "o": "float"
+                        }
+                    ],
+                    "us": 50000
+                }
+            }
+        },
+        "C3Prefixed": {
+            "_notes": "C3 TEST ONLY (control): prefixed WRONG check value (ID reads 0xAB). Should never match.",
+            "addresses": "0x39",
+            "deviceType": "C3Prefixed",
+            "detectionValues": "0x92=0xFF",
+            "initValues": "0x81db&0x8f05&0x8e87&0x8007",
+            "pollInfo": {
+                "c": "0x94=r9",
+                "i": 100,
+                "s": 1
+            },
+            "scanPriority": "high",
+            "devInfoJson": {
+                "name": "Proximity, Light, RGB & Gesture",
+                "desc": "Ambient light (clear channel), RGB and proximity",
+                "manu": "Broadcom",
+                "type": "C3Prefixed",
+                "clas": [
+                    "PROX",
+                    "LGHT"
+                ],
+                "resp": {
+                    "b": 9,
+                    "a": [
+                        {
+                            "n": "als",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "float"
+                        },
+                        {
+                            "n": "red",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "uint16"
+                        },
+                        {
+                            "n": "green",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "uint16"
+                        },
+                        {
+                            "n": "blue",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "uint16"
+                        },
+                        {
+                            "n": "prox",
+                            "t": "B",
+                            "u": "",
+                            "r": [
+                                0,
+                                1
+                            ],
+                            "d": 255,
+                            "f": ".3f",
+                            "o": "float"
+                        }
+                    ],
+                    "c": {
+                        "n": "c3prefixed_raw",
+                        "c": "out.als=buf[0]|(buf[1]<<8);out.red=buf[2]|(buf[3]<<8);out.green=buf[4]|(buf[5]<<8);out.blue=buf[6]|(buf[7]<<8);out.prox=buf[8];"
+                    },
+                    "us": 100000
+                }
+            }
+        },
+        "APDS9960": {
+            "_notes": "Avago/Broadcom proximity, ambient light, RGB and gesture sensor. ID register 0x92 reads 0xAB (0xA8 and 0x9C on some modules). Init: ATIME 0xDB (~103 ms, full scale 37888 counts), AGAIN 4x and PGAIN 2x, 8 x 16 us proximity pulses, then PON|AEN|PEN. Poll reads CDATAL..PDATA (0x94-0x9C) in one transaction; gesture engine left off. Custom decode (an example of one): it stores raw counts and the table's d/a (prox /255) are applied by whoever reads the field, as for any custom decode. The generator ends a custom decode with next; when it has none.",
+            "addresses": "0x39",
+            "deviceType": "APDS9960",
+            "detectionValues": "0x92=0xab,0xa8,0x9c",
+            "initValues": "0x81db&0x8f05&0x8e87&0x8007",
+            "pollInfo": {
+                "c": "0x94=r9",
+                "i": 100,
+                "s": 1
+            },
+            "scanPriority": "high",
+            "devInfoJson": {
+                "name": "Proximity, Light, RGB & Gesture",
+                "desc": "Ambient light (clear channel), RGB and proximity",
+                "manu": "Broadcom",
+                "type": "APDS9960",
+                "clas": [
+                    "PROX",
+                    "LGHT"
+                ],
+                "resp": {
+                    "b": 9,
+                    "a": [
+                        {
+                            "n": "als",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "float"
+                        },
+                        {
+                            "n": "red",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "uint16"
+                        },
+                        {
+                            "n": "green",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "uint16"
+                        },
+                        {
+                            "n": "blue",
+                            "t": "<H",
+                            "u": "counts",
+                            "r": [
+                                0,
+                                65535
+                            ],
+                            "f": "5d",
+                            "o": "uint16"
+                        },
+                        {
+                            "n": "prox",
+                            "t": "B",
+                            "u": "",
+                            "r": [
+                                0,
+                                1
+                            ],
+                            "d": 255,
+                            "f": ".3f",
+                            "o": "float"
+                        }
+                    ],
+                    "c": {
+                        "n": "apds9960_raw",
+                        "c": "out.als=buf[0]|(buf[1]<<8);out.red=buf[2]|(buf[3]<<8);out.green=buf[4]|(buf[5]<<8);out.blue=buf[6]|(buf[7]<<8);out.prox=buf[8];"
+                    },
+                    "us": 100000
+                }
+            }
+        },
+        "MPU6050": {
+            "_notes": "InvenSense 6-axis IMU. WHO_AM_I (0x75) reads 0x68 on a genuine MPU-6050; 0x70 (MPU-6500), 0x72 and 0x98 are common on clone modules with the same register map for these reads. Init: wake on the X gyro PLL, DLPF 44 Hz, 100 Hz sample rate, gyro +-500 deg/s (65.5 LSB per deg/s), accel +-4 g (8192 LSB/g). Poll reads ACCEL_XOUT_H..GYRO_ZOUT_L (0x3B-0x48), big-endian. Standard decode: the generated code applies each attribute's d/a while decoding, so the struct holds g, deg/s and deg C.",
+            "addresses": "0x68,0x69",
+            "deviceType": "MPU6050",
+            "detectionValues": "0x75=0x68,0x70,0x72,0x98",
+            "initValues": "0x6b01&0x1a03&0x1909&0x1b08&0x1c08",
+            "pollInfo": {
+                "c": "0x3b=r14",
+                "i": 50,
+                "s": 1
+            },
+            "scanPriority": "high",
+            "devInfoJson": {
+                "name": "Accelerometer & Gyroscope",
+                "desc": "6-Axis IMU",
+                "manu": "InvenSense",
+                "type": "MPU6050",
+                "clas": [
+                    "ACC",
+                    "GYRO"
+                ],
+                "resp": {
+                    "b": 14,
+                    "a": [
+                        {
+                            "n": "ax",
+                            "t": ">h",
+                            "u": "g",
+                            "r": [
+                                -4.0,
+                                4.0
+                            ],
+                            "d": 8192,
+                            "f": ".3f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "ay",
+                            "t": ">h",
+                            "u": "g",
+                            "r": [
+                                -4.0,
+                                4.0
+                            ],
+                            "d": 8192,
+                            "f": ".3f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "az",
+                            "t": ">h",
+                            "u": "g",
+                            "r": [
+                                -4.0,
+                                4.0
+                            ],
+                            "d": 8192,
+                            "f": ".3f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "temp",
+                            "t": ">h",
+                            "u": "&deg;C",
+                            "r": [
+                                -40,
+                                85
+                            ],
+                            "d": 340,
+                            "a": 36.53,
+                            "f": ".1f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "gx",
+                            "t": ">h",
+                            "u": "&deg;/s",
+                            "r": [
+                                -500,
+                                500
+                            ],
+                            "d": 65.5,
+                            "f": ".2f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "gy",
+                            "t": ">h",
+                            "u": "&deg;/s",
+                            "r": [
+                                -500,
+                                500
+                            ],
+                            "d": 65.5,
+                            "f": ".2f",
+                            "o": "float"
+                        },
+                        {
+                            "n": "gz",
+                            "t": ">h",
+                            "u": "&deg;/s",
+                            "r": [
+                                -500,
+                                500
+                            ],
+                            "d": 65.5,
+                            "f": ".2f",
+                            "o": "float"
+                        }
+                    ],
+                    "us": 50000
+                }
+            }
+        }
+    }
+}

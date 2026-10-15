@@ -90,6 +90,7 @@
     }
   },
   "NetMan": {
+    "wifiTxPowerDbm": 15,
     "wifiAPEn": 1,
     "wifiAPPW": "raftpassword",
     "wifiAPSSID": "RaftAP",
