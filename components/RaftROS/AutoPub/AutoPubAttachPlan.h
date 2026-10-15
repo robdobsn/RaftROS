@@ -49,19 +49,19 @@ inline const char* AutoPubAttachPlan_topicAlias(const char* topic)
 /// @param deviceId bus/address of the device (subIndex is assigned per endpoint)
 /// @param clasArray device class tags (e.g. "TEMP", "RH"), may be null
 /// @param clasCount number of class tags
-/// @param deviceTypeName device type name from the type record, may be null
-/// @param resolveQoS callable (alias, clasArray, clasCount, deviceTypeName) -> AutoPubQoSProfileId
+/// @param deviceTypeKey device type key from the type record, may be null
+/// @param resolveQoS callable (alias, clasArray, clasCount, deviceTypeKey) -> AutoPubQoSProfileId
 /// @return plan; endpointCount 0 means nothing to publish (excluded, or a name
 ///         that would not fit the descriptor)
 template<typename ResolveQoS>
 inline AutoPubAttachPlan AutoPubAttachPlan_build(
         const AutoPubDeviceId& deviceId,
         const char* const* clasArray, size_t clasCount,
-        const char* deviceTypeName,
+        const char* deviceTypeKey,
         ResolveQoS&& resolveQoS)
 {
     AutoPubAttachPlan plan;
-    const AutoPubClassMapping mapping = AutoPubClassMap_lookup(clasArray, clasCount, deviceTypeName);
+    const AutoPubClassMapping mapping = AutoPubClassMap_lookup(clasArray, clasCount, deviceTypeKey);
     if (mapping.excluded)
     {
         plan.excluded = true;
@@ -86,7 +86,7 @@ inline AutoPubAttachPlan AutoPubAttachPlan_build(
     primary.deviceId.subIndex = 0;
     primary.msgKind = mapping.primaryKind;
     primary.qosProfileId = resolveQoS(AutoPubAttachPlan_topicAlias(primary.topic),
-                                      clasArray, clasCount, deviceTypeName);
+                                      clasArray, clasCount, deviceTypeKey);
     plan.endpointCount = 1;
 
     // Composite extra endpoints (e.g. AHT20 -> Temperature + RelativeHumidity,
@@ -117,7 +117,7 @@ inline AutoPubAttachPlan AutoPubAttachPlan_build(
         extra.deviceId.subIndex = 1 + extraIndex;
         extra.msgKind = extraKinds[extraIndex];
         extra.qosProfileId = resolveQoS(AutoPubAttachPlan_topicAlias(extra.topic),
-                                        clasArray, clasCount, deviceTypeName);
+                                        clasArray, clasCount, deviceTypeKey);
         plan.endpointCount = 2 + extraIndex;
     }
     return plan;

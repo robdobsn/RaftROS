@@ -7,7 +7,7 @@
 // every row in `DeviceTypeRecords.json`.
 //
 // API:
-//   AutoPubClassMap_lookup(clas[], count, deviceTypeName)
+//   AutoPubClassMap_lookup(clas[], count, deviceTypeKey)
 //       → AutoPubClassMapping { primary, secondary, excluded }
 //
 // Precedence (first match wins):
@@ -269,22 +269,22 @@ inline bool AutoPubClassMap_hasClas(
 /// @brief Look up the auto-publish mapping for a bus device.
 /// @param clasArray        array of class-code strings (from `devInfoJson.clas`)
 /// @param clasCount        number of entries in clasArray
-/// @param deviceTypeName   device type name (nullable) — used for per-device
+/// @param deviceTypeKey   device type key (nullable) — used for per-device
 ///                         overrides such as the MCP9808 `LGHT` mis-tag.
 /// @return mapping with `primary`/`secondary`/`tertiary` kinds + topic slugs,
 ///         or `excluded = true` for output-only devices (PIX/LED).
 inline AutoPubClassMapping AutoPubClassMap_lookup(
         const char* const* clasArray, size_t clasCount,
-        const char* deviceTypeName)
+        const char* deviceTypeKey)
 {
     AutoPubClassMapping out;
 
     // -----------------------------------------------------------------
     // 1. Device-type-name overrides
     // -----------------------------------------------------------------
-    if (deviceTypeName)
+    if (deviceTypeKey)
     {
-        if (std::strcmp(deviceTypeName, "MCP9808") == 0)
+        if (std::strcmp(deviceTypeKey, "MCP9808") == 0)
         {
             // JSON mis-tag workaround: MCP9808 is a temperature sensor but
             // currently carries clas=["LGHT"].  Force TEMP mapping regardless.
@@ -292,9 +292,9 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
             out.primaryTopicSlug = "temperature";
             return out;
         }
-        if (std::strcmp(deviceTypeName, "VL53L5CX") == 0 ||
-            std::strcmp(deviceTypeName, "VL53L7CX") == 0 ||
-            std::strcmp(deviceTypeName, "VL53L8CX") == 0)
+        if (std::strcmp(deviceTypeKey, "VL53L5CX") == 0 ||
+            std::strcmp(deviceTypeKey, "VL53L7CX") == 0 ||
+            std::strcmp(deviceTypeKey, "VL53L8CX") == 0)
         {
             // ST multizone ToF: the frame is a 4x4 or 8x8 grid of distances,
             // published as a depth image; the nearest valid zone as a Range
@@ -305,7 +305,7 @@ inline AutoPubClassMapping AutoPubClassMap_lookup(
             out.secondaryTopicSlug = "range";
             return out;
         }
-        if (std::strcmp(deviceTypeName, "RoboticalLightSensor") == 0)
+        if (std::strcmp(deviceTypeKey, "RoboticalLightSensor") == 0)
         {
             // 4-attribute light sensor: left/center/right.  Use MultiArray
             // rather than Illuminance so all three channels are carried.

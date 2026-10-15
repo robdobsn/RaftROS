@@ -182,7 +182,7 @@ void AutoPubDeviceSource<Backend, CAPACITY>::parseQoSOverrides(const char* qosPr
 template <typename Backend, uint8_t CAPACITY>
 AutoPubQoSProfileId AutoPubDeviceSource<Backend, CAPACITY>::resolveQoSProfileId(
         const char* pTopicAlias, const char* const* pClasArray, size_t clasCount,
-        const char* pDeviceTypeName) const
+        const char* pDeviceTypeKey) const
 {
     // 1. Per-device alias
     if (pTopicAlias && *pTopicAlias)
@@ -211,7 +211,7 @@ AutoPubQoSProfileId AutoPubDeviceSource<Backend, CAPACITY>::resolveQoSProfileId(
     }
 
     // 3. Built-in default from the class list
-    return AutoPubQoSProfile_defaultForClasses(pClasArray, clasCount, pDeviceTypeName);
+    return AutoPubQoSProfile_defaultForClasses(pClasArray, clasCount, pDeviceTypeKey);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -245,7 +245,7 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     // back to String/"raw" for unknown classes; actuators are excluded.
     DeviceTypeRecord devTypeRec;
     const bool haveTypeRec = deviceTypeRecords.getDeviceInfo(addrStatus.deviceTypeIndex, devTypeRec);
-    const char* pDeviceTypeName = haveTypeRec ? devTypeRec.deviceType : nullptr;
+    const char* pDeviceTypeKey = haveTypeRec ? devTypeRec.deviceType : nullptr;
 
     // Parse the "clas" array out of devInfoJson.  Runs once per attach, so the
     // RaftJson parse cost is negligible.
@@ -266,22 +266,22 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     const AutoPubDeviceId planDeviceId{(uint8_t)devID.getBusNum(), (uint32_t)devID.getAddress(), 0};
     const auto plan = AutoPubAttachPlan_build(
         planDeviceId,
-        clasPtrs.empty() ? nullptr : clasPtrs.data(), clasPtrs.size(), pDeviceTypeName,
+        clasPtrs.empty() ? nullptr : clasPtrs.data(), clasPtrs.size(), pDeviceTypeKey,
         [this](const char* alias, const char* const* clasArray, size_t clasCount,
-               const char* deviceTypeName) {
-            return resolveQoSProfileId(alias, clasArray, clasCount, deviceTypeName);
+               const char* deviceTypeKey) {
+            return resolveQoSProfileId(alias, clasArray, clasCount, deviceTypeKey);
         });
 
     if (plan.excluded)
     {
         LOG_I(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s is an actuator - excluded from auto-publish",
-              devID.toString().c_str(), pDeviceTypeName ? pDeviceTypeName : "?");
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?");
         return false;
     }
     if (plan.endpointCount == 0)
     {
         LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s - no publishable endpoint (name too long?)",
-              devID.toString().c_str(), pDeviceTypeName ? pDeviceTypeName : "?");
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?");
         return false;
     }
 
