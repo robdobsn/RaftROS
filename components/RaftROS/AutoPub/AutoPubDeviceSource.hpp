@@ -64,6 +64,25 @@ void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceStatusChange(
     // deviceTypeIndex) happens asynchronously in a follow-up status change with
     // isNewlyIdentified=true but no online-state change.  Auto-publish needs
     // the deviceTypeIndex, so we cannot commit on isChange alone.
+    // Identity changes while online: a device re-identified as another type is
+    // published again with its new type (its topic, message type and decoder
+    // all come from the type), and one that is no longer identified is
+    // withdrawn until it is identified again
+    if (addrStatus.onlineState == DeviceOnlineState::ONLINE)
+    {
+        if (addrStatus.identEvent == BusIdentEvent::Lost)
+        {
+            detachDevice(device);
+            return;
+        }
+        if (addrStatus.identEvent == BusIdentEvent::TypeChanged)
+        {
+            detachDevice(device);
+            attachDevice(device, addrStatus);
+            return;
+        }
+    }
+
     if (!addrStatus.isChange && !addrStatus.isNewlyIdentified)
         return;
 
