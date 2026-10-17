@@ -304,6 +304,22 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
         return false;
     }
 
+    // A device whose data can't be decoded on the device (its record has no generated decoder), or whose decoded
+    // record doesn't fit a mailbox, would have a topic that never publishes - so it isn't announced (N5)
+    if (!haveTypeRec || !devTypeRec.pollResultDecodeFn || !devTypeRec.pollFieldDescs || (devTypeRec.pollStructSize == 0))
+    {
+        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s has no on-device decoder - not published",
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?");
+        return false;
+    }
+    if (devTypeRec.pollStructSize > MAILBOX_RECORD_SIZE)
+    {
+        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s decoded record is %u bytes (max %u) - not published",
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?",
+              (unsigned)devTypeRec.pollStructSize, (unsigned)MAILBOX_RECORD_SIZE);
+        return false;
+    }
+
     // Create the primary publisher on the selected backend
     const uint8_t slot = _pBackend->createPublisher(plan.endpoints[0]);
     if (slot == Backend::INVALID_SLOT || slot >= CAPACITY)
@@ -322,40 +338,32 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     pCtx->slot = slot;
     pCtx->msgKind = plan.endpoints[0].msgKind;
 
-    if (haveTypeRec && devTypeRec.pollResultDecodeFn && devTypeRec.pollFieldDescs)
-    {
-        pCtx->decodeFn = devTypeRec.pollResultDecodeFn;
-        pCtx->pFieldDescs = devTypeRec.pollFieldDescs;
-        pCtx->fieldCount = devTypeRec.pollFieldCount;
-        pCtx->structSize = devTypeRec.pollStructSize;
-        pCtx->pollDataSizeBytes = devTypeRec.pollDataSizeBytes;
+    pCtx->decodeFn = devTypeRec.pollResultDecodeFn;
+    pCtx->pFieldDescs = devTypeRec.pollFieldDescs;
+    pCtx->fieldCount = devTypeRec.pollFieldCount;
+    pCtx->structSize = devTypeRec.pollStructSize;
+    pCtx->pollDataSizeBytes = devTypeRec.pollDataSizeBytes;
 
-        // Up to 8 records per decode for FIFO-backed devices keeps the heap
-        // allocation under 1 kB for typical struct sizes (IMU = 24 B).
-        static constexpr uint16_t MAX_DECODE_RECORDS = 8;
-        pCtx->maxDecodeRecords = MAX_DECODE_RECORDS;
-        pCtx->decodeBufSize = (uint32_t)pCtx->structSize * MAX_DECODE_RECORDS;
-        if (pCtx->decodeBufSize > 0)
-            pCtx->pDecodeBuf = new uint8_t[pCtx->decodeBufSize];
-    }
-    else
-    {
-        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach decode unavailable devID=%s typeIdx=%u - callbacks will be rawlen-only",
-              devID.toString().c_str(), (unsigned)addrStatus.deviceTypeIndex);
-    }
+    // Up to 8 records per decode for FIFO-backed devices keeps the heap
+    // allocation under 1 kB for typical struct sizes (IMU = 24 B).
+    static constexpr uint16_t MAX_DECODE_RECORDS = 8;
+    pCtx->maxDecodeRecords = MAX_DECODE_RECORDS;
+    pCtx->decodeBufSize = (uint32_t)pCtx->structSize * MAX_DECODE_RECORDS;
+    if (pCtx->decodeBufSize > 0)
+        pCtx->pDecodeBuf = new uint8_t[pCtx->decodeBufSize];
 
-    // Claim a generation-safe mailbox handle for the bus data callback.
-    // Without one the endpoint is still announced but publishes nothing.
-    if (pCtx->pDecodeBuf)
+    // Claim a generation-safe mailbox handle for the bus data callback. Without one the endpoint couldn't
+    // publish, so the publisher is removed again rather than announced
+    pCtx->handle = _pool.acquire(pCtx, pCtx->structSize);
+    if (!pCtx->handle.isValid())
     {
-        pCtx->handle = _pool.acquire(pCtx, pCtx->structSize);
-        if (!pCtx->handle.isValid())
-        {
-            LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach no mailbox devID=%s structSize=%u (max %u, devices %u/%u) - endpoint will not publish",
-                  devID.toString().c_str(), (unsigned)pCtx->structSize,
-                  (unsigned)MAILBOX_RECORD_SIZE,
-                  (unsigned)_pool.inUseCount(), (unsigned)_pool.capacity());
-        }
+        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach no mailbox devID=%s structSize=%u (max %u, devices %u/%u) - not published",
+              devID.toString().c_str(), (unsigned)pCtx->structSize,
+              (unsigned)MAILBOX_RECORD_SIZE,
+              (unsigned)_pool.inUseCount(), (unsigned)_pool.capacity());
+        _pBackend->destroyPublisher(slot);
+        delete pCtx;
+        return false;
     }
 
     _ctxs[slot] = pCtx;
