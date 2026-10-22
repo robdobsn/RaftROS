@@ -63,7 +63,26 @@ void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceStatusChange(
     // scanner sees an ACK at the address; identification (and therefore a valid
     // deviceTypeIndex) happens asynchronously in a follow-up status change with
     // isNewlyIdentified=true but no online-state change.  Auto-publish needs
-    // the typeIdx, so we cannot commit on isChange alone.
+    // the deviceTypeIndex, so we cannot commit on isChange alone.
+    // Identity changes while online: a device re-identified as another type is
+    // published again with its new type (its topic, message type and decoder
+    // all come from the type), and one that is no longer identified is
+    // withdrawn until it is identified again
+    if (addrStatus.onlineState == DeviceOnlineState::ONLINE)
+    {
+        if (addrStatus.identEvent == BusIdentEvent::Lost)
+        {
+            detachDevice(device);
+            return;
+        }
+        if (addrStatus.identEvent == BusIdentEvent::TypeChanged)
+        {
+            detachDevice(device);
+            attachDevice(device, addrStatus);
+            return;
+        }
+    }
+
     if (!addrStatus.isChange && !addrStatus.isNewlyIdentified)
         return;
 
@@ -182,7 +201,7 @@ void AutoPubDeviceSource<Backend, CAPACITY>::parseQoSOverrides(const char* qosPr
 template <typename Backend, uint8_t CAPACITY>
 AutoPubQoSProfileId AutoPubDeviceSource<Backend, CAPACITY>::resolveQoSProfileId(
         const char* pTopicAlias, const char* const* pClasArray, size_t clasCount,
-        const char* pDeviceTypeName) const
+        const char* pDeviceTypeKey) const
 {
     // 1. Per-device alias
     if (pTopicAlias && *pTopicAlias)
@@ -211,7 +230,7 @@ AutoPubQoSProfileId AutoPubDeviceSource<Backend, CAPACITY>::resolveQoSProfileId(
     }
 
     // 3. Built-in default from the class list
-    return AutoPubQoSProfile_defaultForClasses(pClasArray, clasCount, pDeviceTypeName);
+    return AutoPubQoSProfile_defaultForClasses(pClasArray, clasCount, pDeviceTypeKey);
 }
 
 /////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -245,7 +264,7 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     // back to String/"raw" for unknown classes; actuators are excluded.
     DeviceTypeRecord devTypeRec;
     const bool haveTypeRec = deviceTypeRecords.getDeviceInfo(addrStatus.deviceTypeIndex, devTypeRec);
-    const char* pDeviceTypeName = haveTypeRec ? devTypeRec.deviceType : nullptr;
+    const char* pDeviceTypeKey = haveTypeRec ? devTypeRec.deviceType : nullptr;
 
     // Parse the "clas" array out of devInfoJson.  Runs once per attach, so the
     // RaftJson parse cost is negligible.
@@ -266,22 +285,38 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     const AutoPubDeviceId planDeviceId{(uint8_t)devID.getBusNum(), (uint32_t)devID.getAddress(), 0};
     const auto plan = AutoPubAttachPlan_build(
         planDeviceId,
-        clasPtrs.empty() ? nullptr : clasPtrs.data(), clasPtrs.size(), pDeviceTypeName,
+        clasPtrs.empty() ? nullptr : clasPtrs.data(), clasPtrs.size(), pDeviceTypeKey,
         [this](const char* alias, const char* const* clasArray, size_t clasCount,
-               const char* deviceTypeName) {
-            return resolveQoSProfileId(alias, clasArray, clasCount, deviceTypeName);
+               const char* deviceTypeKey) {
+            return resolveQoSProfileId(alias, clasArray, clasCount, deviceTypeKey);
         });
 
     if (plan.excluded)
     {
         LOG_I(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s is an actuator - excluded from auto-publish",
-              devID.toString().c_str(), pDeviceTypeName ? pDeviceTypeName : "?");
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?");
         return false;
     }
     if (plan.endpointCount == 0)
     {
         LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s - no publishable endpoint (name too long?)",
-              devID.toString().c_str(), pDeviceTypeName ? pDeviceTypeName : "?");
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?");
+        return false;
+    }
+
+    // A device whose data can't be decoded on the device (its record has no generated decoder), or whose decoded
+    // record doesn't fit a mailbox, would have a topic that never publishes - so it isn't announced (N5)
+    if (!haveTypeRec || !devTypeRec.pollResultDecodeFn || !devTypeRec.pollFieldDescs || (devTypeRec.pollStructSize == 0))
+    {
+        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s has no on-device decoder - not published",
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?");
+        return false;
+    }
+    if (devTypeRec.pollStructSize > MAILBOX_RECORD_SIZE)
+    {
+        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach devID=%s type=%s decoded record is %u bytes (max %u) - not published",
+              devID.toString().c_str(), pDeviceTypeKey ? pDeviceTypeKey : "?",
+              (unsigned)devTypeRec.pollStructSize, (unsigned)MAILBOX_RECORD_SIZE);
         return false;
     }
 
@@ -303,40 +338,32 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     pCtx->slot = slot;
     pCtx->msgKind = plan.endpoints[0].msgKind;
 
-    if (haveTypeRec && devTypeRec.pollResultDecodeFn && devTypeRec.pollFieldDescs)
-    {
-        pCtx->decodeFn = devTypeRec.pollResultDecodeFn;
-        pCtx->pFieldDescs = devTypeRec.pollFieldDescs;
-        pCtx->fieldCount = devTypeRec.pollFieldCount;
-        pCtx->structSize = devTypeRec.pollStructSize;
-        pCtx->pollDataSizeBytes = devTypeRec.pollDataSizeBytes;
+    pCtx->decodeFn = devTypeRec.pollResultDecodeFn;
+    pCtx->pFieldDescs = devTypeRec.pollFieldDescs;
+    pCtx->fieldCount = devTypeRec.pollFieldCount;
+    pCtx->structSize = devTypeRec.pollStructSize;
+    pCtx->pollDataSizeBytes = devTypeRec.pollDataSizeBytes;
 
-        // Up to 8 records per decode for FIFO-backed devices keeps the heap
-        // allocation under 1 kB for typical struct sizes (IMU = 24 B).
-        static constexpr uint16_t MAX_DECODE_RECORDS = 8;
-        pCtx->maxDecodeRecords = MAX_DECODE_RECORDS;
-        pCtx->decodeBufSize = (uint32_t)pCtx->structSize * MAX_DECODE_RECORDS;
-        if (pCtx->decodeBufSize > 0)
-            pCtx->pDecodeBuf = new uint8_t[pCtx->decodeBufSize];
-    }
-    else
-    {
-        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach decode unavailable devID=%s typeIdx=%u - callbacks will be rawlen-only",
-              devID.toString().c_str(), (unsigned)addrStatus.deviceTypeIndex);
-    }
+    // Up to 8 records per decode for FIFO-backed devices keeps the heap
+    // allocation under 1 kB for typical struct sizes (IMU = 24 B).
+    static constexpr uint16_t MAX_DECODE_RECORDS = 8;
+    pCtx->maxDecodeRecords = MAX_DECODE_RECORDS;
+    pCtx->decodeBufSize = (uint32_t)pCtx->structSize * MAX_DECODE_RECORDS;
+    if (pCtx->decodeBufSize > 0)
+        pCtx->pDecodeBuf = new uint8_t[pCtx->decodeBufSize];
 
-    // Claim a generation-safe mailbox handle for the bus data callback.
-    // Without one the endpoint is still announced but publishes nothing.
-    if (pCtx->pDecodeBuf)
+    // Claim a generation-safe mailbox handle for the bus data callback. Without one the endpoint couldn't
+    // publish, so the publisher is removed again rather than announced
+    pCtx->handle = _pool.acquire(pCtx, pCtx->structSize);
+    if (!pCtx->handle.isValid())
     {
-        pCtx->handle = _pool.acquire(pCtx, pCtx->structSize);
-        if (!pCtx->handle.isValid())
-        {
-            LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach no mailbox devID=%s structSize=%u (max %u, devices %u/%u) - endpoint will not publish",
-                  devID.toString().c_str(), (unsigned)pCtx->structSize,
-                  (unsigned)MAILBOX_RECORD_SIZE,
-                  (unsigned)_pool.inUseCount(), (unsigned)_pool.capacity());
-        }
+        LOG_W(AUTOPUB_SOURCE_PREFIX, "autoPubAttach no mailbox devID=%s structSize=%u (max %u, devices %u/%u) - not published",
+              devID.toString().c_str(), (unsigned)pCtx->structSize,
+              (unsigned)MAILBOX_RECORD_SIZE,
+              (unsigned)_pool.inUseCount(), (unsigned)_pool.capacity());
+        _pBackend->destroyPublisher(slot);
+        delete pCtx;
+        return false;
     }
 
     _ctxs[slot] = pCtx;
@@ -385,7 +412,7 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     {
         pDevMan->registerForDeviceData(
             devID,
-            [this](uint16_t /*deviceTypeIdx*/, std::vector<uint8_t> data, const void* pCallbackInfo) {
+            [this](uint16_t /*deviceTypeIndex*/, std::vector<uint8_t> data, const void* pCallbackInfo) {
                 this->onDeviceData(std::move(data), pCallbackInfo);
             },
             /*minTimeBetweenReportsMs=*/0,

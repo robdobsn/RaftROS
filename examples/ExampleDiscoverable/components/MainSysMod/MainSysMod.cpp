@@ -189,6 +189,15 @@ void MainSysMod::onDeviceStatusChange(RaftDevice& device, const BusAddrStatus& a
     if (addrStatus.onlineState == DeviceOnlineState::ONLINE &&
         addrStatus.deviceTypeIndex != DEVICE_TYPE_INDEX_INVALID)
     {
+        // A device re-identified as another type: its data is decoded as the new type from now on
+        if (pKnown && (addrStatus.identEvent == BusIdentEvent::TypeChanged))
+        {
+            std::lock_guard<std::mutex> lock(_dataMutex);
+            pKnown->deviceTypeIndex = addrStatus.deviceTypeIndex;
+            pKnown->latest.clear();
+            pKnown->decodeState = RaftBusDeviceDecodeState();
+            return;
+        }
         if (pKnown || !pFree)
             return;
         {
@@ -208,8 +217,9 @@ void MainSysMod::onDeviceStatusChange(RaftDevice& device, const BusAddrStatus& a
             },
             0, reinterpret_cast<const void*>(pFree->key));
     }
-    else if (pKnown && addrStatus.isChange)
+    else if (pKnown && (addrStatus.isChange || (addrStatus.identEvent == BusIdentEvent::Lost)))
     {
+        // Gone, or online but no longer identified
         pDevMan->registerForDeviceData(deviceID, nullptr, 0, reinterpret_cast<const void*>(pKnown->key), true);
         std::lock_guard<std::mutex> lock(_dataMutex);
         pKnown->used = false;

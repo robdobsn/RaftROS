@@ -54,10 +54,10 @@ inline RTPSAutoPubQoSProfileId RTPSAutoPubQoSProfile_defaultForClass(const char*
 }
 
 inline RTPSAutoPubQoSProfileId RTPSAutoPubQoSProfile_defaultForClasses(
-        const char* const* clasArray, size_t clasCount, const char* deviceTypeName = nullptr)
+        const char* const* clasArray, size_t clasCount, const char* deviceTypeKey = nullptr)
 {
     return RaftRuntime::AutoPub::AutoPubQoSProfile_defaultForClasses(
-        clasArray, clasCount, deviceTypeName);
+        clasArray, clasCount, deviceTypeKey);
 }
 
 } // namespace AutoPub

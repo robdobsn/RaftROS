@@ -257,7 +257,7 @@ private:
     void parseQoSOverrides(const char* qosProfilesJson);
     AutoPubQoSProfileId resolveQoSProfileId(const char* pTopicAlias,
                                             const char* const* pClasArray, size_t clasCount,
-                                            const char* pDeviceTypeName) const;
+                                            const char* pDeviceTypeKey) const;
 
     Backend* _pBackend = nullptr;
     SysManagerIF* _pSysManager = nullptr;

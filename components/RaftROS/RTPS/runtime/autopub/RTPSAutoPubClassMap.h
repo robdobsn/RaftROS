@@ -19,9 +19,9 @@ inline bool RTPSAutoPubClassMap_hasClas(const char* const* clasArray, size_t cla
 }
 
 inline RTPSAutoPubClassMapping RTPSAutoPubClassMap_lookup(
-    const char* const* clasArray, size_t clasCount, const char* deviceTypeName)
+    const char* const* clasArray, size_t clasCount, const char* deviceTypeKey)
 {
-    return RaftRuntime::AutoPub::AutoPubClassMap_lookup(clasArray, clasCount, deviceTypeName);
+    return RaftRuntime::AutoPub::AutoPubClassMap_lookup(clasArray, clasCount, deviceTypeKey);
 }
 
 }

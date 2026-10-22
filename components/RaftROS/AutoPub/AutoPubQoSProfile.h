@@ -171,7 +171,7 @@ inline AutoPubQoSProfileId AutoPubQoSProfile_defaultForClass(const char* clasCod
 ///        class whose default is non-fallback, then FallbackString.
 inline AutoPubQoSProfileId AutoPubQoSProfile_defaultForClasses(
         const char* const* clasArray, size_t clasCount,
-        const char* /*deviceTypeName*/ = nullptr)
+        const char* /*deviceTypeKey*/ = nullptr)
 {
     if (!clasArray || clasCount == 0)
         return AutoPubQoSProfileId::FallbackString;
