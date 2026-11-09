@@ -276,41 +276,26 @@ void MainSysMod::appendReading(AttachedDevice& device, bool fresh, String& out)
         out += " no new reading";
         return;
     }
-    // A sample may hold several records (a FIFO read); the last is the newest
-    const uint32_t maxRecords = std::max<uint32_t>(1, std::min<uint32_t>(16, 4096 / devTypeRec.pollStructSize));
-    if (_decodeBuf.size() < maxRecords * devTypeRec.pollStructSize)
-        _decodeBuf.resize(maxRecords * devTypeRec.pollStructSize);
-    const uint32_t numRecords = devTypeRec.pollResultDecodeFn(data.data(), data.size(), _decodeBuf.data(),
-                                    _decodeBuf.size(), maxRecords, device.decodeState);
+    // Decoded as every on-device consumer decodes: a poll cut short (a FIFO read) is padded, and of the records
+    // a poll holds the newest is kept
+    if (_decodeBuf.size() < devTypeRec.pollStructSize)
+        _decodeBuf.resize(devTypeRec.pollStructSize);
+    const uint32_t numRecords = deviceTypeRecords.decodeNewestPollRecord(device.deviceTypeIndex, data.data(),
+                data.size(), _decodeBuf.data(), _decodeBuf.size(), device.decodeState);
     if (numRecords == 0)
     {
         out += " undecodable sample";
         return;
     }
-    const uint8_t* pRecord = _decodeBuf.data() + (numRecords - 1) * devTypeRec.pollStructSize;
     for (uint16_t index = 0; index < devTypeRec.pollFieldCount; ++index)
     {
         const AttrFieldDesc& field = devTypeRec.pollFieldDescs[index];
-        const uint8_t* pField = pRecord + field.offset;
         double value = 0;
-        switch (field.type)
-        {
-            case AttrType::Float:  { float v;    memcpy(&v, pField, sizeof(v)); value = v; break; }
-            case AttrType::Int32:  { int32_t v;  memcpy(&v, pField, sizeof(v)); value = v; break; }
-            case AttrType::Uint32: { uint32_t v; memcpy(&v, pField, sizeof(v)); value = v; break; }
-            case AttrType::Int16:  { int16_t v;  memcpy(&v, pField, sizeof(v)); value = v; break; }
-            case AttrType::Uint16: { uint16_t v; memcpy(&v, pField, sizeof(v)); value = v; break; }
-            case AttrType::Int8:   value = (int8_t)*pField; break;
-            case AttrType::Uint8:
-            case AttrType::Bool:   value = *pField; break;
-        }
-        if (field.divisor != 0.0f && field.divisor != 1.0f)
-            value /= field.divisor;
-        value += field.addend;
+        field.getValue(_decodeBuf.data(), devTypeRec.pollStructSize, 0, value);
         char text[48];
         // An array attribute (a multizone frame, say) shows its first element and its size
-        if (field.count > 1)
-            snprintf(text, sizeof(text), " %s[%u]=%.4g..", field.name, (unsigned)field.count, value);
+        if (field.elemCount() > 1)
+            snprintf(text, sizeof(text), " %s[%u]=%.4g..", field.name, (unsigned)field.elemCount(), value);
         else
             snprintf(text, sizeof(text), " %s=%.4g", field.name, value);
         out += text;

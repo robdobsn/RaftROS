@@ -344,11 +344,13 @@ bool AutoPubDeviceSource<Backend, CAPACITY>::attachDevice(
     pCtx->structSize = devTypeRec.pollStructSize;
     pCtx->pollDataSizeBytes = devTypeRec.pollDataSizeBytes;
 
-    // Up to 8 records per decode for FIFO-backed devices keeps the heap
-    // allocation under 1 kB for typical struct sizes (IMU = 24 B).
-    static constexpr uint16_t MAX_DECODE_RECORDS = 8;
-    pCtx->maxDecodeRecords = MAX_DECODE_RECORDS;
-    pCtx->decodeBufSize = (uint32_t)pCtx->structSize * MAX_DECODE_RECORDS;
+    // Working space for every record of a poll (a FIFO read holds several: an LSM6DS read up to 20, so that the
+    // newest isn't dropped), within 1 kB
+    static constexpr uint32_t MAX_DECODE_BUF_BYTES = 1024;
+    const uint32_t maxDecodeRecords = std::min<uint32_t>(DeviceTypeRecords::NEWEST_DECODE_MAX_RECORDS,
+                std::max<uint32_t>(1, MAX_DECODE_BUF_BYTES / pCtx->structSize));
+    pCtx->maxDecodeRecords = (uint16_t)maxDecodeRecords;
+    pCtx->decodeBufSize = (uint32_t)pCtx->structSize * maxDecodeRecords;
     if (pCtx->decodeBufSize > 0)
         pCtx->pDecodeBuf = new uint8_t[pCtx->decodeBufSize];
 
@@ -510,22 +512,13 @@ void AutoPubDeviceSource<Backend, CAPACITY>::onDeviceData(
                   pCtx->structSize == recordSize))
                 return 0;
 
-            // Pad up to the fixed record stride the generated decoder expects
-            const uint32_t expectedRecordSize = pCtx->pollDataSizeBytes
-                                              + DevicePollingInfo::POLL_RESULT_TIMESTAMP_SIZE;
-            if (data.size() < expectedRecordSize)
-                data.resize(expectedRecordSize, 0);
-
-            const uint32_t numRecords = pCtx->decodeFn(data.data(), data.size(),
-                                                       pCtx->pDecodeBuf, pCtx->decodeBufSize,
-                                                       pCtx->maxDecodeRecords, pCtx->decodeState);
-            // Keep only the latest record (FIFO latest-only); check the
-            // decoder's count before forming the pointer.
-            if (numRecords == 0 || numRecords > pCtx->decodeBufSize / pCtx->structSize)
-                return 0;
-            std::memcpy(pRecord, pCtx->pDecodeBuf + (numRecords - 1) * pCtx->structSize,
-                        pCtx->structSize);
-            return pCtx->structSize;
+            // Decoded as every on-device consumer decodes (DeviceTypeRecords pads a poll cut short, e.g. a FIFO
+            // read), keeping the newest record; the working space is the context's, so nothing is allocated here
+            // for a full-length poll
+            const uint32_t numRecords = DeviceTypeRecords::decodeNewestPollRecord(pCtx->decodeFn,
+                        pCtx->pollDataSizeBytes, pCtx->structSize, data.data(), data.size(), pRecord, recordSize,
+                        pCtx->decodeState, pCtx->pDecodeBuf, pCtx->decodeBufSize);
+            return (numRecords > 0) ? pCtx->structSize : 0;
         },
         PRODUCER_LOCK_TIMEOUT_MS);
 }
